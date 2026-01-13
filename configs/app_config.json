@@ -1,0 +1,63 @@
+{
+  "_comment": "FiniexDataCollector Configuration",
+  "app_name": "FiniexDataCollector",
+  "version": "1.0.0",
+  "environment": "production",
+
+  "paths": {
+    "raw_data_dir": "./data/raw",
+    "processed_data_dir": "./data/processed",
+    "broker_configs_dir": "./configs/brokers",
+    "logs_dir": "./logs"
+  },
+
+  "kraken": {
+    "enabled": true,
+    "websocket_url": "wss://ws.kraken.com/v2",
+    "symbols": [
+      "BTC/USD",
+      "ETH/USD",
+      "SOL/USD",
+      "ADA/USD",
+      "MATIC/USD",
+      "AVAX/USD",
+      "LINK/USD",
+      "DOT/USD"
+    ],
+    "reconnect_max_delay_seconds": 60,
+    "reconnect_initial_delay_seconds": 1,
+    "heartbeat_interval_seconds": 30,
+    "max_ticks_per_file": 50000
+  },
+
+  "mt5": {
+    "enabled": false,
+    "raw_data_path": "",
+    "watch_interval_seconds": 60
+  },
+
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "send_on_error": true,
+    "send_on_rotation": false,
+    "send_weekly_report": true
+  },
+
+  "transfer": {
+    "provider": "local",
+    "local_output_dir": "./output",
+    "rsync_host": "",
+    "rsync_path": "",
+    "rsync_user": ""
+  },
+
+  "scheduler": {
+    "parquet_conversion_enabled": true,
+    "conversion_day": "saturday",
+    "conversion_hour_utc": 6,
+    "report_email_enabled": false,
+    "report_email_address": ""
+  }
+}

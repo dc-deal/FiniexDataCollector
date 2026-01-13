@@ -1,0 +1,50 @@
+# FiniexDataCollector Docker Compose
+# ===================================
+
+services:
+  collector:
+    build: .
+    container_name: finiex-data-collector
+    restart: unless-stopped
+    volumes:
+      # Application code (for development)
+      - .:/app
+      # Persistent data storage
+      - ./data:/app/data
+      # Configuration
+      - ./configs:/app/configs
+      # Logs
+      - ./logs:/app/logs
+      # Output for transfer
+      - ./output:/app/output
+    environment:
+      - PYTHONPATH=/app
+      - TZ=UTC
+    command: python python/main.py collect
+    
+  # One-off conversion job (run manually)
+  converter:
+    build: .
+    container_name: finiex-converter
+    profiles:
+      - tools
+    volumes:
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app
+    command: python python/main.py convert
+
+  # Fetch broker config (run once)
+  broker-config:
+    build: .
+    container_name: finiex-broker-config
+    profiles:
+      - tools
+    volumes:
+      - ./configs:/app/configs
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app
+    command: python python/main.py broker-config

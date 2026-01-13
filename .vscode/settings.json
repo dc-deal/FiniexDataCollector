@@ -1,0 +1,29 @@
+{
+    "editor.formatOnSave": true,
+    "editor.formatOnPaste": true,
+    
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.autopep8"
+    },
+    
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/.pytest_cache": true,
+        "**/.mypy_cache": true,
+        "**/*.egg-info": true
+    },
+    
+    "search.exclude": {
+        "**/data/raw": true,
+        "**/data/processed": true,
+        "**/logs": true,
+        "**/output": true
+    },
+    
+    "terminal.integrated.fontFamily": "Cascadia Code PL",
+    "debug.console.fontFamily": "Cascadia Code PL",
+    "editor.fontFamily": "Cascadia Code PL",
+    
+    "python.analysis.typeCheckingMode": "basic"
+}
