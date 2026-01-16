@@ -14,9 +14,10 @@ from typing import Dict, List, Optional, Any
 class TickData:
     """
     Single tick data point - matches MT5 output format.
-    
+
     All times are UTC with timezone awareness.
     """
+    symbol: str                       # "BTCUSD" - normalized symbol for routing
     timestamp: str                    # "2025.01.13 14:30:45"
     time_msc: int                     # Unix milliseconds
     bid: float
@@ -67,7 +68,7 @@ class ErrorTracking:
 class TickFileMetadata:
     """
     Metadata header for tick JSON files.
-    
+
     Mirrors MT5 TickCollector output format.
     """
     symbol: str
@@ -142,7 +143,7 @@ class TickFileSummary:
 class TickFileContent:
     """
     Complete tick file structure.
-    
+
     Matches MT5 TickCollector JSON output format exactly.
     """
     metadata: TickFileMetadata
@@ -158,7 +159,7 @@ class TickFileContent:
 class KrakenTickerMessage:
     """
     Parsed Kraken WebSocket ticker message.
-    
+
     Intermediate format before conversion to TickData.
     """
     symbol: str           # "BTC/USD"

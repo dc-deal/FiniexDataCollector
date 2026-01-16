@@ -14,37 +14,37 @@ from typing import Dict, List, Any, Optional
 
 import aiohttp
 
-from python.framework.exceptions.collector_exceptions import BrokerConfigError
+from python.exceptions.collector_exceptions import BrokerConfigError
 from python.utils.logging_setup import get_logger
 
 
 class KrakenBrokerConfigFetcher:
     """
     Fetches broker configuration from Kraken API.
-    
+
     Uses AssetPairs endpoint to get symbol specifications.
     Output compatible with FiniexTestingIDE BrokerConfig loader.
     """
-    
+
     API_BASE = "https://api.kraken.com/0/public"
-    
+
     # Target symbols for collection
     DEFAULT_SYMBOLS = [
         "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD",
         "MATIC/USD", "AVAX/USD", "LINK/USD", "DOT/USD"
     ]
-    
+
     # Kraken symbol name mappings
     KRAKEN_TO_STANDARD = {
         "XBT": "BTC",
         "XXBT": "BTC",
         "XETH": "ETH",
     }
-    
+
     def __init__(self, output_dir: Path, symbols: Optional[List[str]] = None):
         """
         Initialize broker config fetcher.
-        
+
         Args:
             output_dir: Directory to write broker config
             symbols: List of symbols to include (uses defaults if None)
@@ -52,43 +52,43 @@ class KrakenBrokerConfigFetcher:
         self._output_dir = Path(output_dir)
         self._symbols = symbols or self.DEFAULT_SYMBOLS
         self._logger = get_logger("FiniexDataCollector.broker_config")
-        
+
         # Ensure output directory exists
         self._output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     async def fetch_and_save(self) -> Path:
         """
         Fetch symbol info and save to JSON.
-        
+
         Returns:
             Path to created config file
         """
         self._logger.info("Fetching Kraken broker configuration...")
-        
+
         # Fetch asset pairs
         pairs_data = await self._fetch_asset_pairs()
-        
+
         # Build config structure
         config = self._build_config(pairs_data)
-        
+
         # Save to file
         output_path = self._output_dir / "kraken_demo.json"
-        
+
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
-        
+
         self._logger.info(f"Broker config saved: {output_path}")
         return output_path
-    
+
     async def _fetch_asset_pairs(self) -> Dict[str, Any]:
         """
         Fetch asset pairs from Kraken API.
-        
+
         Returns:
             Dict with pair info
         """
         url = f"{self.API_BASE}/AssetPairs"
-        
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=30) as response:
@@ -98,37 +98,37 @@ class KrakenBrokerConfigFetcher:
                             broker="kraken",
                             endpoint="AssetPairs"
                         )
-                    
+
                     data = await response.json()
-                    
+
                     if data.get("error"):
                         raise BrokerConfigError(
                             f"API error: {data['error']}",
                             broker="kraken",
                             endpoint="AssetPairs"
                         )
-                    
+
                     return data.get("result", {})
-                    
+
         except aiohttp.ClientError as e:
             raise BrokerConfigError(
                 f"Network error: {e}",
                 broker="kraken",
                 endpoint="AssetPairs"
             )
-    
+
     def _build_config(self, pairs_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Build broker config structure.
-        
+
         Args:
             pairs_data: Raw API response
-            
+
         Returns:
             Complete config dict
         """
         now = datetime.now(timezone.utc)
-        
+
         config = {
             "_comment": "Static broker configuration for FiniexTestingIDE - Kraken Spot",
             "_version": "1.0",
@@ -165,16 +165,16 @@ class KrakenBrokerConfigFetcher:
             },
             "symbols": {}
         }
-        
+
         # Process each target symbol
         for symbol in self._symbols:
             symbol_config = self._find_and_build_symbol(symbol, pairs_data)
             if symbol_config:
                 normalized = self._normalize_symbol(symbol)
                 config["symbols"][normalized] = symbol_config
-        
+
         return config
-    
+
     def _find_and_build_symbol(
         self,
         target_symbol: str,
@@ -182,35 +182,35 @@ class KrakenBrokerConfigFetcher:
     ) -> Optional[Dict[str, Any]]:
         """
         Find symbol in API data and build config entry.
-        
+
         Args:
             target_symbol: Symbol to find (e.g., "BTC/USD")
             pairs_data: API response
-            
+
         Returns:
             Symbol config dict or None if not found
         """
         # Normalize target for matching
         target_base, target_quote = target_symbol.split("/")
         target_base = self.KRAKEN_TO_STANDARD.get(target_base, target_base)
-        
+
         # Search in API data
         for pair_name, pair_info in pairs_data.items():
             wsname = pair_info.get("wsname", "")
-            
+
             if "/" in wsname:
                 api_base, api_quote = wsname.split("/")
                 api_base = self.KRAKEN_TO_STANDARD.get(api_base, api_base)
-                
+
                 if api_base == target_base and api_quote == target_quote:
                     return self._build_symbol_config(
                         target_symbol,
                         pair_info
                     )
-        
+
         self._logger.warning(f"Symbol not found: {target_symbol}")
         return None
-    
+
     def _build_symbol_config(
         self,
         symbol: str,
@@ -218,27 +218,27 @@ class KrakenBrokerConfigFetcher:
     ) -> Dict[str, Any]:
         """
         Build symbol configuration entry.
-        
+
         Args:
             symbol: Target symbol (e.g., "BTC/USD")
             pair_info: API pair info
-            
+
         Returns:
             Symbol config dict
         """
         base, quote = symbol.split("/")
         base = self.KRAKEN_TO_STANDARD.get(base, base)
-        
+
         # Extract values from API
         pair_decimals = pair_info.get("pair_decimals", 1)
         lot_decimals = pair_info.get("lot_decimals", 8)
         ordermin = float(pair_info.get("ordermin", 0.0001))
-        
+
         # Calculate tick size from decimals
         tick_size = 10 ** (-pair_decimals)
-        
+
         normalized = self._normalize_symbol(symbol)
-        
+
         return {
             "path": f"Crypto/Major/{normalized}",
             "description": f"{base} vs {quote}",
@@ -258,14 +258,14 @@ class KrakenBrokerConfigFetcher:
             "stops_level": 0,
             "freeze_level": 0
         }
-    
+
     def _normalize_symbol(self, symbol: str) -> str:
         """
         Normalize symbol to standard format.
-        
+
         Args:
             symbol: Symbol with slash (e.g., "BTC/USD")
-            
+
         Returns:
             Normalized symbol (e.g., "BTCUSD")
         """
@@ -283,11 +283,11 @@ async def fetch_kraken_broker_config(
 ) -> Path:
     """
     Convenience function to fetch and save broker config.
-    
+
     Args:
         output_dir: Directory to save config
         symbols: Optional list of symbols
-        
+
     Returns:
         Path to created config file
     """
