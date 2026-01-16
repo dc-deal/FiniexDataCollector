@@ -1,0 +1,23 @@
+{
+    "name": "FiniexDataCollector Dev",
+    "dockerComposeFile": "../docker-compose.yml",
+    "service": "collector",
+    "workspaceFolder": "/app",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.debugpy",
+                "ms-python.autopep8"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/usr/local/bin/python",
+                "python.terminal.activateEnvironment": false,
+                "git.path": "/usr/bin/git"
+            }
+        }
+    },
+    "forwardPorts": [],
+    //"postCreateCommand": "pip install -e .",
+    "remoteUser": "root"
+}

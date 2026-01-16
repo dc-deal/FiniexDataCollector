@@ -1,15 +1,20 @@
 # FiniexDataCollector Dockerfile
 # ==============================
 
-FROM python:3.11-slim
+FROM python:3.12-slim
+
+# System-Pakete installieren (Git, Build-Tools und htop für Monitoring)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    htop \
+    && rm -rf /var/lib/apt/lists/*
+
+# Git safe directory fix für VS Code
+RUN git config --system --add safe.directory /app
 
 # Set working directory
 WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (cache layer)
 COPY requirements.txt .
@@ -30,5 +35,5 @@ RUN mkdir -p /app/data/raw/kraken \
     && mkdir -p /app/logs \
     && mkdir -p /app/output
 
-# Default command: start collector
-CMD ["python", "python/main.py", "collect"]
+# Bash als interaktive Login-Shell setzen
+CMD ["/bin/bash", "-l"]
