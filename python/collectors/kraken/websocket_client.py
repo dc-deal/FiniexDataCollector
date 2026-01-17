@@ -9,7 +9,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
-from typing import List, Optional, Callable
+from typing import Any, List, Optional, Callable
 
 import websockets
 from websockets.exceptions import (
@@ -28,8 +28,6 @@ from python.exceptions.collector_exceptions import (
     CollectorHealthReport
 )
 from python.utils.logging_setup import get_collector_logger
-
-from websockets.asyncio.client import ClientConnection
 
 
 class KrakenWebSocketClient(AbstractCollector):
@@ -70,7 +68,7 @@ class KrakenWebSocketClient(AbstractCollector):
         self._reconnect_max_delay = reconnect_max_delay
         self._heartbeat_interval = heartbeat_interval
 
-        self._websocket: Optional[ClientConnection] = None
+        self._websocket: Optional[Any] = None
         self._parser = KrakenMessageParser()
         self._logger = get_collector_logger("kraken")
 
@@ -79,9 +77,35 @@ class KrakenWebSocketClient(AbstractCollector):
         self._reconnect_attempt = 0
         self._should_reconnect = True
 
+        # Callbacks
+        self._status_callback: Optional[Callable[[str], None]] = None
+
         # Tasks
         self._receive_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+
+    def set_status_callback(self, callback: Callable[[str], None]) -> None:
+        """
+        Set callback for connection status changes.
+
+        Args:
+            callback: Function called with status string (connected, disconnected, reconnecting)
+        """
+        self._status_callback = callback
+
+    def _set_status(self, status: str) -> None:
+        """
+        Update connection status and notify callback.
+
+        Args:
+            status: New status string
+        """
+        self._connection_status = status
+        if self._status_callback:
+            try:
+                self._status_callback(status)
+            except Exception:
+                pass  # Don't crash on callback errors
 
     async def connect(self) -> bool:
         """
@@ -100,7 +124,7 @@ class KrakenWebSocketClient(AbstractCollector):
                 close_timeout=5
             )
 
-            self._connection_status = "connected"
+            self._set_status("connected")
             self._reconnect_attempt = 0
             self._last_message_time = datetime.now(timezone.utc)
 
@@ -108,7 +132,7 @@ class KrakenWebSocketClient(AbstractCollector):
             return True
 
         except Exception as e:
-            self._connection_status = "failed"
+            self._set_status("failed")
             self._logger.error(f"Connection failed: {e}")
             raise WebSocketConnectionError(
                 message=str(e),
@@ -119,7 +143,7 @@ class KrakenWebSocketClient(AbstractCollector):
     async def disconnect(self) -> None:
         """Disconnect from WebSocket."""
         self._should_reconnect = False
-        self._connection_status = "disconnecting"
+        self._set_status("disconnecting")
 
         # Cancel tasks
         if self._receive_task:
@@ -135,7 +159,7 @@ class KrakenWebSocketClient(AbstractCollector):
                 self._logger.warning(f"Error closing WebSocket: {e}")
 
         self._websocket = None
-        self._connection_status = "disconnected"
+        self._set_status("disconnected")
         self._is_running = False
         self._logger.info("Disconnected from Kraken WebSocket")
 
@@ -228,7 +252,7 @@ class KrakenWebSocketClient(AbstractCollector):
 
             except (ConnectionClosed, ConnectionClosedError, ConnectionClosedOK) as e:
                 self._logger.warning(f"Connection closed: {e}")
-                self._connection_status = "reconnecting"
+                self._set_status("reconnecting")
 
             except WebSocketConnectionError as e:
                 self._logger.error(f"Connection error: {e}")

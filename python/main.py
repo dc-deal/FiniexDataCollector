@@ -20,6 +20,8 @@ from typing import Optional
 
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import setup_logging, get_logger
+from python.utils.live_display import LiveDisplay
+from python.types.collector_stats import CollectorStats
 from python.collectors.kraken.websocket_client import KrakenWebSocketClient
 from python.collectors.kraken.symbols import normalize_symbol
 from python.writers.json_tick_writer import JsonTickWriter
@@ -52,9 +54,16 @@ class FiniexDataCollector:
         self._telegram: Optional[TelegramAlertProvider] = None
         self._scheduler: Optional[WeeklyJobScheduler] = None
 
+        # Live monitoring
+        self._stats = CollectorStats()
+        self._live_display: Optional[LiveDisplay] = None
+
         # State
         self._is_running = False
         self._shutdown_event = asyncio.Event()
+
+        # Track first tick per symbol for logging
+        self._first_tick_logged = set()
 
     async def start_collection(self) -> None:
         """Start all configured collectors."""
@@ -94,6 +103,10 @@ class FiniexDataCollector:
 
         self._is_running = True
 
+        # Start live display
+        self._live_display = LiveDisplay(self._stats)
+        await self._live_display.start()
+
         # Wait for shutdown
         await self._shutdown_event.wait()
 
@@ -131,13 +144,23 @@ class FiniexDataCollector:
             heartbeat_interval=self._config.kraken.heartbeat_interval_seconds
         )
 
-        # Set tick callback
+        # Set callbacks
         collector.set_tick_callback(self._on_tick_received)
+        collector.set_status_callback(self._on_status_changed)
 
         self._collectors.append(collector)
 
         # Start collector (non-blocking)
         asyncio.create_task(self._run_collector(collector))
+
+    def _on_status_changed(self, status: str) -> None:
+        """
+        Handle WebSocket connection status change.
+
+        Args:
+            status: New status (connected, disconnected, reconnecting)
+        """
+        self._stats.set_websocket_status(status)
 
     async def _run_collector(self, collector: KrakenWebSocketClient) -> None:
         """
@@ -164,15 +187,49 @@ class FiniexDataCollector:
         Args:
             tick: TickData instance
         """
-        # Find writer for this symbol (extract from tick)
-        # Symbol is embedded in tick via the parser
         symbol = self._get_symbol_from_tick(tick)
 
+        # Update stats
+        self._stats.record_tick(
+            symbol=symbol,
+            bid=tick.bid,
+            ask=tick.ask,
+            spread_pct=tick.spread_pct
+        )
+
+        # Log first tick for this symbol
+        if symbol not in self._first_tick_logged:
+            self._first_tick_logged.add(symbol)
+            self._logger.info(
+                f"First tick: {symbol} | "
+                f"bid={tick.bid:.2f} ask={tick.ask:.2f} "
+                f"spread={tick.spread_pct:.4f}%"
+            )
+
+        # Write tick
         if symbol in self._writers:
             writer = self._writers[symbol]
+
+            # Check if rotation happened
+            old_file = writer.get_current_filepath()
+            old_count = writer.current_tick_count
+
             writer.write_tick(tick)
 
-            # Check for rotation notification
+            # Detect rotation (file changed or count reset)
+            new_file = writer.get_current_filepath()
+            if old_file and new_file and old_file != new_file:
+                # File was rotated
+                self._stats.record_file_created(
+                    symbol=symbol,
+                    filename=old_file.name,
+                    tick_count=old_count
+                )
+                self._logger.info(
+                    f"File rotated: {old_file.name} ({old_count:,} ticks)"
+                )
+
+            # Check for rotation notification (Telegram)
             if writer.needs_rotation() and self._telegram:
                 asyncio.create_task(
                     self._telegram.send_file_rotation_notice(
@@ -248,15 +305,25 @@ class FiniexDataCollector:
         """Graceful shutdown of all components."""
         self._logger.info("Shutting down...")
 
+        # Stop live display first (so we can see logs)
+        if self._live_display:
+            await self._live_display.stop()
+
         # Stop collectors
         for collector in self._collectors:
             await collector.stop()
 
         # Finalize writers
         for symbol, writer in self._writers.items():
+            tick_count = writer.current_tick_count
             filepath = writer.finalize()
             if filepath:
                 self._logger.info(f"Finalized: {filepath.name}")
+                self._stats.record_file_created(
+                    symbol=symbol,
+                    filename=filepath.name,
+                    tick_count=tick_count
+                )
 
         # Stop scheduler
         if self._scheduler:
@@ -266,7 +333,8 @@ class FiniexDataCollector:
         if self._telegram:
             await self._telegram.send_info(
                 "Collector Stopped",
-                "FiniexDataCollector has been shut down"
+                f"FiniexDataCollector stopped. "
+                f"Total: {self._stats.total_ticks:,} ticks, {self._stats.total_files} files"
             )
 
         self._is_running = False

@@ -2,7 +2,7 @@
 FiniexDataCollector - Collector Exceptions
 Custom exceptions for tick collection and processing.
 
-Location: python/framework/exceptions/collector_exceptions.py
+Location: python/exceptions/collector_exceptions.py
 """
 
 from dataclasses import dataclass

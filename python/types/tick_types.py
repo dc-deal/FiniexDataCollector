@@ -2,7 +2,7 @@
 FiniexDataCollector - Tick Data Types
 Core data structures for tick collection and processing.
 
-Location: python/framework/types/tick_types.py
+Location: python/types/tick_types.py
 """
 
 from dataclasses import dataclass, field
