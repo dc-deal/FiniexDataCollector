@@ -29,6 +29,8 @@ from python.exceptions.collector_exceptions import (
 )
 from python.utils.logging_setup import get_collector_logger
 
+from websockets.asyncio.client import ClientConnection
+
 
 class KrakenWebSocketClient(AbstractCollector):
     """
@@ -68,7 +70,7 @@ class KrakenWebSocketClient(AbstractCollector):
         self._reconnect_max_delay = reconnect_max_delay
         self._heartbeat_interval = heartbeat_interval
 
-        self._websocket: Optional[websockets.WebSocketClientProtocol] = None
+        self._websocket: Optional[ClientConnection] = None
         self._parser = KrakenMessageParser()
         self._logger = get_collector_logger("kraken")
 
