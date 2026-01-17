@@ -1,108 +1,249 @@
 """
 FiniexDataCollector - Logging Setup
-Configures application logging with console and file handlers.
+Custom logger with colored console output and config-driven levels.
 
 Location: python/utils/logging_setup.py
 """
 
-import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, TextIO
+
+from python.types.log_level import (
+    LogLevel,
+    get_log_level,
+    DEBUG,
+    INFO,
+    WARNING,
+    ERROR,
+    CRITICAL,
+    ANSI_RESET,
+    ANSI_RED
+)
 
 
-class UTCFormatter(logging.Formatter):
-    """Formatter that uses UTC timestamps."""
-    
-    converter = lambda *args: datetime.now(timezone.utc).timetuple()
-    
-    def formatTime(self, record, datefmt=None):
-        """Format time in UTC."""
-        ct = datetime.now(timezone.utc)
-        if datefmt:
-            return ct.strftime(datefmt)
-        return ct.strftime("%Y-%m-%d %H:%M:%S UTC")
+def _print_error(message: str) -> None:
+    """
+    Print error message in red to stderr.
+    Used for logger initialization failures.
+
+    Args:
+        message: Error message
+    """
+    print(f"{ANSI_RED}[LOGGER ERROR] {message}{ANSI_RESET}", file=sys.stderr)
+
+
+class FiniexLogger:
+    """
+    Custom logger with colored console output.
+
+    Features:
+    - Colored console output (configurable per level)
+    - Plain text file output
+    - UTC timestamps
+    - Compatible interface with standard logging
+    """
+
+    def __init__(
+        self,
+        name: str,
+        console_level: LogLevel,
+        file_level: Optional[LogLevel] = None,
+        log_file: Optional[Path] = None
+    ):
+        """
+        Initialize logger.
+
+        Args:
+            name: Logger name
+            console_level: Minimum level for console output
+            file_level: Minimum level for file output (None = no file logging)
+            log_file: Path to log file (required if file_level set)
+        """
+        self._name = name
+        self._console_level = console_level
+        self._file_level = file_level
+        self._log_file = log_file
+        self._file_handle: Optional[TextIO] = None
+
+        # Open file if configured
+        if self._file_level and self._log_file:
+            try:
+                self._log_file.parent.mkdir(parents=True, exist_ok=True)
+                self._file_handle = open(self._log_file, "a", encoding="utf-8")
+            except Exception as e:
+                _print_error(f"Failed to open log file {self._log_file}: {e}")
+
+    def _log(self, level: LogLevel, message: str) -> None:
+        """
+        Internal log method.
+
+        Args:
+            level: Log level
+            message: Log message
+        """
+        timestamp = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC")
+
+        # Console output (colored)
+        if level >= self._console_level:
+            colored_line = (
+                f"{timestamp} | "
+                f"{level.color}{level.name:<8}{ANSI_RESET} | "
+                f"{self._name} | {message}"
+            )
+            print(colored_line)
+
+        # File output (plain text)
+        if self._file_handle and self._file_level and level >= self._file_level:
+            plain_line = f"{timestamp} | {level.name:<8} | {self._name} | {message}\n"
+            try:
+                self._file_handle.write(plain_line)
+                self._file_handle.flush()
+            except Exception as e:
+                _print_error(f"Failed to write to log file: {e}")
+
+    def debug(self, message: str) -> None:
+        """Log debug message."""
+        self._log(DEBUG, message)
+
+    def info(self, message: str) -> None:
+        """Log info message."""
+        self._log(INFO, message)
+
+    def warning(self, message: str) -> None:
+        """Log warning message."""
+        self._log(WARNING, message)
+
+    def error(self, message: str) -> None:
+        """Log error message."""
+        self._log(ERROR, message)
+
+    def critical(self, message: str) -> None:
+        """Log critical message."""
+        self._log(CRITICAL, message)
+
+    def close(self) -> None:
+        """Close file handle."""
+        if self._file_handle:
+            try:
+                self._file_handle.close()
+            except Exception:
+                pass
+            self._file_handle = None
+
+
+# Global logger registry
+_loggers: Dict[str, FiniexLogger] = {}
+_global_console_level: Optional[LogLevel] = None
+_global_file_level: Optional[LogLevel] = None
+_global_log_dir: Optional[Path] = None
+_initialized = False
 
 
 def setup_logging(
-    log_dir: Optional[Path] = None,
-    log_level: int = logging.INFO,
-    log_to_file: bool = True,
-    log_to_console: bool = True,
-    app_name: str = "FiniexDataCollector"
-) -> logging.Logger:
+    console_level: str,
+    file_level: str,
+    log_dir: Path
+) -> None:
     """
-    Configure application logging.
-    
+    Initialize global logging configuration.
+
+    MUST be called before any get_logger() calls.
+
     Args:
+        console_level: Console log level name (e.g., "DEBUG", "INFO")
+        file_level: File log level name
         log_dir: Directory for log files
-        log_level: Logging level (default: INFO)
-        log_to_file: Enable file logging
-        log_to_console: Enable console logging
-        app_name: Application name for logger
-        
-    Returns:
-        Configured logger instance
+
+    Raises:
+        ValueError: If log level is unknown
+        RuntimeError: If log_dir cannot be created
     """
-    logger = logging.getLogger(app_name)
-    logger.setLevel(log_level)
-    
-    # Clear existing handlers
-    logger.handlers.clear()
-    
-    # Format string
-    log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-    formatter = UTCFormatter(log_format)
-    
-    # Console handler
-    if log_to_console:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(log_level)
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-    
-    # File handler
-    if log_to_file and log_dir:
-        log_dir = Path(log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Daily log file
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        log_file = log_dir / f"{app_name.lower()}_{today}.log"
-        
-        file_handler = logging.FileHandler(
-            log_file,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(log_level)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    
-    return logger
+    global _global_console_level, _global_file_level, _global_log_dir, _initialized
+
+    try:
+        _global_console_level = get_log_level(console_level)
+    except ValueError as e:
+        _print_error(str(e))
+        raise
+
+    try:
+        _global_file_level = get_log_level(file_level)
+    except ValueError as e:
+        _print_error(str(e))
+        raise
+
+    _global_log_dir = Path(log_dir)
+
+    try:
+        _global_log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        _print_error(f"Failed to create log directory {log_dir}: {e}")
+        raise RuntimeError(f"Failed to create log directory: {e}")
+
+    _initialized = True
 
 
-def get_logger(name: str = "FiniexDataCollector") -> logging.Logger:
+def _get_log_file() -> Path:
+    """Get current log file path (daily rotation)."""
+    if not _global_log_dir:
+        raise RuntimeError("Logging not initialized")
+
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _global_log_dir / f"finiexdatacollector_{date_str}.log"
+
+
+def get_logger(name: str) -> FiniexLogger:
     """
-    Get logger instance by name.
-    
+    Get or create logger by name.
+
     Args:
         name: Logger name
-        
+
     Returns:
-        Logger instance
+        FiniexLogger instance
+
+    Raises:
+        RuntimeError: If logging not initialized
     """
-    return logging.getLogger(name)
+    if not _initialized:
+        _print_error(
+            "Logging not initialized! Call setup_logging() first. "
+            "Check 'logging' section in app_config.json"
+        )
+        raise RuntimeError(
+            "Logging not initialized. Ensure 'logging' section exists in app_config.json "
+            "with 'console_level' and 'file_level' settings."
+        )
+
+    if name not in _loggers:
+        _loggers[name] = FiniexLogger(
+            name=name,
+            console_level=_global_console_level,
+            file_level=_global_file_level,
+            log_file=_get_log_file()
+        )
+
+    return _loggers[name]
 
 
-def get_collector_logger(collector_name: str) -> logging.Logger:
+def get_collector_logger(collector_name: str) -> FiniexLogger:
     """
-    Get logger for specific collector.
-    
+    Get logger for a collector.
+
     Args:
-        collector_name: Name of collector (e.g., "kraken")
-        
+        collector_name: Collector identifier
+
     Returns:
-        Logger instance with collector prefix
+        FiniexLogger instance
     """
-    return logging.getLogger(f"FiniexDataCollector.{collector_name}")
+    return get_logger(f"FiniexDataCollector.{collector_name}")
+
+
+def close_all_loggers() -> None:
+    """Close all logger file handles."""
+    for logger in _loggers.values():
+        logger.close()
+    _loggers.clear()

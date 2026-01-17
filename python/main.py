@@ -352,14 +352,6 @@ def main():
         help="Path to config file"
     )
 
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level"
-    )
-
     args = parser.parse_args()
 
     # Load config
@@ -369,20 +361,17 @@ def main():
             loader = ConfigLoader(config_path)
             config = loader.load()
         else:
-            print(f"Config not found: {config_path}, using defaults")
-            from python.utils.config_loader import get_default_config
-            config = get_default_config()
+            print(f"Config not found: {config_path}")
+            sys.exit(1)
     except Exception as e:
         print(f"Failed to load config: {e}")
         sys.exit(1)
 
-    # Setup logging
-    import logging
-    log_level = getattr(logging, args.log_level)
+    # Setup logging (from config - required section)
     setup_logging(
-        log_dir=Path(config.paths.logs_dir),
-        log_level=log_level,
-        app_name="FiniexDataCollector"
+        console_level=config.logging.console_level,
+        file_level=config.logging.file_level,
+        log_dir=Path(config.paths.logs_dir)
     )
 
     # Execute command

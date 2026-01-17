@@ -14,6 +14,13 @@ from python.exceptions.collector_exceptions import ConfigurationError
 
 
 @dataclass
+class LoggingConfig:
+    """Logging configuration - REQUIRED, no defaults."""
+    console_level: str
+    file_level: str
+
+
+@dataclass
 class TelegramConfig:
     """Telegram bot configuration."""
     enabled: bool = False
@@ -87,6 +94,10 @@ class AppConfig:
     version: str = "1.0.0"
     environment: str = "production"   # "development", "production"
 
+    logging: LoggingConfig = field(default_factory=lambda: LoggingConfig(
+        console_level="INFO",
+        file_level="INFO"
+    ))
     paths: PathsConfig = field(default_factory=PathsConfig)
     kraken: KrakenCollectorConfig = field(
         default_factory=KrakenCollectorConfig)
@@ -152,17 +163,62 @@ class ConfigLoader:
 
         Returns:
             Populated AppConfig instance
+
+        Raises:
+            ConfigurationError: If required sections are missing
         """
         return AppConfig(
             app_name=data.get("app_name", "FiniexDataCollector"),
             version=data.get("version", "1.0.0"),
             environment=data.get("environment", "production"),
+            logging=self._parse_logging(data.get("logging")),
             paths=self._parse_paths(data.get("paths", {})),
             kraken=self._parse_kraken(data.get("kraken", {})),
             mt5=self._parse_mt5(data.get("mt5", {})),
             telegram=self._parse_telegram(data.get("telegram", {})),
             transfer=self._parse_transfer(data.get("transfer", {})),
             scheduler=self._parse_scheduler(data.get("scheduler", {})),
+        )
+
+    def _parse_logging(self, data: Optional[Dict[str, Any]]) -> LoggingConfig:
+        """
+        Parse logging configuration section.
+
+        REQUIRED section - raises error if missing or incomplete.
+
+        Args:
+            data: Logging section data
+
+        Returns:
+            LoggingConfig instance
+
+        Raises:
+            ConfigurationError: If section or required keys missing
+        """
+        if data is None:
+            raise ConfigurationError(
+                "Missing required 'logging' section in config",
+                config_file=str(self._config_path),
+                missing_key="logging"
+            )
+
+        if "console_level" not in data:
+            raise ConfigurationError(
+                "Missing required 'console_level' in logging config",
+                config_file=str(self._config_path),
+                missing_key="logging.console_level"
+            )
+
+        if "file_level" not in data:
+            raise ConfigurationError(
+                "Missing required 'file_level' in logging config",
+                config_file=str(self._config_path),
+                missing_key="logging.file_level"
+            )
+
+        return LoggingConfig(
+            console_level=data["console_level"],
+            file_level=data["file_level"],
         )
 
     def _parse_paths(self, data: Dict[str, Any]) -> PathsConfig:

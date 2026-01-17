@@ -9,6 +9,10 @@
     "broker_configs_dir": "./configs/brokers",
     "logs_dir": "./logs"
   },
+  "logging": {
+    "console_level": "DEBUG",
+    "file_level": "INFO"
+  },
   "kraken": {
     "enabled": true,
     "websocket_url": "wss://ws.kraken.com/v2",
