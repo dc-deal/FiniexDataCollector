@@ -16,19 +16,48 @@ import asyncio
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import setup_logging, get_logger
 from python.utils.live_display import LiveDisplay
 from python.types.collector_stats import CollectorStats
+from python.types.broker_config_types import BrokerConfig, normalize_symbol
+from python.exceptions.collector_exceptions import ConfigurationError
 from python.collectors.kraken.websocket_client import KrakenWebSocketClient
-from python.collectors.kraken.symbols import normalize_symbol
 from python.writers.json_tick_writer import JsonTickWriter
 from python.alerts.telegram_bot import TelegramAlertProvider
 from python.scheduler.weekly_jobs import WeeklyJobScheduler
 from python.converters.tick_to_parquet import run_weekly_conversion
 from python.converters.broker_config_fetcher import fetch_kraken_broker_config
+
+
+def validate_symbols(symbols: List[str]) -> None:
+    """
+    Validate symbols list for duplicates.
+
+    Args:
+        symbols: List of symbols from config
+
+    Raises:
+        ConfigurationError: If duplicates found
+    """
+    normalized = [normalize_symbol(s) for s in symbols]
+    seen = set()
+    duplicates = []
+
+    for s in normalized:
+        if s in seen:
+            duplicates.append(s)
+        seen.add(s)
+
+    if duplicates:
+        unique_dups = list(set(duplicates))
+        raise ConfigurationError(
+            f"Duplicate symbols in config: {', '.join(unique_dups)}. "
+            f"Remove duplicates from kraken.symbols in app_config.json",
+            config_file="app_config.json"
+        )
 
 
 class FiniexDataCollector:
@@ -341,8 +370,77 @@ class FiniexDataCollector:
         self._logger.info("Shutdown complete")
 
 
+async def ensure_broker_config(config: AppConfig, logger) -> Path:
+    """
+    Ensure broker config exists, fetch from API if not.
+
+    Args:
+        config: Application config
+        logger: Logger instance
+
+    Returns:
+        Path to broker config file
+
+    Raises:
+        ConfigurationError: If symbols invalid or API fails
+    """
+    broker_config_dir = Path(config.paths.broker_configs_dir) / "kraken"
+    broker_config_path = broker_config_dir / "kraken_public.json"
+
+    # Always fetch fresh from API at collect start
+    logger.info("Fetching broker configuration from Kraken API...")
+
+    try:
+        filepath, _ = await fetch_kraken_broker_config(
+            output_dir=broker_config_dir,
+            symbols=config.kraken.symbols
+        )
+        logger.info(f"Broker config ready: {filepath}")
+        return filepath
+
+    except Exception as e:
+        # If fetch fails but we have cached config, use it
+        if broker_config_path.exists():
+            logger.warning(
+                f"API fetch failed ({e}), using cached broker config"
+            )
+            return broker_config_path
+
+        # No cache, re-raise
+        raise
+
+
 async def cmd_collect(config: AppConfig) -> None:
     """Run collection daemon."""
+    logger = get_logger("FiniexDataCollector")
+
+    # === VALIDATION PHASE ===
+
+    # 1. Validate symbols for duplicates (HARD ERROR)
+    logger.info("Validating configuration...")
+    validate_symbols(config.kraken.symbols)
+
+    # 2. Fetch/ensure broker config (validates symbols against Kraken API)
+    broker_config_path = await ensure_broker_config(config, logger)
+
+    # 3. Load BrokerConfig singleton
+    BrokerConfig.load_from_file(broker_config_path)
+    logger.info(
+        f"Loaded {len(BrokerConfig.get_all_symbols())} symbols from broker config")
+
+    # 4. Verify all configured symbols are in broker config
+    for symbol in config.kraken.symbols:
+        normalized = normalize_symbol(symbol)
+        if not BrokerConfig.has_symbol(normalized):
+            raise ConfigurationError(
+                f"Symbol '{symbol}' (normalized: '{normalized}') not found in broker config. "
+                f"Available: {', '.join(BrokerConfig.get_all_symbols())}",
+                missing_key=normalized
+            )
+
+    logger.info("Configuration validated successfully")
+
+    # === START COLLECTION ===
     app = FiniexDataCollector(config)
     await app.start_collection()
 
@@ -366,9 +464,12 @@ async def cmd_broker_config(config: AppConfig) -> None:
     logger = get_logger("FiniexDataCollector")
     logger.info("Fetching Kraken broker configuration...")
 
+    # Validate symbols first
+    validate_symbols(config.kraken.symbols)
+
     output_dir = Path(config.paths.broker_configs_dir) / "kraken"
 
-    filepath = await fetch_kraken_broker_config(
+    filepath, _ = await fetch_kraken_broker_config(
         output_dir=output_dir,
         symbols=config.kraken.symbols
     )
@@ -443,14 +544,23 @@ def main():
     )
 
     # Execute command
-    if args.command == "collect":
-        asyncio.run(cmd_collect(config))
-    elif args.command == "convert":
-        asyncio.run(cmd_convert(config))
-    elif args.command == "broker-config":
-        asyncio.run(cmd_broker_config(config))
-    elif args.command == "status":
-        cmd_status(config)
+    try:
+        if args.command == "collect":
+            asyncio.run(cmd_collect(config))
+        elif args.command == "convert":
+            asyncio.run(cmd_convert(config))
+        elif args.command == "broker-config":
+            asyncio.run(cmd_broker_config(config))
+        elif args.command == "status":
+            cmd_status(config)
+    except ConfigurationError as e:
+        logger = get_logger("FiniexDataCollector")
+        logger.error(f"Configuration error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger = get_logger("FiniexDataCollector")
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

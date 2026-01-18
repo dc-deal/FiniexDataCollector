@@ -20,7 +20,7 @@ from websockets.exceptions import (
 
 from python.collectors.base import AbstractCollector
 from python.collectors.kraken.message_parser import KrakenMessageParser
-from python.collectors.kraken.symbols import to_kraken_format, normalize_symbol
+from python.types.broker_config_types import to_kraken_format, normalize_symbol
 from python.types.tick_types import TickData
 from python.exceptions.collector_exceptions import (
     WebSocketConnectionError,

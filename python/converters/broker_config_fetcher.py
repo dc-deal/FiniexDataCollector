@@ -2,7 +2,7 @@
 FiniexDataCollector - Broker Config Fetcher
 Fetches symbol configuration from Kraken REST API.
 
-Creates kraken_demo.json with symbol specifications.
+Creates kraken_public.json with symbol specifications.
 
 Location: python/converters/broker_config_fetcher.py
 """
@@ -10,11 +10,11 @@ Location: python/converters/broker_config_fetcher.py
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 import aiohttp
 
-from python.exceptions.collector_exceptions import BrokerConfigError
+from python.exceptions.collector_exceptions import BrokerConfigError, ConfigurationError
 from python.utils.logging_setup import get_logger
 
 
@@ -24,15 +24,12 @@ class KrakenBrokerConfigFetcher:
 
     Uses AssetPairs endpoint to get symbol specifications.
     Output compatible with FiniexTestingIDE BrokerConfig loader.
+
+    STRICT MODE: Raises error if any requested symbol is not found.
     """
 
     API_BASE = "https://api.kraken.com/0/public"
-
-    # Target symbols for collection
-    DEFAULT_SYMBOLS = [
-        "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD",
-        "MATIC/USD", "AVAX/USD", "LINK/USD", "DOT/USD"
-    ]
+    CONFIG_FILENAME = "kraken_public.json"
 
     # Kraken symbol name mappings
     KRAKEN_TO_STANDARD = {
@@ -41,44 +38,67 @@ class KrakenBrokerConfigFetcher:
         "XETH": "ETH",
     }
 
-    def __init__(self, output_dir: Path, symbols: Optional[List[str]] = None):
+    def __init__(self, output_dir: Path, symbols: List[str]):
         """
         Initialize broker config fetcher.
 
         Args:
             output_dir: Directory to write broker config
-            symbols: List of symbols to include (uses defaults if None)
+            symbols: List of symbols to include (REQUIRED)
+
+        Raises:
+            ConfigurationError: If symbols list is empty or has duplicates
         """
+        if not symbols:
+            raise ConfigurationError(
+                "Symbols list cannot be empty",
+                missing_key="kraken.symbols"
+            )
+
+        # Check for duplicates
+        normalized_symbols = [self._normalize_symbol(s) for s in symbols]
+        duplicates = [
+            s for s in normalized_symbols if normalized_symbols.count(s) > 1]
+        if duplicates:
+            unique_dups = list(set(duplicates))
+            raise ConfigurationError(
+                f"Duplicate symbols in config: {', '.join(unique_dups)}",
+                config_file="app_config.json"
+            )
+
         self._output_dir = Path(output_dir)
-        self._symbols = symbols or self.DEFAULT_SYMBOLS
+        self._symbols = symbols
         self._logger = get_logger("FiniexDataCollector.broker_config")
 
         # Ensure output directory exists
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
-    async def fetch_and_save(self) -> Path:
+    async def fetch_and_save(self) -> Tuple[Path, Dict[str, Any]]:
         """
         Fetch symbol info and save to JSON.
 
         Returns:
-            Path to created config file
+            Tuple of (path to config file, config dict)
+
+        Raises:
+            BrokerConfigError: If any symbol is not found on Kraken
         """
         self._logger.info("Fetching Kraken broker configuration...")
 
         # Fetch asset pairs
         pairs_data = await self._fetch_asset_pairs()
 
-        # Build config structure
+        # Build config structure (with strict validation)
         config = self._build_config(pairs_data)
 
         # Save to file
-        output_path = self._output_dir / "kraken_demo.json"
+        output_path = self._output_dir / self.CONFIG_FILENAME
 
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
 
         self._logger.info(f"Broker config saved: {output_path}")
-        return output_path
+        return output_path, config
 
     async def _fetch_asset_pairs(self) -> Dict[str, Any]:
         """
@@ -121,11 +141,16 @@ class KrakenBrokerConfigFetcher:
         """
         Build broker config structure.
 
+        STRICT: Raises error if any symbol is not found.
+
         Args:
             pairs_data: Raw API response
 
         Returns:
             Complete config dict
+
+        Raises:
+            BrokerConfigError: If any requested symbol is not found
         """
         now = datetime.now(timezone.utc)
 
@@ -136,13 +161,13 @@ class KrakenBrokerConfigFetcher:
             "export_info": {
                 "timestamp": now.isoformat(),
                 "source": "Kraken Public API",
-                "exporter_version": "1.00",
+                "exporter_version": "1.01",
                 "symbols_total": len(self._symbols)
             },
             "broker_info": {
                 "company": "Kraken",
                 "server": "kraken_spot",
-                "name": "kraken_demo",
+                "name": "kraken_public",
                 "trade_mode": "demo",
                 "api_base_url": "https://api.kraken.com",
                 "websocket_url": "wss://ws.kraken.com/v2"
@@ -166,12 +191,26 @@ class KrakenBrokerConfigFetcher:
             "symbols": {}
         }
 
+        # Track missing symbols for error reporting
+        missing_symbols = []
+
         # Process each target symbol
         for symbol in self._symbols:
             symbol_config = self._find_and_build_symbol(symbol, pairs_data)
             if symbol_config:
                 normalized = self._normalize_symbol(symbol)
                 config["symbols"][normalized] = symbol_config
+            else:
+                missing_symbols.append(symbol)
+
+        # STRICT: Fail if any symbol not found
+        if missing_symbols:
+            raise BrokerConfigError(
+                f"Symbols not found on Kraken: {', '.join(missing_symbols)}. "
+                f"Check symbol names in app_config.json (format: BASE/QUOTE, e.g., BTC/USD)",
+                broker="kraken",
+                endpoint="AssetPairs"
+            )
 
         return config
 
@@ -191,6 +230,11 @@ class KrakenBrokerConfigFetcher:
             Symbol config dict or None if not found
         """
         # Normalize target for matching
+        if "/" not in target_symbol:
+            self._logger.error(
+                f"Invalid symbol format: {target_symbol} (expected BASE/QUOTE)")
+            return None
+
         target_base, target_quote = target_symbol.split("/")
         target_base = self.KRAKEN_TO_STANDARD.get(target_base, target_base)
 
@@ -208,7 +252,6 @@ class KrakenBrokerConfigFetcher:
                         pair_info
                     )
 
-        self._logger.warning(f"Symbol not found: {target_symbol}")
         return None
 
     def _build_symbol_config(
@@ -279,17 +322,21 @@ class KrakenBrokerConfigFetcher:
 
 async def fetch_kraken_broker_config(
     output_dir: Path,
-    symbols: Optional[List[str]] = None
-) -> Path:
+    symbols: List[str]
+) -> Tuple[Path, Dict[str, Any]]:
     """
     Convenience function to fetch and save broker config.
 
     Args:
         output_dir: Directory to save config
-        symbols: Optional list of symbols
+        symbols: List of symbols (REQUIRED)
 
     Returns:
-        Path to created config file
+        Tuple of (path to config file, config dict)
+
+    Raises:
+        ConfigurationError: If symbols have duplicates
+        BrokerConfigError: If any symbol not found on Kraken
     """
     fetcher = KrakenBrokerConfigFetcher(output_dir, symbols)
     return await fetcher.fetch_and_save()

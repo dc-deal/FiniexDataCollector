@@ -23,7 +23,7 @@
       "ADA/USD",
       "XRP/USD",
       "DASH/USD",
-      "ADA/USD",
+      "LTC/USD",
       "ETH/EUR"
     ],
     "reconnect_max_delay_seconds": 60,

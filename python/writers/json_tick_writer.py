@@ -31,6 +31,7 @@ from python.types.tick_types import (
     CollectionSettings,
     ErrorTracking
 )
+from python.types.broker_config_types import BrokerConfig
 from python.exceptions.collector_exceptions import (
     TickWriteError,
     FileRotationError
@@ -149,19 +150,19 @@ class JsonTickWriter(AbstractTickWriter):
     def _start_new_file(self) -> None:
         """Initialize new tick file with lock."""
         now = datetime.now(timezone.utc)
-        self._file_start_time = now
-
-        # Generate filename
         timestamp = now.strftime("%Y%m%d_%H%M%S")
+
         filename = f"{self._symbol}_{timestamp}_ticks.json"
+        lock_filename = f"{filename}.lock"
 
         self._current_file = self._symbol_dir / filename
-        self._current_lock = self._symbol_dir / f"{filename}.lock"
+        self._current_lock = self._symbol_dir / lock_filename
 
         # Create lock file
         self._current_lock.touch()
 
         # Reset state
+        self._file_start_time = now
         self._ticks_buffer = []
         self._current_tick_count = 0
         self._errors = []
@@ -250,12 +251,13 @@ class JsonTickWriter(AbstractTickWriter):
         # Summary
         duration_minutes = 0.0
         if self._file_start_time:
-            delta = now - self._file_start_time
-            duration_minutes = delta.total_seconds() / 60
+            duration = (now - self._file_start_time).total_seconds()
+            duration_minutes = round(duration / 60, 1)
 
         avg_ticks_per_minute = 0.0
         if duration_minutes > 0:
-            avg_ticks_per_minute = len(self._ticks_buffer) / duration_minutes
+            avg_ticks_per_minute = round(
+                len(self._ticks_buffer) / duration_minutes, 1)
 
         summary = TickFileSummary(
             total_ticks=len(self._ticks_buffer),
@@ -265,17 +267,20 @@ class JsonTickWriter(AbstractTickWriter):
             quality_metrics=QualityMetrics(
                 overall_quality_score=self._calculate_quality_score(),
                 data_integrity_score=1.0,
-                data_reliability_score=1.0
+                data_reliability_score=1.0,
+                negligible_error_rate=0.0,
+                serious_error_rate=0.0,
+                fatal_error_rate=0.0
             ),
             timing=TimingSummary(
                 end_time=now.strftime("%Y.%m.%d %H:%M:%S"),
-                duration_minutes=round(duration_minutes, 1),
-                avg_ticks_per_minute=round(avg_ticks_per_minute, 1)
+                duration_minutes=duration_minutes,
+                avg_ticks_per_minute=avg_ticks_per_minute
             ),
             recommendations=self._get_recommendations()
         )
 
-        # Build output dict
+        # Build final structure
         return {
             "metadata": self._metadata_to_dict(metadata),
             "ticks": [self._tick_to_dict(t) for t in self._ticks_buffer],
@@ -297,14 +302,14 @@ class JsonTickWriter(AbstractTickWriter):
         Args:
             content: File content dict
         """
-        # Write to temp file in same directory
-        temp_fd, temp_path = tempfile.mkstemp(
-            suffix='.tmp',
-            dir=self._symbol_dir
+        # Create temp file in same directory
+        fd, temp_path = tempfile.mkstemp(
+            dir=self._symbol_dir,
+            suffix=".tmp"
         )
 
         try:
-            with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(content, f, indent=2)
 
             # Atomic rename
@@ -317,32 +322,30 @@ class JsonTickWriter(AbstractTickWriter):
             raise
 
     def _get_symbol_info(self) -> SymbolInfo:
-        """Get symbol info based on symbol type."""
-        # BTC pairs
-        if self._symbol.startswith("BTC"):
+        """
+        Get symbol info from BrokerConfig.
+
+        Uses API-sourced values for digits, tick_size, point.
+        """
+        try:
+            config = BrokerConfig.get_symbol(self._symbol)
             return SymbolInfo(
-                point_value=0.1,
-                digits=1,
-                tick_size=0.1,
+                point_value=config.tick_size,
+                digits=config.digits,
+                tick_size=config.tick_size,
                 tick_value=1.0
             )
-
-        # ETH pairs
-        if self._symbol.startswith("ETH"):
+        except Exception:
+            # Fallback if BrokerConfig not loaded (should not happen)
+            self._logger.warning(
+                f"BrokerConfig not available for {self._symbol}, using defaults"
+            )
             return SymbolInfo(
-                point_value=0.01,
-                digits=2,
-                tick_size=0.01,
+                point_value=0.00001,
+                digits=5,
+                tick_size=0.00001,
                 tick_value=1.0
             )
-
-        # Default for altcoins
-        return SymbolInfo(
-            point_value=0.00001,
-            digits=5,
-            tick_size=0.00001,
-            tick_value=1.0
-        )
 
     def _calculate_quality_score(self) -> float:
         """Calculate overall quality score."""

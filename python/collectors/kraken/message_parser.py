@@ -11,12 +11,8 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
 from python.types.tick_types import TickData, KrakenTickerMessage
+from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import MessageParseError
-from python.collectors.kraken.symbols import (
-    normalize_symbol,
-    get_tick_size,
-    get_digits
-)
 
 
 class KrakenMessageParser:
@@ -24,6 +20,7 @@ class KrakenMessageParser:
     Parses Kraken WebSocket v2 messages.
 
     Converts ticker updates to TickData format matching MT5 output.
+    Uses BrokerConfig for digits/tick_size (loaded from API).
     """
 
     def __init__(self):
@@ -109,9 +106,11 @@ class KrakenMessageParser:
             if bid <= 0 or ask <= 0:
                 return None
 
+            # Get tick_size and digits from BrokerConfig (API-sourced)
+            tick_size = BrokerConfig.get_tick_size(symbol)
+            digits = BrokerConfig.get_digits(symbol)
+
             # Calculate spread
-            tick_size = get_tick_size(symbol)
-            digits = get_digits(symbol)
             spread_raw = ask - bid
             spread_points = int(spread_raw / tick_size) if tick_size > 0 else 0
             spread_pct = (spread_raw / bid * 100) if bid > 0 else 0.0
