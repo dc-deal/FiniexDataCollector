@@ -316,14 +316,23 @@ class FiniexDataCollector:
         )
 
     def _setup_signal_handlers(self) -> None:
-        """Setup graceful shutdown handlers."""
-        loop = asyncio.get_event_loop()
+        """Setup graceful shutdown handlers (cross-platform)."""
+        if sys.platform == "win32":
+            # Windows: use signal.signal (SIGTERM not available)
+            def win_handler(signum, frame):
+                asyncio.create_task(self._signal_handler())
 
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(
-                sig,
-                lambda: asyncio.create_task(self._signal_handler())
-            )
+            signal.signal(signal.SIGINT, win_handler)
+            # SIGTERM doesn't exist on Windows, skip it
+        else:
+            # Unix: use asyncio signal handlers (cleaner integration)
+            loop = asyncio.get_event_loop()
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(
+                    sig,
+                    lambda: asyncio.create_task(self._signal_handler())
+                )
 
     async def _signal_handler(self) -> None:
         """Handle shutdown signal."""

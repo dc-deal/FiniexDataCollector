@@ -7,10 +7,12 @@ Location: python/collectors/kraken/websocket_client.py
 
 import asyncio
 import json
+import ssl
 import time
 from datetime import datetime, timezone
 from typing import Any, List, Optional, Callable
 
+import certifi
 import websockets
 from websockets.exceptions import (
     ConnectionClosed,
@@ -77,6 +79,9 @@ class KrakenWebSocketClient(AbstractCollector):
         self._reconnect_attempt = 0
         self._should_reconnect = True
 
+        # SSL context with certifi certificates (cross-platform)
+        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
+
         # Callbacks
         self._status_callback: Optional[Callable[[str], None]] = None
 
@@ -119,6 +124,7 @@ class KrakenWebSocketClient(AbstractCollector):
 
             self._websocket = await websockets.connect(
                 self._url,
+                ssl=self._ssl_context,
                 ping_interval=20,
                 ping_timeout=10,
                 close_timeout=5

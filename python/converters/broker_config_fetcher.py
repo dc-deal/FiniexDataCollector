@@ -8,11 +8,13 @@ Location: python/converters/broker_config_fetcher.py
 """
 
 import json
+import ssl
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
 import aiohttp
+import certifi
 
 from python.exceptions.collector_exceptions import BrokerConfigError, ConfigurationError
 from python.utils.logging_setup import get_logger
@@ -70,6 +72,9 @@ class KrakenBrokerConfigFetcher:
         self._symbols = symbols
         self._logger = get_logger("FiniexDataCollector.broker_config")
 
+        # SSL context with certifi certificates (cross-platform)
+        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
+
         # Ensure output directory exists
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -110,7 +115,8 @@ class KrakenBrokerConfigFetcher:
         url = f"{self.API_BASE}/AssetPairs"
 
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url, timeout=30) as response:
                     if response.status != 200:
                         raise BrokerConfigError(
