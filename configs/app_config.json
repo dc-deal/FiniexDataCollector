@@ -26,6 +26,9 @@
       "LTC/USD",
       "ETH/EUR"
     ],
+    "streams": [
+      "trade"
+    ],
     "reconnect_max_delay_seconds": 60,
     "reconnect_initial_delay_seconds": 1,
     "heartbeat_interval_seconds": 30,
@@ -52,7 +55,7 @@
     "rsync_user": ""
   },
   "scheduler": {
-    "parquet_conversion_enabled": true,
+    "parquet_conversion_enabled": false,
     "conversion_day": "saturday",
     "conversion_hour_utc": 6,
     "report_email_enabled": false,

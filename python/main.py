@@ -167,6 +167,7 @@ class FiniexDataCollector:
         # Create collector
         collector = KrakenWebSocketClient(
             symbols=self._config.kraken.symbols,
+            streams=self._config.kraken.streams,
             url=self._config.kraken.websocket_url,
             reconnect_initial_delay=self._config.kraken.reconnect_initial_delay_seconds,
             reconnect_max_delay=self._config.kraken.reconnect_max_delay_seconds,

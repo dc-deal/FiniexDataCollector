@@ -34,20 +34,23 @@ from python.utils.logging_setup import get_collector_logger
 
 class KrakenWebSocketClient(AbstractCollector):
     """
-    Kraken WebSocket v2 ticker collector.
+    Kraken WebSocket v2 ticker/trade collector.
 
     Features:
     - Automatic reconnection with exponential backoff
     - Heartbeat monitoring
     - Multi-symbol subscription
+    - Configurable streams (ticker, trade)
     - Graceful shutdown
     """
 
     DEFAULT_URL = "wss://ws.kraken.com/v2"
+    VALID_STREAMS = {"ticker", "trade"}
 
     def __init__(
         self,
         symbols: List[str],
+        streams: List[str] = None,
         url: str = DEFAULT_URL,
         reconnect_initial_delay: float = 1.0,
         reconnect_max_delay: float = 60.0,
@@ -58,6 +61,7 @@ class KrakenWebSocketClient(AbstractCollector):
 
         Args:
             symbols: List of symbols to subscribe (e.g., ["BTC/USD", "ETH/USD"])
+            streams: List of streams to subscribe (e.g., ["ticker"], ["trade"], ["ticker", "trade"])
             url: WebSocket URL
             reconnect_initial_delay: Initial reconnect delay in seconds
             reconnect_max_delay: Maximum reconnect delay in seconds
@@ -66,9 +70,16 @@ class KrakenWebSocketClient(AbstractCollector):
         super().__init__(name="kraken", symbols=symbols)
 
         self._url = url
+        self._streams = streams if streams else ["ticker"]
         self._reconnect_initial_delay = reconnect_initial_delay
         self._reconnect_max_delay = reconnect_max_delay
         self._heartbeat_interval = heartbeat_interval
+
+        # Validate streams
+        for stream in self._streams:
+            if stream not in self.VALID_STREAMS:
+                raise ValueError(
+                    f"Invalid stream '{stream}'. Valid: {self.VALID_STREAMS}")
 
         self._websocket: Optional[Any] = None
         self._parser = KrakenMessageParser()
@@ -171,7 +182,7 @@ class KrakenWebSocketClient(AbstractCollector):
 
     async def subscribe(self) -> bool:
         """
-        Subscribe to ticker channel for configured symbols.
+        Subscribe to configured channels for configured symbols.
 
         Returns:
             True if subscription successful
@@ -182,50 +193,52 @@ class KrakenWebSocketClient(AbstractCollector):
         # Convert symbols to Kraken format
         kraken_symbols = [to_kraken_format(s) for s in self._symbols]
 
-        subscribe_msg = {
-            "method": "subscribe",
-            "params": {
-                "channel": "ticker",
-                "symbol": kraken_symbols
+        # Subscribe to each configured stream
+        for stream in self._streams:
+            subscribe_msg = {
+                "method": "subscribe",
+                "params": {
+                    "channel": stream,
+                    "symbol": kraken_symbols
+                }
             }
-        }
 
-        try:
-            await self._websocket.send(json.dumps(subscribe_msg))
-            self._logger.info(
-                f"Subscription request sent for {kraken_symbols}")
-
-            # Wait for confirmation (with timeout)
             try:
-                response = await asyncio.wait_for(
-                    self._websocket.recv(),
-                    timeout=10.0
-                )
+                await self._websocket.send(json.dumps(subscribe_msg))
+                self._logger.info(
+                    f"Subscription request sent: {stream} for {kraken_symbols}")
 
-                if self._parser.is_subscription_confirmation(response):
-                    self._logger.info("Subscription confirmed")
-                    return True
-
-                error = self._parser.is_error_message(response)
-                if error:
-                    raise WebSocketSubscriptionError(
-                        message=error,
-                        channel="ticker",
-                        symbols=kraken_symbols
+                # Wait for confirmation (with timeout)
+                try:
+                    response = await asyncio.wait_for(
+                        self._websocket.recv(),
+                        timeout=10.0
                     )
 
-            except asyncio.TimeoutError:
-                self._logger.warning("Subscription confirmation timeout")
+                    if self._parser.is_subscription_confirmation(response):
+                        self._logger.info(f"Subscription confirmed: {stream}")
+                    else:
+                        error = self._parser.is_error_message(response)
+                        if error:
+                            raise WebSocketSubscriptionError(
+                                message=error,
+                                channel=stream,
+                                symbols=kraken_symbols
+                            )
 
-            return True  # Continue anyway, might receive data
+                except asyncio.TimeoutError:
+                    self._logger.warning(
+                        f"Subscription confirmation timeout: {stream}")
 
-        except Exception as e:
-            self._logger.error(f"Subscription failed: {e}")
-            raise WebSocketSubscriptionError(
-                message=str(e),
-                channel="ticker",
-                symbols=kraken_symbols
-            )
+            except Exception as e:
+                self._logger.error(f"Subscription failed for {stream}: {e}")
+                raise WebSocketSubscriptionError(
+                    message=str(e),
+                    channel=stream,
+                    symbols=kraken_symbols
+                )
+
+        return True
 
     async def start(self) -> None:
         """Start tick collection."""
@@ -234,7 +247,9 @@ class KrakenWebSocketClient(AbstractCollector):
         self._start_time = datetime.now(timezone.utc)
 
         self._logger.info(
-            f"Starting Kraken collector for {len(self._symbols)} symbols")
+            f"Starting Kraken collector for {len(self._symbols)} symbols, "
+            f"streams: {self._streams}"
+        )
 
         while self._should_reconnect:
             try:
@@ -292,7 +307,7 @@ class KrakenWebSocketClient(AbstractCollector):
             if self._parser.is_heartbeat(message):
                 continue
 
-            # Parse ticker messages
+            # Parse ticker/trade messages
             try:
                 ticks = self._parser.parse_message(message)
                 if ticks:
@@ -376,6 +391,7 @@ class KrakenWebSocketClient(AbstractCollector):
             warnings=warnings,
             details={
                 "url": self._url,
+                "streams": self._streams,
                 "reconnect_attempts": self._reconnect_attempt,
                 "heartbeat_interval": self._heartbeat_interval
             }

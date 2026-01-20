@@ -1,6 +1,6 @@
 """
 FiniexDataCollector - Kraken Message Parser
-Parses Kraken WebSocket v2 ticker messages into TickData format.
+Parses Kraken WebSocket v2 ticker and trade messages into TickData format.
 
 Location: python/collectors/kraken/message_parser.py
 """
@@ -19,8 +19,7 @@ class KrakenMessageParser:
     """
     Parses Kraken WebSocket v2 messages.
 
-    Converts ticker updates to TickData format matching MT5 output.
-    Uses BrokerConfig for digits/tick_size (loaded from API).
+    Converts ticker and trade updates to TickData format matching MT5 output.
     """
 
     def __init__(self):
@@ -35,7 +34,7 @@ class KrakenMessageParser:
             raw_message: JSON string from WebSocket
 
         Returns:
-            List of TickData if ticker message, None for other messages
+            List of TickData if ticker/trade message, None for other messages
 
         Raises:
             MessageParseError: If message parsing fails
@@ -48,19 +47,33 @@ class KrakenMessageParser:
                 raw_message=raw_message
             )
 
-        # Skip non-ticker messages
+        # Skip non-dict messages
         if not isinstance(data, dict):
             return None
 
         channel = data.get("channel")
-        if channel != "ticker":
-            return None
-
         msg_type = data.get("type")
-        if msg_type not in ("snapshot", "update"):
-            return None
 
-        # Parse ticker data array
+        # Handle ticker channel
+        if channel == "ticker" and msg_type in ("snapshot", "update"):
+            return self._parse_ticker_message(data)
+
+        # Handle trade channel
+        if channel == "trade" and msg_type in ("snapshot", "update"):
+            return self._parse_trade_message(data)
+
+        return None
+
+    def _parse_ticker_message(self, data: Dict[str, Any]) -> Optional[List[TickData]]:
+        """
+        Parse ticker channel message.
+
+        Args:
+            data: Parsed JSON dict
+
+        Returns:
+            List of TickData or None
+        """
         ticker_data = data.get("data", [])
         if not ticker_data:
             return None
@@ -70,6 +83,29 @@ class KrakenMessageParser:
 
         for ticker in ticker_data:
             tick = self._parse_ticker_to_tick(ticker, receive_time_msc)
+            if tick:
+                ticks.append(tick)
+
+        return ticks if ticks else None
+
+    def _parse_trade_message(self, data: Dict[str, Any]) -> Optional[List[TickData]]:
+        """
+        Parse trade channel message.
+
+        Args:
+            data: Parsed JSON dict
+
+        Returns:
+            List of TickData or None
+        """
+        trade_data = data.get("data", [])
+        if not trade_data:
+            return None
+
+        ticks = []
+
+        for trade in trade_data:
+            tick = self._parse_trade_to_tick(trade)
             if tick:
                 ticks.append(tick)
 
@@ -106,7 +142,7 @@ class KrakenMessageParser:
             if bid <= 0 or ask <= 0:
                 return None
 
-            # Get tick_size and digits from BrokerConfig (API-sourced)
+            # Get symbol config from BrokerConfig
             tick_size = BrokerConfig.get_tick_size(symbol)
             digits = BrokerConfig.get_digits(symbol)
 
@@ -147,6 +183,96 @@ class KrakenMessageParser:
                 f"Failed to parse ticker: {e}",
                 raw_message=str(ticker),
                 symbol=ticker.get("symbol")
+            )
+
+    def _parse_trade_to_tick(self, trade: Dict[str, Any]) -> Optional[TickData]:
+        """
+        Convert single trade message to TickData.
+
+        Kraken trade format:
+        {
+            "symbol": "BTC/USD",
+            "side": "buy" | "sell",
+            "price": 92642.7,
+            "qty": 0.01,
+            "ord_type": "market",
+            "trade_id": 12345,
+            "timestamp": "2026-01-19T07:44:05.371000Z"
+        }
+
+        Args:
+            trade: Trade data dict from Kraken
+
+        Returns:
+            TickData instance or None if invalid
+        """
+        try:
+            kraken_symbol = trade.get("symbol", "")
+            if not kraken_symbol:
+                return None
+
+            symbol = normalize_symbol(kraken_symbol)
+
+            price = float(trade.get("price", 0))
+            qty = float(trade.get("qty", 0))
+            side = trade.get("side", "").upper()  # "BUY" or "SELL"
+
+            # Skip invalid trades
+            if price <= 0:
+                return None
+
+            # Get symbol config from BrokerConfig
+            digits = BrokerConfig.get_digits(symbol)
+
+            # Parse Kraken timestamp (ISO format)
+            timestamp_str_kraken = trade.get("timestamp", "")
+            if timestamp_str_kraken:
+                try:
+                    dt_utc = datetime.fromisoformat(
+                        timestamp_str_kraken.replace("Z", "+00:00")
+                    )
+                    time_msc = int(dt_utc.timestamp() * 1000)
+                except ValueError:
+                    dt_utc = datetime.now(timezone.utc)
+                    time_msc = int(time.time() * 1000)
+            else:
+                dt_utc = datetime.now(timezone.utc)
+                time_msc = int(time.time() * 1000)
+
+            timestamp_str = dt_utc.strftime("%Y.%m.%d %H:%M:%S")
+            server_time_str = timestamp_str
+
+            # Increment tick counter for chart_tick_volume
+            if symbol not in self._tick_counter:
+                self._tick_counter[symbol] = 0
+            self._tick_counter[symbol] += 1
+
+            # Trade price becomes bid/ask/last
+            # No spread info in trades
+            rounded_price = round(price, digits)
+
+            return TickData(
+                symbol=symbol,
+                timestamp=timestamp_str,
+                time_msc=time_msc,
+                bid=rounded_price,
+                ask=rounded_price,
+                last=rounded_price,
+                tick_volume=0,
+                real_volume=round(qty, 8),
+                chart_tick_volume=self._tick_counter[symbol],
+                spread_points=0,
+                spread_pct=0.0,
+                tick_flags=side if side else "TRADE",
+                session="24h",
+                server_time=server_time_str
+            )
+
+        except (KeyError, ValueError, TypeError) as e:
+            raise MessageParseError(
+                f"Failed to parse trade: {e}",
+                raw_message=str(trade),
+                symbol=trade.get("symbol")
             )
 
     def parse_kraken_ticker(

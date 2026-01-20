@@ -60,6 +60,8 @@ class KrakenCollectorConfig:
         "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD",
         "MATIC/USD", "AVAX/USD", "LINK/USD", "DOT/USD"
     ])
+    streams: List[str] = field(default_factory=lambda: [
+                               "ticker"])  # "ticker", "trade"
     reconnect_max_delay_seconds: int = 60
     reconnect_initial_delay_seconds: int = 1
     heartbeat_interval_seconds: int = 30
@@ -241,6 +243,7 @@ class ConfigLoader:
                 "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD",
                 "MATIC/USD", "AVAX/USD", "LINK/USD", "DOT/USD"
             ]),
+            streams=data.get("streams", ["ticker"]),
             reconnect_max_delay_seconds=data.get(
                 "reconnect_max_delay_seconds", 60),
             reconnect_initial_delay_seconds=data.get(
