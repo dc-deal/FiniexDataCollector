@@ -33,6 +33,7 @@ class SymbolStats:
     last_bid: float = 0.0
     last_ask: float = 0.0
     last_spread_pct: float = 0.0
+    last_volume: float = 0.0
     last_tick_time: Optional[datetime] = None
     errors_count: int = 0
     file_count: int = 0
@@ -125,7 +126,7 @@ class CollectorStats:
             self.symbols[symbol] = SymbolStats(symbol=symbol)
         return self.symbols[symbol]
 
-    def record_tick(self, symbol: str, bid: float, ask: float, spread_pct: float) -> None:
+    def record_tick(self, symbol: str, bid: float, ask: float, spread_pct: float, real_volume: float) -> None:
         """
         Record a received tick.
 
@@ -140,6 +141,7 @@ class CollectorStats:
         stats.last_bid = bid
         stats.last_ask = ask
         stats.last_spread_pct = spread_pct
+        stats.last_volume = real_volume
         stats.last_tick_time = datetime.utcnow()
         stats.current_file_ticks += 1
         self.total_ticks += 1

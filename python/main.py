@@ -227,7 +227,8 @@ class FiniexDataCollector:
             symbol=symbol,
             bid=tick.bid,
             ask=tick.ask,
-            spread_pct=tick.spread_pct
+            spread_pct=tick.spread_pct,
+            real_volume=tick.real_volume
         )
 
         # Log first tick for this symbol

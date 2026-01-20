@@ -210,7 +210,7 @@ class LiveDisplay:
                 # Trade stream: show last price and volume
                 price_str = f"{stats.last_bid:,.2f}" if stats.last_bid > 0 else "-"
                 # For trades, last_ask is same as last_bid, use spread_pct field for volume display
-                vol_str = "-"  # Volume tracking would need stats update
+                vol_str = f"{stats.last_volume:.4f}" if stats.last_volume > 0 else "-"
 
                 table.add_row(
                     f"[bold]{symbol}[/bold]",
