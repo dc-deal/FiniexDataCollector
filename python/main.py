@@ -133,7 +133,10 @@ class FiniexDataCollector:
         self._is_running = True
 
         # Start live display
-        self._live_display = LiveDisplay(self._stats)
+        self._live_display = LiveDisplay(
+            self._stats,
+            streams=self._config.kraken.streams
+        )
         await self._live_display.start()
 
         # Wait for shutdown

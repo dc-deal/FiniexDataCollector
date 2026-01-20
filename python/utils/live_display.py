@@ -5,6 +5,7 @@ Real-time terminal display for collection monitoring using rich.
 Features:
 - Live updating table with per-symbol stats
 - WebSocket connection status
+- Stream configuration display
 - Recent errors/warnings with count
 - Last file info
 - Uptime and totals
@@ -14,7 +15,7 @@ Location: python/utils/live_display.py
 
 import asyncio
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from rich.console import Console
 from rich.live import Live
@@ -38,6 +39,7 @@ class LiveDisplay:
     def __init__(
         self,
         stats: CollectorStats,
+        streams: List[str] = None,
         update_interval: float = 1.0,
         max_log_lines: int = 5
     ):
@@ -46,10 +48,12 @@ class LiveDisplay:
 
         Args:
             stats: Shared CollectorStats object
+            streams: List of active streams (e.g., ["ticker"], ["trade"])
             update_interval: Display update interval in seconds
             max_log_lines: Maximum log lines to show (rest shown as "...")
         """
         self._stats = stats
+        self._streams = streams if streams else ["ticker"]
         self._update_interval = update_interval
         self._max_log_lines = max_log_lines
         self._running = False
@@ -132,7 +136,7 @@ class LiveDisplay:
         )
 
     def _build_header(self) -> Text:
-        """Build header with uptime and totals."""
+        """Build header with uptime, totals, and stream info."""
         uptime = self._format_uptime(self._stats.get_uptime_seconds())
 
         # WebSocket status with color
@@ -144,13 +148,16 @@ class LiveDisplay:
         else:
             ws_display = "[red]○ disconnected[/red]"
 
+        # Streams display
+        streams_str = ", ".join(self._streams)
+
         header = (
+            f"[bold]📋 Streams:[/bold] [magenta]{streams_str}[/magenta] │ "
             f"[bold]⏱️ Uptime:[/bold] {uptime} │ "
             f"[bold]📊 Ticks:[/bold] {self._stats.total_ticks:,} │ "
             f"[bold]📁 Files:[/bold] {self._stats.total_files} │ "
             f"[bold]🔌 WS:[/bold] {ws_display} │ "
-            f"[bold]⚠️ Errors:[/bold] [red]{self._stats.total_errors}[/red] │ "
-            f"[bold]⚡ Warnings:[/bold] [yellow]{self._stats.total_warnings}[/yellow]"
+            f"[bold]⚠️ Errors:[/bold] [red]{self._stats.total_errors}[/red]"
         )
 
         return Text.from_markup(header)
@@ -164,20 +171,27 @@ class LiveDisplay:
             padding=(0, 1)
         )
 
-        # Columns
+        # Columns - adapt based on stream type
         table.add_column("Symbol", width=10)
         table.add_column("Ticks", justify="right", width=10)
         table.add_column("Ticks/min", justify="right", width=10)
-        table.add_column("Bid", justify="right", width=12)
-        table.add_column("Ask", justify="right", width=12)
-        table.add_column("Spread %", justify="right", width=10)
+
+        # For trade streams, show Price instead of Bid/Ask
+        if "trade" in self._streams and "ticker" not in self._streams:
+            table.add_column("Last Price", justify="right", width=14)
+            table.add_column("Volume", justify="right", width=12)
+        else:
+            table.add_column("Bid", justify="right", width=12)
+            table.add_column("Ask", justify="right", width=12)
+            table.add_column("Spread %", justify="right", width=10)
+
         table.add_column("Files", justify="right", width=6)
         table.add_column("Status", width=12)
 
         # No symbols yet
         if not self._stats.symbols:
             table.add_row(
-                "[dim]Waiting...[/dim]", "", "", "", "", "", "", ""
+                "[dim]Waiting...[/dim]", "", "", "", "", "", ""
             )
             return table
 
@@ -191,21 +205,38 @@ class LiveDisplay:
             else:
                 status = "[dim]⏳ Waiting[/dim]"
 
-            # Format prices (handle 0 gracefully)
-            bid_str = f"{stats.last_bid:,.2f}" if stats.last_bid > 0 else "-"
-            ask_str = f"{stats.last_ask:,.2f}" if stats.last_ask > 0 else "-"
-            spread_str = f"{stats.last_spread_pct:.4f}" if stats.last_spread_pct > 0 else "-"
+            # Format based on stream type
+            if "trade" in self._streams and "ticker" not in self._streams:
+                # Trade stream: show last price and volume
+                price_str = f"{stats.last_bid:,.2f}" if stats.last_bid > 0 else "-"
+                # For trades, last_ask is same as last_bid, use spread_pct field for volume display
+                vol_str = "-"  # Volume tracking would need stats update
 
-            table.add_row(
-                f"[bold]{symbol}[/bold]",
-                f"{stats.ticks_count:,}",
-                f"{stats.ticks_per_minute:.1f}",
-                bid_str,
-                ask_str,
-                spread_str,
-                str(stats.file_count),
-                status
-            )
+                table.add_row(
+                    f"[bold]{symbol}[/bold]",
+                    f"{stats.ticks_count:,}",
+                    f"{stats.ticks_per_minute:.1f}",
+                    price_str,
+                    vol_str,
+                    str(stats.file_count),
+                    status
+                )
+            else:
+                # Ticker stream: show bid/ask/spread
+                bid_str = f"{stats.last_bid:,.2f}" if stats.last_bid > 0 else "-"
+                ask_str = f"{stats.last_ask:,.2f}" if stats.last_ask > 0 else "-"
+                spread_str = f"{stats.last_spread_pct:.4f}" if stats.last_spread_pct > 0 else "-"
+
+                table.add_row(
+                    f"[bold]{symbol}[/bold]",
+                    f"{stats.ticks_count:,}",
+                    f"{stats.ticks_per_minute:.1f}",
+                    bid_str,
+                    ask_str,
+                    spread_str,
+                    str(stats.file_count),
+                    status
+                )
 
         return table
 
