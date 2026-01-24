@@ -6,10 +6,12 @@ Location: python/alerts/telegram_bot.py
 """
 
 import asyncio
+import ssl
 from typing import Optional
 from urllib.parse import quote
 
 import aiohttp
+import certifi
 
 from python.alerts.base import AbstractAlertProvider, Alert, AlertLevel
 from python.exceptions.collector_exceptions import AlertDeliveryError
@@ -54,6 +56,9 @@ class TelegramAlertProvider(AbstractAlertProvider):
         self._send_on_rotation = send_on_rotation
         self._send_weekly_report = send_weekly_report
         self._logger = get_logger("FiniexDataCollector.telegram")
+
+        # SSL context with certifi certificates (cross-platform)
+        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     @property
     def is_configured(self) -> bool:
@@ -115,7 +120,8 @@ class TelegramAlertProvider(AbstractAlertProvider):
             # Use getMe to verify bot token
             url = f"{self.API_BASE}{self._bot_token}/getMe"
 
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url, timeout=10) as response:
                     if response.status == 200:
                         data = await response.json()
@@ -229,7 +235,8 @@ class TelegramAlertProvider(AbstractAlertProvider):
             payload["parse_mode"] = parse_mode
 
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.post(url, json=payload, timeout=30) as response:
                     if response.status == 200:
                         data = await response.json()
