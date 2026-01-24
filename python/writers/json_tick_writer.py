@@ -82,7 +82,7 @@ class JsonTickWriter(AbstractTickWriter):
         self._errors: List[Dict[str, Any]] = []
 
         # Ensure output directory exists
-        self._symbol_dir = self._output_dir / data_collector / symbol
+        self._symbol_dir = self._output_dir / data_collector
         self._symbol_dir.mkdir(parents=True, exist_ok=True)
 
     def write_tick(self, tick: TickData) -> None:
