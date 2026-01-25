@@ -53,6 +53,7 @@ class JsonTickWriter(AbstractTickWriter):
         symbol: str,
         broker: str = "Kraken",
         server: str = "kraken_spot",
+        broker_type: str = "",
         max_ticks_per_file: int = 50000,
         data_collector: str = "kraken"
     ):
@@ -64,6 +65,7 @@ class JsonTickWriter(AbstractTickWriter):
             symbol: Trading symbol (normalized, e.g., "BTCUSD")
             broker: Broker name
             server: Server identifier
+            broker_type: Broker type identifier (e.g., "kraken_spot")
             max_ticks_per_file: Maximum ticks before rotation
             data_collector: Data collector identifier
         """
@@ -71,6 +73,7 @@ class JsonTickWriter(AbstractTickWriter):
 
         self._broker = broker
         self._server = server
+        self._broker_type = broker_type
         self._data_collector = data_collector
         self._logger = get_collector_logger(f"writer.{symbol}")
 
@@ -227,6 +230,7 @@ class JsonTickWriter(AbstractTickWriter):
             symbol=self._symbol,
             broker=self._broker,
             server=self._server,
+            broker_type=self._broker_type,
             broker_utc_offset_hours=0,
             local_device_time=now.strftime("%Y.%m.%d %H:%M:%S"),
             broker_server_time=now.strftime("%Y.%m.%d %H:%M:%S"),
@@ -237,7 +241,7 @@ class JsonTickWriter(AbstractTickWriter):
             timeframe="TICK",
             volume_timeframe="PERIOD_M1",
             volume_timeframe_minutes=1,
-            data_format_version="1.0.5",
+            data_format_version="1.2.0",
             data_collector=self._data_collector,
             collection_purpose="backtesting",
             operator="automated",
@@ -370,6 +374,7 @@ class JsonTickWriter(AbstractTickWriter):
             "symbol": metadata.symbol,
             "broker": metadata.broker,
             "server": metadata.server,
+            "broker_type": metadata.broker_type,
             "broker_utc_offset_hours": metadata.broker_utc_offset_hours,
             "local_device_time": metadata.local_device_time,
             "broker_server_time": metadata.broker_server_time,

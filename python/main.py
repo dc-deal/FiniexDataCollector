@@ -160,7 +160,8 @@ class FiniexDataCollector:
                 output_dir=raw_dir,
                 symbol=normalized,
                 broker="Kraken",
-                server="kraken_spot",
+                server=self._config.kraken.server_name,
+                broker_type=self._config.kraken.broker_type,
                 max_ticks_per_file=self._config.kraken.max_ticks_per_file,
                 data_collector="kraken"
             )
@@ -407,7 +408,8 @@ async def ensure_broker_config(config: AppConfig, logger) -> Path:
     try:
         filepath, _ = await fetch_kraken_broker_config(
             output_dir=broker_config_dir,
-            symbols=config.kraken.symbols
+            symbols=config.kraken.symbols,
+            broker_type=config.kraken.broker_type
         )
         logger.info(f"Broker config ready: {filepath}")
         return filepath
@@ -485,7 +487,8 @@ async def cmd_broker_config(config: AppConfig) -> None:
 
     filepath, _ = await fetch_kraken_broker_config(
         output_dir=output_dir,
-        symbols=config.kraken.symbols
+        symbols=config.kraken.symbols,
+        broker_type=config.kraken.broker_type
     )
 
     logger.info(f"Broker config saved: {filepath}")

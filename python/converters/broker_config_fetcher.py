@@ -40,21 +40,28 @@ class KrakenBrokerConfigFetcher:
         "XETH": "ETH",
     }
 
-    def __init__(self, output_dir: Path, symbols: List[str]):
+    def __init__(self, output_dir: Path, symbols: List[str], broker_type: str):
         """
         Initialize broker config fetcher.
 
         Args:
             output_dir: Directory to write broker config
             symbols: List of symbols to include (REQUIRED)
+            broker_type: Broker type identifier (e.g., "kraken_spot")
 
         Raises:
-            ConfigurationError: If symbols list is empty or has duplicates
+            ConfigurationError: If symbols list is empty or has duplicates, or broker_type empty
         """
         if not symbols:
             raise ConfigurationError(
                 "Symbols list cannot be empty",
-                missing_key="kraken.symbols"
+                missing_keys=["kraken.symbols"]
+            )
+
+        if not broker_type or not broker_type.strip():
+            raise ConfigurationError(
+                "broker_type cannot be empty",
+                missing_keys=["kraken.broker_type"]
             )
 
         # Check for duplicates
@@ -70,13 +77,8 @@ class KrakenBrokerConfigFetcher:
 
         self._output_dir = Path(output_dir)
         self._symbols = symbols
+        self._broker_type = broker_type.strip()
         self._logger = get_logger("FiniexDataCollector.broker_config")
-
-        # SSL context with certifi certificates (cross-platform)
-        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
-
-        # Ensure output directory exists
-        self._output_dir.mkdir(parents=True, exist_ok=True)
 
     async def fetch_and_save(self) -> Tuple[Path, Dict[str, Any]]:
         """
@@ -163,7 +165,7 @@ class KrakenBrokerConfigFetcher:
         config = {
             "_comment": "Static broker configuration for FiniexTestingIDE - Kraken Spot",
             "_version": "1.0",
-            "broker_type": "kraken_spot",
+            "broker_type": self._broker_type,
             "export_info": {
                 "timestamp": now.isoformat(),
                 "source": "Kraken Public API",
@@ -172,11 +174,12 @@ class KrakenBrokerConfigFetcher:
             },
             "broker_info": {
                 "company": "Kraken",
-                "server": "kraken_spot",
+                "server": f"{self._broker_type}_server",
                 "name": "kraken_public",
                 "trade_mode": "demo",
                 "api_base_url": "https://api.kraken.com",
-                "websocket_url": "wss://ws.kraken.com/v2"
+                "websocket_url": "wss://ws.kraken.com/v2",
+                "broker_type": self._broker_type
             },
             "fee_structure": {
                 "model": "maker_taker",
@@ -328,7 +331,8 @@ class KrakenBrokerConfigFetcher:
 
 async def fetch_kraken_broker_config(
     output_dir: Path,
-    symbols: List[str]
+    symbols: List[str],
+    broker_type: str
 ) -> Tuple[Path, Dict[str, Any]]:
     """
     Convenience function to fetch and save broker config.
@@ -336,13 +340,14 @@ async def fetch_kraken_broker_config(
     Args:
         output_dir: Directory to save config
         symbols: List of symbols (REQUIRED)
+        broker_type: Broker type identifier (e.g., "kraken_spot")
 
     Returns:
         Tuple of (path to config file, config dict)
 
     Raises:
-        ConfigurationError: If symbols have duplicates
+        ConfigurationError: If symbols have duplicates or broker_type empty
         BrokerConfigError: If any symbol not found on Kraken
     """
-    fetcher = KrakenBrokerConfigFetcher(output_dir, symbols)
+    fetcher = KrakenBrokerConfigFetcher(output_dir, symbols, broker_type)
     return await fetcher.fetch_and_save()

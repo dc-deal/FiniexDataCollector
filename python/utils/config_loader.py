@@ -55,6 +55,9 @@ class SchedulerConfig:
 class KrakenCollectorConfig:
     """Kraken WebSocket collector configuration."""
     enabled: bool = True
+    broker_type: str = ""  # REQUIRED - set in config validation
+    # Optional - defaults to broker_type_server
+    server_name: Optional[str] = None
     websocket_url: str = "wss://ws.kraken.com/v2"
     symbols: List[str] = field(default_factory=lambda: [
         "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD",
@@ -201,21 +204,21 @@ class ConfigLoader:
             raise ConfigurationError(
                 "Missing required 'logging' section in config",
                 config_file=str(self._config_path),
-                missing_key="logging"
+                missing_keys=["logging"]
             )
 
         if "console_level" not in data:
             raise ConfigurationError(
                 "Missing required 'console_level' in logging config",
                 config_file=str(self._config_path),
-                missing_key="logging.console_level"
+                missing_keys=["logging.console_level"]
             )
 
         if "file_level" not in data:
             raise ConfigurationError(
                 "Missing required 'file_level' in logging config",
                 config_file=str(self._config_path),
-                missing_key="logging.file_level"
+                missing_keys=["logging.file_level"]
             )
 
         return LoggingConfig(
@@ -235,9 +238,37 @@ class ConfigLoader:
         )
 
     def _parse_kraken(self, data: Dict[str, Any]) -> KrakenCollectorConfig:
-        """Parse Kraken collector configuration section."""
+        """
+        Parse Kraken collector configuration section.
+
+        Args:
+            data: Kraken config section from JSON
+
+        Returns:
+            KrakenCollectorConfig instance
+
+        Raises:
+            ConfigurationError: If broker_type missing
+        """
+        # REQUIRED: broker_type
+        broker_type = data.get("broker_type", "").strip()
+        if not broker_type:
+            raise ConfigurationError(
+                "Missing required 'broker_type' in kraken config. "
+                "Add 'broker_type': 'kraken_spot' to kraken section in app_config.json",
+                config_file=str(self._config_path),
+                missing_keys=["kraken.broker_type"]
+            )
+
+        # Optional: server_name (defaults to broker_type_server)
+        server_name = data.get("server_name")
+        if not server_name:
+            server_name = f"{broker_type}_server"
+
         return KrakenCollectorConfig(
             enabled=data.get("enabled", True),
+            broker_type=broker_type,
+            server_name=server_name,
             websocket_url=data.get("websocket_url", "wss://ws.kraken.com/v2"),
             symbols=data.get("symbols", [
                 "BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD",

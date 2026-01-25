@@ -249,7 +249,7 @@ class LiveDisplay:
             lf = self._stats.last_file
             lines.append(
                 f"[bold]📄 Last file:[/bold] {lf.filename} "
-                f"([cyan]{lf.tick_count:,} ticks[/cyan])"
+                f"([cyan]{lf.tick_count+1:,} ticks[/cyan])"
             )
         else:
             lines.append("[dim]📄 No files created yet[/dim]")

@@ -16,7 +16,7 @@ class CollectorException(Exception):
 
 class WebSocketConnectionError(CollectorException):
     """Raised when WebSocket connection fails."""
-    
+
     def __init__(
         self,
         message: str,
@@ -34,7 +34,7 @@ class WebSocketConnectionError(CollectorException):
 
 class WebSocketSubscriptionError(CollectorException):
     """Raised when subscription to channel fails."""
-    
+
     def __init__(
         self,
         message: str,
@@ -50,7 +50,7 @@ class WebSocketSubscriptionError(CollectorException):
 
 class MessageParseError(CollectorException):
     """Raised when WebSocket message parsing fails."""
-    
+
     def __init__(
         self,
         message: str,
@@ -65,7 +65,7 @@ class MessageParseError(CollectorException):
 
 class TickWriteError(CollectorException):
     """Raised when tick write operation fails."""
-    
+
     def __init__(
         self,
         message: str,
@@ -81,7 +81,7 @@ class TickWriteError(CollectorException):
 
 class FileRotationError(CollectorException):
     """Raised when file rotation fails."""
-    
+
     def __init__(
         self,
         message: str,
@@ -97,7 +97,7 @@ class FileRotationError(CollectorException):
 
 class ConfigurationError(CollectorException):
     """Raised when configuration is invalid or missing."""
-    
+
     def __init__(
         self,
         message: str,
@@ -106,19 +106,19 @@ class ConfigurationError(CollectorException):
     ):
         self.config_file = config_file
         self.missing_keys = missing_keys or []
-        
+
         detail = ""
         if config_file:
             detail += f" (File: {config_file})"
         if missing_keys:
             detail += f" Missing: {missing_keys}"
-            
+
         super().__init__(f"{message}{detail}")
 
 
 class BrokerConfigError(CollectorException):
     """Raised when broker config fetch or parse fails."""
-    
+
     def __init__(
         self,
         message: str,
@@ -136,7 +136,7 @@ class BrokerConfigError(CollectorException):
 
 class ParquetConversionError(CollectorException):
     """Raised when JSON to Parquet conversion fails."""
-    
+
     def __init__(
         self,
         message: str,
@@ -154,7 +154,7 @@ class ParquetConversionError(CollectorException):
 
 class AlertDeliveryError(CollectorException):
     """Raised when alert delivery fails."""
-    
+
     def __init__(
         self,
         message: str,
@@ -172,7 +172,7 @@ class AlertDeliveryError(CollectorException):
 class CollectorHealthReport:
     """
     Health report for collector diagnostics.
-    
+
     Used when collector encounters issues that need reporting.
     """
     collector_name: str
@@ -185,7 +185,7 @@ class CollectorHealthReport:
     symbols_active: List[str]
     warnings: List[str]
     details: Dict[str, Any]
-    
+
     def get_report(self) -> str:
         """Generate human-readable health report."""
         lines = [
@@ -200,11 +200,11 @@ class CollectorHealthReport:
             f"Last Tick:   {self.last_tick_time or 'N/A'}",
             f"Symbols:     {', '.join(self.symbols_active)}",
         ]
-        
+
         if self.warnings:
             lines.append("\nWarnings:")
             for warning in self.warnings:
                 lines.append(f"  ⚠️  {warning}")
-        
+
         lines.append("=" * 60)
         return "\n".join(lines)

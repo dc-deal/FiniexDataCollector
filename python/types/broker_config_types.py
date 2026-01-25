@@ -60,6 +60,8 @@ class BrokerConfig:
     _symbols: Dict[str, SymbolConfig] = {}
     _loaded: bool = False
     _config_path: Optional[Path] = None
+    _broker_type: Optional[str] = None
+    _server_name: Optional[str] = None
 
     @classmethod
     def load_from_file(cls, config_path: Path) -> None:
@@ -86,6 +88,16 @@ class BrokerConfig:
                 f"Invalid JSON in broker config: {e}",
                 config_file=str(config_path)
             )
+
+        # Load broker_type (top-level or in broker_info)
+        cls._broker_type = data.get("broker_type")
+        if not cls._broker_type:
+            broker_info = data.get("broker_info", {})
+            cls._broker_type = broker_info.get("broker_type")
+
+        # Load server_name from broker_info
+        broker_info = data.get("broker_info", {})
+        cls._server_name = broker_info.get("server")
 
         symbols_data = data.get("symbols", {})
         if not symbols_data:
@@ -165,11 +177,41 @@ class BrokerConfig:
         return symbol in cls._symbols
 
     @classmethod
+    def get_broker_type(cls) -> Optional[str]:
+        """
+        Get broker type identifier.
+
+        Returns:
+            Broker type string or None if not loaded
+        """
+        if not cls._loaded:
+            raise ConfigurationError(
+                "Broker config not loaded. Call BrokerConfig.load_from_file() first."
+            )
+        return cls._broker_type
+
+    @classmethod
+    def get_server_name(cls) -> Optional[str]:
+        """
+        Get server name.
+
+        Returns:
+            Server name string or None if not loaded
+        """
+        if not cls._loaded:
+            raise ConfigurationError(
+                "Broker config not loaded. Call BrokerConfig.load_from_file() first."
+            )
+        return cls._server_name
+
+    @classmethod
     def reset(cls) -> None:
         """Reset loaded config (for testing)."""
         cls._symbols = {}
         cls._loaded = False
         cls._config_path = None
+        cls._broker_type = None
+        cls._server_name = None
 
 
 # =============================================================================

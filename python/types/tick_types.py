@@ -74,6 +74,7 @@ class TickFileMetadata:
     symbol: str
     broker: str
     server: str
+    broker_type: str = ""
     broker_utc_offset_hours: int = 0
     local_device_time: str = ""
     broker_server_time: str = ""
@@ -82,7 +83,7 @@ class TickFileMetadata:
     timeframe: str = "TICK"
     volume_timeframe: str = "PERIOD_M1"
     volume_timeframe_minutes: int = 1
-    data_format_version: str = "1.0.5"
+    data_format_version: str = "1.2.0"
     data_collector: str = "kraken"
     collection_purpose: str = "backtesting"
     operator: str = "automated"
