@@ -2,12 +2,15 @@
 FiniexDataCollector - Telegram Alert Provider
 Sends alerts via Telegram Bot API.
 
+Supports command handling for:
+- /report - Trigger weekly report on demand
+
 Location: python/alerts/telegram_bot.py
 """
 
 import asyncio
 import ssl
-from typing import Optional
+from typing import Optional, Callable, Awaitable
 from urllib.parse import quote
 
 import aiohttp
@@ -22,7 +25,7 @@ class TelegramAlertProvider(AbstractAlertProvider):
     """
     Telegram Bot alert provider.
 
-    Uses Telegram Bot API to send notifications.
+    Uses Telegram Bot API to send notifications and handle commands.
     Requires bot token and chat ID from app_config.json.
     """
 
@@ -60,10 +63,153 @@ class TelegramAlertProvider(AbstractAlertProvider):
         # SSL context with certifi certificates (cross-platform)
         self._ssl_context = ssl.create_default_context(cafile=certifi.where())
 
+        # Command handlers
+        self._report_callback: Optional[Callable[[], Awaitable[bool]]] = None
+        self._command_polling_task: Optional[asyncio.Task] = None
+        self._last_update_id: int = 0
+
     @property
     def is_configured(self) -> bool:
         """Check if bot token and chat ID are configured."""
         return bool(self._bot_token and self._chat_id)
+
+    def set_report_callback(self, callback: Callable[[], Awaitable[bool]]) -> None:
+        """
+        Set callback for /report command.
+
+        Args:
+            callback: Async function to call when /report is triggered
+        """
+        self._report_callback = callback
+
+    def start_command_polling(self) -> None:
+        """Start polling for Telegram commands."""
+        if not self.is_configured:
+            self._logger.warning(
+                "Cannot start command polling: Telegram not configured")
+            return
+
+        if self._command_polling_task:
+            self._logger.warning("Command polling already running")
+            return
+
+        self._command_polling_task = asyncio.create_task(self._poll_commands())
+        self._logger.info("Telegram command polling started")
+
+    def stop_command_polling(self) -> None:
+        """Stop polling for commands."""
+        if self._command_polling_task:
+            self._command_polling_task.cancel()
+            self._command_polling_task = None
+            self._logger.info("Telegram command polling stopped")
+
+    async def _poll_commands(self) -> None:
+        """Poll for Telegram bot commands."""
+        while True:
+            try:
+                # Get updates
+                url = f"{self.API_BASE}{self._bot_token}/getUpdates"
+                params = {
+                    "offset": self._last_update_id + 1,
+                    "timeout": 30,
+                    "allowed_updates": ["message"]
+                }
+
+                connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.get(url, params=params, timeout=35) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data.get("ok"):
+                                await self._process_updates(data.get("result", []))
+
+                await asyncio.sleep(1)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._logger.error(f"Command polling error: {e}")
+                await asyncio.sleep(5)
+
+    async def _process_updates(self, updates: list) -> None:
+        """
+        Process incoming Telegram updates.
+
+        Args:
+            updates: List of update objects from Telegram API
+        """
+        for update in updates:
+            self._last_update_id = update["update_id"]
+
+            # Check if this is a message from our chat
+            message = update.get("message")
+            if not message:
+                continue
+
+            chat_id = str(message.get("chat", {}).get("id", ""))
+            if chat_id != self._chat_id:
+                continue  # Ignore messages from other chats
+
+            # Check for commands
+            text = message.get("text", "")
+            if text.startswith("/"):
+                await self._handle_command(text)
+
+    async def _handle_command(self, command: str) -> None:
+        """
+        Handle bot command.
+
+        Args:
+            command: Command string (e.g., "/report")
+        """
+        command = command.strip().lower()
+
+        if command == "/report":
+            await self._handle_report_command()
+        elif command == "/help":
+            await self._handle_help_command()
+        else:
+            await self._send_message(
+                f"Unknown command: {command}\n"
+                f"Available commands:\n"
+                f"• /report - Generate collection report\n"
+                f"• /help - Show this help"
+            )
+
+    async def _handle_report_command(self) -> None:
+        """Handle /report command."""
+        self._logger.info("Received /report command")
+
+        await self._send_message("📊 Generating report...")
+
+        if self._report_callback:
+            try:
+                success = await self._report_callback()
+                if not success:
+                    await self._send_message("❌ Failed to generate report")
+            except Exception as e:
+                self._logger.error(f"Report callback failed: {e}")
+                await self._send_message(f"❌ Report generation error: {e}")
+        else:
+            await self._send_message("❌ Report callback not configured")
+
+    async def _handle_help_command(self) -> None:
+        """Handle /help command."""
+        help_text = (
+            "🤖 *FiniexDataCollector Bot*\n"
+            "\n"
+            "*Available Commands:*\n"
+            "• /report - Generate and send collection report\n"
+            "• /help - Show this help message\n"
+            "\n"
+            "*Automatic Alerts:*\n"
+            "• File rotations (if enabled)\n"
+            "• Errors and warnings\n"
+            "• Weekly reports (scheduled)\n"
+            "• Reconnect notifications"
+        )
+
+        await self._send_message(help_text, parse_mode="Markdown")
 
     async def send_alert(self, alert: Alert) -> bool:
         """
@@ -165,7 +311,7 @@ class TelegramAlertProvider(AbstractAlertProvider):
 
         message = (
             f"📊 *Weekly Conversion Report*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
             f"Status: {status}\n"
             f"\n"
             f"📈 *Statistics:*\n"

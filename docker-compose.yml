@@ -5,7 +5,7 @@ services:
   collector:
     build: .
     container_name: finiex-data-collector
-    restart: unless-stopped
+    restart: "no" 
     volumes:
       # Application code (for development)
       - .:/app
@@ -20,7 +20,7 @@ services:
     environment:
       - PYTHONPATH=/app
       - TZ=UTC
-    command: python python/main.py collect
+    command: tail -f /dev/null 
     
   # One-off conversion job (run manually)
   converter:

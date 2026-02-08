@@ -19,20 +19,6 @@
             }
         },
         {
-            "name": "🔄 Run Parquet Conversion",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/python/main.py",
-            "args": [
-                "convert"
-            ],
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
-        },
-        {
             "name": "📋 Fetch Broker Config",
             "type": "debugpy",
             "request": "launch",
@@ -53,59 +39,6 @@
             "program": "${workspaceFolder}/python/main.py",
             "args": [
                 "status"
-            ],
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
-        },
-        // ====================================================
-        // 🧪 DEBUG MODES
-        // ====================================================
-        {
-            "name": "🐛 Collector (DEBUG)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/python/main.py",
-            "args": [
-                "collect",
-                "--log-level",
-                "DEBUG"
-            ],
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
-        },
-        // ====================================================
-        // 🧩 TESTS
-        // ====================================================
-        {
-            "name": "🧪 Pytest: All Tests",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "pytest",
-            "args": [
-                "tests/",
-                "-v",
-                "--tb=short"
-            ],
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}"
-            }
-        },
-        {
-            "name": "🧪 Pytest: Message Parser",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "pytest",
-            "args": [
-                "tests/test_message_parser.py",
-                "-v"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,

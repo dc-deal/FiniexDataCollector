@@ -102,16 +102,19 @@ class ConfigurationError(CollectorException):
         self,
         message: str,
         config_file: Optional[str] = None,
-        missing_keys: Optional[List[str]] = None
+        missing_keys: Optional[List[str]] = None,
+        missing_key: Optional[str] = None
     ):
         self.config_file = config_file
         self.missing_keys = missing_keys or []
+        if missing_key:
+            self.missing_keys.append(missing_key)
 
         detail = ""
         if config_file:
             detail += f" (File: {config_file})"
-        if missing_keys:
-            detail += f" Missing: {missing_keys}"
+        if self.missing_keys:
+            detail += f" Missing: {self.missing_keys}"
 
         super().__init__(f"{message}{detail}")
 
@@ -130,24 +133,6 @@ class BrokerConfigError(CollectorException):
         detail = f" (Broker: {broker}"
         if endpoint:
             detail += f", Endpoint: {endpoint}"
-        detail += ")"
-        super().__init__(f"{message}{detail}")
-
-
-class ParquetConversionError(CollectorException):
-    """Raised when JSON to Parquet conversion fails."""
-
-    def __init__(
-        self,
-        message: str,
-        source_file: str,
-        target_file: Optional[str] = None
-    ):
-        self.source_file = source_file
-        self.target_file = target_file
-        detail = f" (Source: {source_file}"
-        if target_file:
-            detail += f" -> {target_file}"
         detail += ")"
         super().__init__(f"{message}{detail}")
 

@@ -4,11 +4,12 @@ Real-time terminal display for collection monitoring using rich.
 
 Features:
 - Live updating table with per-symbol stats
+- File progress percentage (current/max)
 - WebSocket connection status
-- Stream configuration display
-- Recent errors/warnings with count
+- Disk space monitoring
+- Folder statistics (Kraken, MT5, Logs)
+- Recent errors/warnings
 - Last file info
-- Uptime and totals
 
 Location: python/utils/live_display.py
 """
@@ -50,7 +51,7 @@ class LiveDisplay:
             stats: Shared CollectorStats object
             streams: List of active streams (e.g., ["ticker"], ["trade"])
             update_interval: Display update interval in seconds
-            max_log_lines: Maximum log lines to show (rest shown as "...")
+            max_log_lines: Maximum log lines to show
         """
         self._stats = stats
         self._streams = streams if streams else ["ticker"]
@@ -92,9 +93,6 @@ class LiveDisplay:
 
             while self._running:
                 try:
-                    # Update tick rates
-                    self._stats.calculate_ticks_per_minute()
-
                     # Render
                     live.update(self._render())
 
@@ -103,7 +101,7 @@ class LiveDisplay:
 
                 except asyncio.CancelledError:
                     break
-                except Exception as e:
+                except Exception:
                     # Don't crash on render errors
                     pass
 
@@ -118,13 +116,17 @@ class LiveDisplay:
 
         # Build sections
         header = self._build_header()
+        monitoring = self._build_monitoring_status()
         symbol_table = self._build_symbol_table()
+        storage_summary = self._build_storage_summary()
         footer = self._build_footer()
 
         # Combine
         layout.split_column(
             Layout(header, name="header", size=3),
+            Layout(monitoring, name="monitoring", size=3),
             Layout(symbol_table, name="symbols"),
+            Layout(storage_summary, name="storage", size=3),
             Layout(footer, name="footer", size=8)
         )
 
@@ -136,7 +138,7 @@ class LiveDisplay:
         )
 
     def _build_header(self) -> Text:
-        """Build header with uptime, totals, and stream info."""
+        """Build header with uptime, files, and WebSocket status."""
         uptime = self._format_uptime(self._stats.get_uptime_seconds())
 
         # WebSocket status with color
@@ -144,7 +146,7 @@ class LiveDisplay:
         if ws_status == "connected":
             ws_display = "[green]● connected[/green]"
         elif ws_status == "reconnecting":
-            ws_display = "[yellow]◐ reconnecting[/yellow]"
+            ws_display = "[yellow]● reconnecting[/yellow]"
         else:
             ws_display = "[red]○ disconnected[/red]"
 
@@ -154,13 +156,50 @@ class LiveDisplay:
         header = (
             f"[bold]📋 Streams:[/bold] [magenta]{streams_str}[/magenta] │ "
             f"[bold]⏱️ Uptime:[/bold] {uptime} │ "
-            f"[bold]📊 Ticks:[/bold] {self._stats.total_ticks:,} │ "
             f"[bold]📁 Files:[/bold] {self._stats.total_files} │ "
             f"[bold]🔌 WS:[/bold] {ws_display} │ "
             f"[bold]⚠️ Errors:[/bold] [red]{self._stats.total_errors}[/red]"
         )
 
         return Text.from_markup(header)
+
+    def _build_monitoring_status(self) -> Text:
+        """Build monitoring status line with disk space and last check."""
+        lines = []
+
+        # Disk space
+        disk = self._stats.disk_space
+        if disk.last_checked:
+            if disk.status == "OK":
+                status_color = "green"
+                status_icon = "✅"
+            elif disk.status == "WARNING":
+                status_color = "yellow"
+                status_icon = "⚠️"
+            elif disk.status == "CRITICAL":
+                status_color = "red"
+                status_icon = "🚨"
+            else:
+                status_color = "bright_red"
+                status_icon = "🔴"
+
+            disk_line = (
+                f"[bold]💾 Disk:[/bold] "
+                f"[{status_color}]{disk.free_gb:.1f} GB free ({disk.percent_free:.0f}%) {status_icon}[/{status_color}]"
+            )
+        else:
+            disk_line = "[dim]💾 Disk: checking...[/dim]"
+
+        lines.append(disk_line)
+
+        # Last check time
+        if disk.last_checked:
+            last_check = disk.last_checked.strftime("%a %d.%m %H:%M")
+            lines.append(f"[dim]Last Check: {last_check}[/dim]")
+        else:
+            lines.append("[dim]Last Check: N/A[/dim]")
+
+        return Text.from_markup(" │ ".join(lines))
 
     def _build_symbol_table(self) -> Table:
         """Build per-symbol statistics table."""
@@ -171,10 +210,10 @@ class LiveDisplay:
             padding=(0, 1)
         )
 
-        # Columns - adapt based on stream type
+        # Columns
         table.add_column("Symbol", width=10)
-        table.add_column("Ticks", justify="right", width=10)
-        table.add_column("Ticks/min", justify="right", width=10)
+        table.add_column("Current File", justify="right", width=22)
+        table.add_column("Files", justify="right", width=12)
 
         # For trade streams, show Price instead of Bid/Ask
         if "trade" in self._streams and "ticker" not in self._streams:
@@ -185,7 +224,6 @@ class LiveDisplay:
             table.add_column("Ask", justify="right", width=12)
             table.add_column("Spread %", justify="right", width=10)
 
-        table.add_column("Files", justify="right", width=6)
         table.add_column("Status", width=12)
 
         # No symbols yet
@@ -200,25 +238,41 @@ class LiveDisplay:
             # Status indicator
             if stats.is_active:
                 status = "[green]✅ Active[/green]"
-            elif stats.ticks_count > 0:
-                status = "[yellow]⏸️ Idle[/yellow]"
+            elif stats.current_file_ticks > 0:
+                status = "[yellow]⸻ Idle[/yellow]"
             else:
                 status = "[dim]⏳ Waiting[/dim]"
+
+            # File progress
+            from python.utils.config_loader import load_config
+            try:
+                config = load_config()
+                max_ticks = config.kraken.max_ticks_per_file
+            except:
+                max_ticks = 50000
+
+            percent = (stats.current_file_ticks /
+                       max_ticks * 100) if max_ticks > 0 else 0
+            file_progress = f"{stats.current_file_ticks:,} / {max_ticks:,} ({percent:.0f}%)"
+
+            # Folder files
+            if stats.folder_file_count > 0:
+                files_display = f"{stats.folder_file_count} total"
+            else:
+                files_display = f"{stats.file_count} created"
 
             # Format based on stream type
             if "trade" in self._streams and "ticker" not in self._streams:
                 # Trade stream: show last price and volume
                 price_str = f"{stats.last_bid:,.2f}" if stats.last_bid > 0 else "-"
-                # For trades, last_ask is same as last_bid, use spread_pct field for volume display
                 vol_str = f"{stats.last_volume:.4f}" if stats.last_volume > 0 else "-"
 
                 table.add_row(
                     f"[bold]{symbol}[/bold]",
-                    f"{stats.ticks_count:,}",
-                    f"{stats.ticks_per_minute:.1f}",
+                    file_progress,
+                    files_display,
                     price_str,
                     vol_str,
-                    str(stats.file_count),
                     status
                 )
             else:
@@ -229,16 +283,55 @@ class LiveDisplay:
 
                 table.add_row(
                     f"[bold]{symbol}[/bold]",
-                    f"{stats.ticks_count:,}",
-                    f"{stats.ticks_per_minute:.1f}",
+                    file_progress,
+                    files_display,
                     bid_str,
                     ask_str,
                     spread_str,
-                    str(stats.file_count),
                     status
                 )
 
         return table
+
+    def _build_storage_summary(self) -> Text:
+        """Build storage summary with folder stats and reconnects."""
+        parts = []
+
+        # Folder stats
+        kraken = self._stats.folders.get("kraken")
+        mt5 = self._stats.folders.get("mt5")
+        logs = self._stats.folders.get("logs")
+
+        if kraken:
+            parts.append(f"Kraken: {kraken.file_count} files")
+        else:
+            parts.append("Kraken: -")
+
+        if mt5:
+            parts.append(f"MT5: {mt5.file_count} files")
+        else:
+            parts.append("MT5: -")
+
+        if logs:
+            parts.append(f"Logs: {logs.file_count} files")
+        else:
+            parts.append("Logs: -")
+
+        # Reconnects
+        reconnect_count = len(self._stats.reconnect_events)
+        if self._stats.last_reconnect:
+            last = self._stats.last_reconnect
+            duration = int(last.duration_seconds / 60)
+            time_str = last.reconnected_at.strftime(
+                "%a %d.%m %H:%M") if last.reconnected_at else "unknown"
+            parts.append(
+                f"Reconnects: {reconnect_count} (Last: {time_str}, {duration}m down)")
+        else:
+            parts.append(f"Reconnects: {reconnect_count}")
+
+        summary = "[bold]📁 Storage:[/bold] " + " │ ".join(parts)
+
+        return Text.from_markup(summary)
 
     def _build_footer(self) -> Text:
         """Build footer with last file and recent logs."""
@@ -249,7 +342,7 @@ class LiveDisplay:
             lf = self._stats.last_file
             lines.append(
                 f"[bold]📄 Last file:[/bold] {lf.filename} "
-                f"([cyan]{lf.tick_count+1:,} ticks[/cyan])"
+                f"([cyan]{lf.tick_count:,} ticks[/cyan])"
             )
         else:
             lines.append("[dim]📄 No files created yet[/dim]")

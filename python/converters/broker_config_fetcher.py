@@ -80,6 +80,9 @@ class KrakenBrokerConfigFetcher:
         self._broker_type = broker_type.strip()
         self._logger = get_logger("FiniexDataCollector.broker_config")
 
+        # SSL context with certifi certificates
+        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
+
     async def fetch_and_save(self) -> Tuple[Path, Dict[str, Any]]:
         """
         Fetch symbol info and save to JSON.

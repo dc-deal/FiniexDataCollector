@@ -1,36 +1,39 @@
-# FiniexDataCollector Requirements
-# ================================
-
-# WebSocket Client
-websockets>=12.0
-
-# HTTP Client (async)
-aiohttp>=3.9.0
-
-# Scheduler
-APScheduler>=3.10.0
-
-# Data Processing
+# Core Data Processing
 pandas>=2.0.0
-pyarrow>=14.0.0
+pyarrow>=12.0.0
 numpy>=1.24.0
-
-# Date/Time
 python-dateutil>=2.8.0
 
-# Logging & Console
-rich>=13.0.0
+# Fast Data Loading
+polars>=0.18.0
+fastparquet>=2023.4.0
 
-# Development & Testing
-pytest>=7.0.0
-pytest-asyncio>=0.21.0
+# Configuration & Validation
+pydantic>=2.0.0
 
-# Code Style
+# Development & Debugging
+ipython>=8.14.0
+jupyter>=1.0.0
+
+# Code Style & Formatting
 autopep8>=2.0.0
 isort>=5.12.0
 
-# Type Checking (optional)
-mypy>=1.0.0
+# Data Visualization
+plotly>=5.15.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
 
-# win handling ssl
-certifi>=2024.12.0
+# Console
+rich>=14.2.0
+psutil>=7.1.0
+
+# Testing
+pytest>=7.0.0
+
+# Async & Networking (Kraken WebSocket)
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Task Scheduling
+apscheduler>=3.10.0

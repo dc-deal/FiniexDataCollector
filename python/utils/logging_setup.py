@@ -70,10 +70,13 @@ class FiniexLogger:
         # Open file if configured
         if self._file_level and self._log_file:
             try:
-                self._log_file.parent.mkdir(parents=True, exist_ok=True)
-                self._file_handle = open(self._log_file, "a", encoding="utf-8")
+                log_path = Path(self._log_file).absolute()
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Path.open() ist robuster als open()
+                self._file_handle = log_path.open("a", encoding="utf-8")
             except Exception as e:
-                _print_error(f"Failed to open log file {self._log_file}: {e}")
+                _print_error(f"Failed to open log file {log_path}: {e}")
 
     def _log(self, level: LogLevel, message: str) -> None:
         """

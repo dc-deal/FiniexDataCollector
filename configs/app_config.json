@@ -5,7 +5,6 @@
   "environment": "production",
   "paths": {
     "raw_data_dir": "./data/raw",
-    "processed_data_dir": "./data/processed",
     "broker_configs_dir": "./configs/brokers",
     "logs_dir": "./logs"
   },
@@ -38,8 +37,7 @@
   },
   "mt5": {
     "enabled": false,
-    "raw_data_path": "",
-    "watch_interval_seconds": 60
+    "raw_data_path": ""
   },
   "telegram": {
     "enabled": false,
@@ -49,18 +47,14 @@
     "send_on_rotation": false,
     "send_weekly_report": true
   },
-  "transfer": {
-    "provider": "local",
-    "local_output_dir": "./output",
-    "rsync_host": "",
-    "rsync_path": "",
-    "rsync_user": ""
-  },
   "scheduler": {
-    "parquet_conversion_enabled": false,
-    "conversion_day": "saturday",
-    "conversion_hour_utc": 20,
-    "report_email_enabled": false,
-    "report_email_address": ""
+    "report_day": "saturday",
+    "report_hour_utc": 6,
+    "report_minute_utc": 0
+  },
+  "monitoring": {
+    "disk_space_check_interval_seconds": 60,
+    "folder_scan_interval_seconds": 60,
+    "reconnect_alert_cooldown_minutes": 30
   }
 }

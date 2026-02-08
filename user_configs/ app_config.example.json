@@ -1,0 +1,27 @@
+{
+    "_comment": "User configuration overrides - Copy to user_configs/app_config.json",
+    "_usage": "Only include settings you want to change from defaults",
+    "kraken": {
+        "symbols": [
+            "BTC/USD",
+            "ETH/USD",
+            "SOL/USD"
+        ]
+    },
+    "telegram": {
+        "enabled": true,
+        "bot_token": "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz",
+        "chat_id": "123456789",
+        "send_on_error": true,
+        "send_on_rotation": false,
+        "send_weekly_report": true
+    },
+    "mt5": {
+        "enabled": true,
+        "raw_data_path": "C:\\Users\\YourUser\\AppData\\Roaming\\MetaQuotes\\Terminal\\HASH\\MQL5\\Files"
+    },
+    "monitoring": {
+        "disk_space_check_interval_seconds": 60,
+        "folder_scan_interval_seconds": 60,
+        "reconnect_alert_cooldown_minutes": 30
+    }

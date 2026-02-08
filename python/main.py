@@ -4,7 +4,6 @@ CLI and daemon mode for tick data collection.
 
 Usage:
     python main.py collect              # Start collectors
-    python main.py convert              # Run parquet conversion
     python main.py broker-config        # Fetch broker config
     python main.py status               # Show collector status
 
@@ -15,8 +14,12 @@ import argparse
 import asyncio
 import signal
 import sys
+import os
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
+
+import psutil
 
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import setup_logging, get_logger
@@ -28,7 +31,6 @@ from python.collectors.kraken.websocket_client import KrakenWebSocketClient
 from python.writers.json_tick_writer import JsonTickWriter
 from python.alerts.telegram_bot import TelegramAlertProvider
 from python.scheduler.weekly_jobs import WeeklyJobScheduler
-from python.converters.tick_to_parquet import run_weekly_conversion
 from python.converters.broker_config_fetcher import fetch_kraken_broker_config
 
 
@@ -60,11 +62,56 @@ def validate_symbols(symbols: List[str]) -> None:
         )
 
 
+def count_files_in_folder(folder_path: Path) -> int:
+    """
+    Count files in a folder (non-recursive).
+
+    Args:
+        folder_path: Path to folder
+
+    Returns:
+        Number of files
+    """
+    if not folder_path.exists():
+        return 0
+
+    try:
+        return sum(1 for item in folder_path.iterdir() if item.is_file())
+    except Exception:
+        return 0
+
+
+def get_folder_size(folder_path: Path) -> int:
+    """
+    Calculate total size of folder in bytes (recursive).
+
+    Args:
+        folder_path: Path to folder
+
+    Returns:
+        Total size in bytes
+    """
+    if not folder_path.exists():
+        return 0
+
+    total = 0
+    try:
+        for entry in os.scandir(folder_path):
+            if entry.is_file(follow_symlinks=False):
+                total += entry.stat().st_size
+            elif entry.is_dir(follow_symlinks=False):
+                total += get_folder_size(Path(entry.path))
+    except Exception:
+        pass
+
+    return total
+
+
 class FiniexDataCollector:
     """
     Main application class.
 
-    Orchestrates collectors, writers, alerts, and scheduler.
+    Orchestrates collectors, writers, alerts, scheduler, and monitoring.
     """
 
     def __init__(self, config: AppConfig):
@@ -94,6 +141,13 @@ class FiniexDataCollector:
         # Track first tick per symbol for logging
         self._first_tick_logged = set()
 
+        # Monitoring tasks
+        self._monitoring_tasks = []
+
+        # Reconnect tracking
+        self._disconnect_time: Optional[datetime] = None
+        self._last_reconnect_alert: Optional[datetime] = None
+
     async def start_collection(self) -> None:
         """Start all configured collectors."""
         self._logger.info("=" * 60)
@@ -115,6 +169,12 @@ class FiniexDataCollector:
             )
 
             if await self._telegram.test_connection():
+                # Set report callback for /report command
+                self._telegram.set_report_callback(self._send_weekly_report)
+
+                # Start command polling
+                self._telegram.start_command_polling()
+
                 await self._telegram.send_info(
                     "Collector Started",
                     f"FiniexDataCollector started with {len(self._config.kraken.symbols)} symbols"
@@ -122,9 +182,11 @@ class FiniexDataCollector:
 
         # Initialize scheduler
         self._scheduler = WeeklyJobScheduler(self._config.scheduler)
-        self._scheduler.set_conversion_callback(self._run_conversion)
-        self._scheduler.set_report_callback(self._send_conversion_report)
+        self._scheduler.set_report_callback(self._send_weekly_report)
         self._scheduler.start()
+
+        # Start monitoring tasks
+        await self._start_monitoring_tasks()
 
         # Initialize Kraken collector
         if self._config.kraken.enabled:
@@ -144,6 +206,200 @@ class FiniexDataCollector:
 
         # Cleanup
         await self._shutdown()
+
+    async def _start_monitoring_tasks(self) -> None:
+        """Start background monitoring tasks."""
+        # Disk space monitoring
+        disk_task = asyncio.create_task(
+            self._monitor_disk_space()
+        )
+        self._monitoring_tasks.append(disk_task)
+
+        # Folder scanning
+        folder_task = asyncio.create_task(
+            self._monitor_folders()
+        )
+        self._monitoring_tasks.append(folder_task)
+
+        self._logger.info("Monitoring tasks started")
+
+    async def _monitor_disk_space(self) -> None:
+        """Monitor disk space usage."""
+        interval = self._config.monitoring.disk_space_check_interval_seconds
+
+        self._logger.debug(
+            f"[DISK_MONITOR] Started with interval={interval}s"
+        )
+
+        while self._is_running:
+            try:
+                # Get disk usage for raw data directory
+                data_path = Path(self._config.paths.raw_data_dir).resolve()
+
+                self._logger.debug(
+                    f"[DISK_MONITOR] Checking path: {data_path}"
+                )
+
+                usage = psutil.disk_usage(str(data_path))
+
+                self._stats.update_disk_space(
+                    total=usage.total,
+                    used=usage.used,
+                    free=usage.free
+                )
+
+                percent_free = (usage.free / usage.total *
+                                100) if usage.total > 0 else 0
+
+                self._logger.debug(
+                    f"[DISK_MONITOR] Status: "
+                    f"free={usage.free / (1024**3):.1f}GB ({percent_free:.1f}%), "
+                    f"total={usage.total / (1024**3):.1f}GB"
+                )
+
+                # Check for critical disk space
+                if percent_free < 20 and self._telegram:
+                    self._logger.debug(
+                        f"[DISK_MONITOR] CRITICAL threshold reached, sending alert"
+                    )
+                    await self._telegram.send_error(
+                        "🚨 Critical Disk Space",
+                        f"Only {percent_free:.1f}% free ({usage.free / (1024**3):.1f} GB)\n"
+                        f"Total: {usage.total / (1024**3):.1f} GB\n"
+                        f"Used: {usage.used / (1024**3):.1f} GB"
+                    )
+
+            except Exception as e:
+                self._logger.error(f"Disk space check failed: {e}")
+                self._logger.debug(
+                    f"[DISK_MONITOR] Exception details:", exc_info=True)
+
+            await asyncio.sleep(interval)
+
+    async def _monitor_folders(self) -> None:
+        """Monitor folder file counts."""
+        interval = self._config.monitoring.folder_scan_interval_seconds
+
+        self._logger.debug(
+            f"[FOLDER_SCAN] Started with interval={interval}s"
+        )
+
+        while self._is_running:
+            try:
+                scan_start = datetime.now(timezone.utc)
+
+                # Kraken data folder
+                kraken_path = Path(self._config.paths.raw_data_dir) / "kraken"
+
+                self._logger.debug(
+                    f"[FOLDER_SCAN] Scanning Kraken: path={kraken_path}, "
+                    f"exists={kraken_path.exists()}"
+                )
+
+                if kraken_path.exists():
+                    # Check if files are in sub-folders (per symbol) or directly in kraken folder
+                    has_subfolders = any(
+                        item.is_dir()
+                        for item in kraken_path.iterdir()
+                    )
+
+                    self._logger.debug(
+                        f"[FOLDER_SCAN] Kraken structure: has_subfolders={has_subfolders}"
+                    )
+
+                    if has_subfolders:
+                        # Files organized in symbol sub-folders
+                        kraken_count = sum(
+                            count_files_in_folder(symbol_folder)
+                            for symbol_folder in kraken_path.iterdir()
+                            if symbol_folder.is_dir()
+                        )
+
+                        # Update per-symbol folder counts
+                        symbol_scans = []
+                        for symbol_folder in kraken_path.iterdir():
+                            if symbol_folder.is_dir():
+                                symbol = symbol_folder.name
+                                if symbol in self._stats.symbols:
+                                    count = count_files_in_folder(
+                                        symbol_folder)
+                                    self._stats.symbols[symbol].folder_file_count = count
+                                    symbol_scans.append(f"{symbol}={count}")
+
+                        self._logger.debug(
+                            f"[FOLDER_SCAN] Per-symbol counts: {', '.join(symbol_scans) if symbol_scans else 'none'}"
+                        )
+                    else:
+                        # Files directly in kraken folder (no sub-folders)
+                        kraken_count = count_files_in_folder(kraken_path)
+
+                        self._logger.debug(
+                            f"[FOLDER_SCAN] Flat structure: {kraken_count} files directly in kraken folder"
+                        )
+
+                        # Cannot determine per-symbol counts in flat structure
+                        # Set folder_file_count to 0 for all symbols
+                        for symbol in self._stats.symbols:
+                            self._stats.symbols[symbol].folder_file_count = 0
+
+                    self._logger.debug(
+                        f"[FOLDER_SCAN] Kraken total: {kraken_count} files"
+                    )
+
+                    self._stats.update_folder_stats(
+                        "kraken", str(kraken_path), kraken_count)
+                else:
+                    self._logger.debug(
+                        f"[FOLDER_SCAN] Kraken path does not exist: {kraken_path}"
+                    )
+                    self._stats.update_folder_stats(
+                        "kraken", str(kraken_path), 0)
+
+                # MT5 folder
+                if self._config.mt5.enabled and self._config.mt5.raw_data_path:
+                    mt5_path = Path(self._config.mt5.raw_data_path)
+
+                    self._logger.debug(
+                        f"[FOLDER_SCAN] Scanning MT5: path={mt5_path}, "
+                        f"exists={mt5_path.exists()}"
+                    )
+
+                    if mt5_path.exists():
+                        mt5_count = count_files_in_folder(mt5_path)
+                        self._logger.debug(
+                            f"[FOLDER_SCAN] MT5 total: {mt5_count} files"
+                        )
+                        self._stats.update_folder_stats(
+                            "mt5", str(mt5_path), mt5_count)
+
+                # Logs folder
+                logs_path = Path(self._config.paths.logs_dir)
+
+                self._logger.debug(
+                    f"[FOLDER_SCAN] Scanning Logs: path={logs_path}, "
+                    f"exists={logs_path.exists()}"
+                )
+
+                if logs_path.exists():
+                    logs_count = count_files_in_folder(logs_path)
+                    self._logger.debug(
+                        f"[FOLDER_SCAN] Logs total: {logs_count} files"
+                    )
+                    self._stats.update_folder_stats(
+                        "logs", str(logs_path), logs_count)
+
+                scan_duration = (datetime.now(timezone.utc) -
+                                 scan_start).total_seconds()
+                self._logger.debug(
+                    f"[FOLDER_SCAN] Completed in {scan_duration:.2f}s"
+                )
+
+            except Exception as e:
+                self._logger.error(f"Folder scan failed: {e}")
+                self._logger.debug(
+                    f"[FOLDER_SCAN] Exception details:", exc_info=True)
+
+            await asyncio.sleep(interval)
 
     async def _start_kraken_collector(self) -> None:
         """Initialize and start Kraken WebSocket collector."""
@@ -192,9 +448,93 @@ class FiniexDataCollector:
         Handle WebSocket connection status change.
 
         Args:
-            status: New status (connected, disconnected, reconnecting)
+            status: New status (connected, disconnected, reconnecting, failed)
         """
+        old_status = self._stats.websocket_status
         self._stats.set_websocket_status(status)
+
+        self._logger.debug(
+            f"[STATUS] WebSocket status changed: {old_status} → {status}, "
+            f"disconnect_time={self._disconnect_time}"
+        )
+
+        # Track disconnects (including 'reconnecting' which means connection was lost)
+        if status in ["disconnected", "reconnecting"] and old_status == "connected":
+            self._disconnect_time = datetime.now(timezone.utc)
+            self._logger.debug(
+                f"[DISCONNECT] Tracked disconnect at {self._disconnect_time} (status={status})"
+            )
+
+        # Track reconnects (any transition back to 'connected' after being disconnected)
+        if status == "connected" and old_status in ["disconnected", "reconnecting"]:
+            if self._disconnect_time:
+                duration = (datetime.now(timezone.utc) -
+                            self._disconnect_time).total_seconds()
+
+                self._logger.debug(
+                    f"[RECONNECT] Recording reconnect event: "
+                    f"duration={duration:.1f}s, "
+                    f"disconnect_time={self._disconnect_time}, "
+                    f"old_status={old_status}"
+                )
+
+                self._stats.record_reconnect("connection_restored", duration)
+
+                # Send alert if cooldown passed
+                asyncio.create_task(self._send_reconnect_alert(duration))
+
+                self._disconnect_time = None
+            else:
+                self._logger.debug(
+                    f"[RECONNECT] Connected but no disconnect_time tracked "
+                    f"(old_status={old_status}) - possible initial connection"
+                )
+
+    async def _send_reconnect_alert(self, duration_seconds: float) -> None:
+        """
+        Send reconnect alert if cooldown allows.
+
+        Args:
+            duration_seconds: Downtime duration
+        """
+        if not self._telegram:
+            self._logger.debug(
+                "[RECONNECT_ALERT] No Telegram configured, skipping")
+            return
+
+        # Check cooldown
+        cooldown_minutes = self._config.monitoring.reconnect_alert_cooldown_minutes
+        now = datetime.now(timezone.utc)
+
+        if self._last_reconnect_alert:
+            elapsed = (now - self._last_reconnect_alert).total_seconds() / 60
+            self._logger.debug(
+                f"[RECONNECT_ALERT] Cooldown check: "
+                f"elapsed={elapsed:.1f}min, cooldown={cooldown_minutes}min"
+            )
+            if elapsed < cooldown_minutes:
+                self._logger.debug(
+                    f"[RECONNECT_ALERT] Skipping (still in cooldown)"
+                )
+                return  # Still in cooldown
+
+        # Send alert
+        duration_minutes = int(duration_seconds / 60)
+
+        self._logger.debug(
+            f"[RECONNECT_ALERT] Sending alert: duration={duration_minutes}m"
+        )
+
+        await self._telegram.send_warning(
+            "🔌 Connection Restored",
+            f"WebSocket reconnected after {duration_minutes}m downtime"
+        )
+
+        self._last_reconnect_alert = now
+
+        self._logger.debug(
+            f"[RECONNECT_ALERT] Alert sent, next allowed at {now + timedelta(minutes=cooldown_minutes)}"
+        )
 
     async def _run_collector(self, collector: KrakenWebSocketClient) -> None:
         """
@@ -223,15 +563,6 @@ class FiniexDataCollector:
         """
         symbol = self._get_symbol_from_tick(tick)
 
-        # Update stats
-        self._stats.record_tick(
-            symbol=symbol,
-            bid=tick.bid,
-            ask=tick.ask,
-            spread_pct=tick.spread_pct,
-            real_volume=tick.real_volume
-        )
-
         # Log first tick for this symbol
         if symbol not in self._first_tick_logged:
             self._first_tick_logged.add(symbol)
@@ -245,35 +576,92 @@ class FiniexDataCollector:
         if symbol in self._writers:
             writer = self._writers[symbol]
 
-            # Check if rotation happened
+            # Get current state BEFORE any changes
             old_file = writer.get_current_filepath()
-            old_count = writer.current_tick_count
+            stats = self._stats.symbols.get(symbol)
+            count_before = stats.current_file_ticks if stats else 0
 
+            self._logger.debug(
+                f"[TICK] Before processing: symbol={symbol}, "
+                f"count_before={count_before}, file={old_file.name if old_file else 'None'}"
+            )
+
+            # Update stats FIRST (increments count)
+            self._stats.record_tick(
+                symbol=symbol,
+                bid=tick.bid,
+                ask=tick.ask,
+                spread_pct=tick.spread_pct,
+                real_volume=tick.real_volume
+            )
+
+            # Get count AFTER increment - this is the FINAL count for this file
+            count_after = self._stats.symbols[symbol].current_file_ticks
+            self._logger.debug(
+                f"[TICK] After stats update: symbol={symbol}, "
+                f"count_after={count_after}, incremented={count_after - count_before}"
+            )
+
+            # Write tick (may rotate internally)
             writer.write_tick(tick)
 
-            # Detect rotation (file changed or count reset)
+            # Detect rotation (file changed)
             new_file = writer.get_current_filepath()
+
+            self._logger.debug(
+                f"[ROTATION_CHECK] symbol={symbol}, "
+                f"old_file={old_file.name if old_file else 'None'}, "
+                f"new_file={new_file.name if new_file else 'None'}, "
+                f"count_after={count_after}, rotation={old_file != new_file if old_file and new_file else False}"
+            )
+
             if old_file and new_file and old_file != new_file:
-                # File was rotated
+                # File was rotated!
+                # count_after contains the FINAL tick count for the OLD file
                 self._stats.record_file_created(
                     symbol=symbol,
                     filename=old_file.name,
-                    tick_count=old_count
-                )
-                self._logger.info(
-                    f"File rotated: {old_file.name} ({old_count:,} ticks)"
+                    tick_count=count_after  # Final count of OLD file
                 )
 
-            # Check for rotation notification (Telegram)
-            if writer.needs_rotation() and self._telegram:
-                asyncio.create_task(
-                    self._telegram.send_file_rotation_notice(
-                        symbol=symbol,
-                        filename=writer.get_current_filepath(
-                        ).name if writer.get_current_filepath() else "unknown",
-                        tick_count=writer.current_tick_count
-                    )
+                # CRITICAL: Reset tick count for NEW file
+                # The new file is empty (writer just started it)
+                self._stats.symbols[symbol].current_file_ticks = 0
+
+                self._logger.debug(
+                    f"[ROTATION] Detected: symbol={symbol}, "
+                    f"rotated_file={old_file.name}, "
+                    f"final_count={count_after}, "
+                    f"new_file={new_file.name}, "
+                    f"stats_reset=0"
                 )
+
+                self._logger.info(
+                    f"File rotated: {old_file.name} ({count_after:,} ticks)"
+                )
+
+                # Send rotation notification (if enabled)
+                if self._telegram and self._config.telegram.send_on_rotation:
+                    self._logger.debug(
+                        f"[TELEGRAM] Sending rotation alert: symbol={symbol}, "
+                        f"file={old_file.name}, count={count_after}"
+                    )
+                    asyncio.create_task(
+                        self._telegram.send_file_rotation_notice(
+                            symbol=symbol,
+                            filename=old_file.name,
+                            tick_count=count_after
+                        )
+                    )
+        else:
+            # No writer, just update stats
+            self._stats.record_tick(
+                symbol=symbol,
+                bid=tick.bid,
+                ask=tick.ask,
+                spread_pct=tick.spread_pct,
+                real_volume=tick.real_volume
+            )
 
     def _get_symbol_from_tick(self, tick) -> str:
         """
@@ -287,39 +675,103 @@ class FiniexDataCollector:
         """
         return tick.symbol
 
-    async def _run_conversion(self) -> dict:
+    async def _send_weekly_report(self) -> bool:
         """
-        Run parquet conversion job.
+        Send weekly collection report via Telegram.
 
         Returns:
-            Conversion result dict
-        """
-        return await run_weekly_conversion(
-            raw_dir=Path(self._config.paths.raw_data_dir),
-            processed_dir=Path(self._config.paths.processed_data_dir),
-            data_collector="kraken"
-        )
-
-    async def _send_conversion_report(self, result: dict) -> bool:
-        """
-        Send conversion report via Telegram.
-
-        Args:
-            result: Conversion result dict
-
-        Returns:
-            True if sent
+            True if sent successfully
         """
         if not self._telegram:
             return False
 
-        return await self._telegram.send_weekly_report(
-            symbols_processed=result.get("symbols_processed", 0),
-            files_converted=result.get("files_converted", 0),
-            total_ticks=result.get("total_ticks", 0),
-            errors=result.get("errors", 0),
-            duration_seconds=result.get("duration_seconds", 0)
-        )
+        # Calculate folder sizes (slow, but only once per week)
+        self._logger.info("Calculating folder sizes for weekly report...")
+
+        kraken_path = Path(self._config.paths.raw_data_dir) / "kraken"
+        kraken_size = get_folder_size(
+            kraken_path) if kraken_path.exists() else 0
+
+        mt5_size = 0
+        if self._config.mt5.enabled and self._config.mt5.raw_data_path:
+            mt5_path = Path(self._config.mt5.raw_data_path)
+            mt5_size = get_folder_size(mt5_path) if mt5_path.exists() else 0
+
+        logs_path = Path(self._config.paths.logs_dir)
+        logs_size = get_folder_size(logs_path) if logs_path.exists() else 0
+
+        total_size = kraken_size + mt5_size + logs_size
+
+        # Get folder stats
+        kraken_stats = self._stats.folders.get("kraken")
+        mt5_stats = self._stats.folders.get("mt5")
+        logs_stats = self._stats.folders.get("logs")
+
+        # Reconnects this week
+        reconnects = self._stats.get_reconnects_this_week()
+
+        # Build report
+        uptime_hours = self._stats.get_uptime_hours()
+        disk = self._stats.disk_space
+
+        if disk.status == "OK":
+            disk_status = "✅"
+        elif disk.status == "WARNING":
+            disk_status = "⚠️"
+        else:
+            disk_status = "🚨"
+
+        report_lines = [
+            "📊 *Weekly Collection Report*",
+            f"{datetime.now(timezone.utc).strftime('%A, %d.%m.%Y %H:%M UTC')}",
+            "",
+            "⏱️ *Uptime*",
+            f"• Runtime: {uptime_hours:.1f} hours",
+            f"• Files Created: {self._stats.total_files}",
+            f"• Errors: {self._stats.total_errors} | Warnings: {self._stats.total_warnings}",
+            "",
+            "📁 *Data Storage*",
+            f"• Kraken: {kraken_size/(1024**3):.2f} GB ({kraken_stats.file_count if kraken_stats else 0} files)",
+            f"• MT5: {mt5_size/(1024**3):.2f} GB ({mt5_stats.file_count if mt5_stats else 0} files)",
+            f"• Logs: {logs_size/(1024**3):.2f} GB ({logs_stats.file_count if logs_stats else 0} files)",
+            f"• Total Data: {total_size/(1024**3):.2f} GB",
+            "",
+            "💾 *Disk Space*",
+            f"• Total: {disk.total_gb:.1f} GB",
+            f"• Used: {disk.used_gb:.1f} GB ({disk.percent_used:.0f}%)",
+            f"• Free: {disk.free_gb:.1f} GB ({disk.percent_free:.0f}%) {disk_status}",
+            "",
+            "🔌 *Connection Health*",
+            f"• Reconnects This Week: {len(reconnects)}",
+        ]
+
+        # Add reconnect details
+        if reconnects:
+            for event in reconnects[-3:]:  # Last 3
+                time_str = event.timestamp.strftime("%a %d.%m %H:%M")
+                duration = int(event.duration_seconds / 60)
+                report_lines.append(f"  - {time_str} ({duration}m downtime)")
+
+        report_lines.extend([
+            f"• Current Status: {self._stats.websocket_status}",
+            "",
+            "📈 *Per Symbol*"
+        ])
+
+        # Per symbol stats
+        for symbol, stats in sorted(self._stats.symbols.items()):
+            report_lines.append(
+                f"• {symbol}: {stats.file_count} files created")
+
+        report_text = "\n".join(report_lines)
+
+        success = await self._telegram.send_info("Weekly Report", report_text)
+
+        # Reset weekly reconnects after report
+        if success:
+            self._stats.reset_weekly_reconnects()
+
+        return success
 
     def _setup_signal_handlers(self) -> None:
         """Setup graceful shutdown handlers (cross-platform)."""
@@ -353,13 +805,26 @@ class FiniexDataCollector:
         if self._live_display:
             await self._live_display.stop()
 
+        # Stop monitoring tasks
+        for task in self._monitoring_tasks:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
         # Stop collectors
         for collector in self._collectors:
             await collector.stop()
 
         # Finalize writers
         for symbol, writer in self._writers.items():
-            tick_count = writer.current_tick_count
+            # Get final count from stats (source of truth)
+            if symbol in self._stats.symbols:
+                tick_count = self._stats.symbols[symbol].current_file_ticks
+            else:
+                tick_count = 0
+
             filepath = writer.finalize()
             if filepath:
                 self._logger.info(f"Finalized: {filepath.name}")
@@ -373,12 +838,16 @@ class FiniexDataCollector:
         if self._scheduler:
             self._scheduler.stop()
 
+        # Stop telegram command polling
+        if self._telegram:
+            self._telegram.stop_command_polling()
+
         # Send shutdown notification
         if self._telegram:
             await self._telegram.send_info(
                 "Collector Stopped",
                 f"FiniexDataCollector stopped. "
-                f"Total: {self._stats.total_ticks:,} ticks, {self._stats.total_files} files"
+                f"Files: {self._stats.total_files}"
             )
 
         self._is_running = False
@@ -461,20 +930,6 @@ async def cmd_collect(config: AppConfig) -> None:
     await app.start_collection()
 
 
-async def cmd_convert(config: AppConfig) -> None:
-    """Run parquet conversion manually."""
-    logger = get_logger("FiniexDataCollector")
-    logger.info("Running manual parquet conversion...")
-
-    result = await run_weekly_conversion(
-        raw_dir=Path(config.paths.raw_data_dir),
-        processed_dir=Path(config.paths.processed_data_dir),
-        data_collector="kraken"
-    )
-
-    logger.info(f"Conversion complete: {result}")
-
-
 async def cmd_broker_config(config: AppConfig) -> None:
     """Fetch and save broker configuration."""
     logger = get_logger("FiniexDataCollector")
@@ -515,7 +970,13 @@ def cmd_status(config: AppConfig) -> None:
     logger.info("")
     logger.info("Scheduler:")
     logger.info(
-        f"  Conversion: {config.scheduler.conversion_day} {config.scheduler.conversion_hour_utc:02d}:00 UTC")
+        f"  Weekly Report: {config.scheduler.report_day} {config.scheduler.report_hour_utc:02d}:{config.scheduler.report_minute_utc:02d} UTC")
+    logger.info("")
+    logger.info("Monitoring:")
+    logger.info(
+        f"  Disk Check: every {config.monitoring.disk_space_check_interval_seconds}s")
+    logger.info(
+        f"  Folder Scan: every {config.monitoring.folder_scan_interval_seconds}s")
     logger.info("=" * 60)
 
 
@@ -527,7 +988,7 @@ def main():
 
     parser.add_argument(
         "command",
-        choices=["collect", "convert", "broker-config", "status"],
+        choices=["collect", "broker-config", "status"],
         help="Command to execute"
     )
 
@@ -564,8 +1025,6 @@ def main():
     try:
         if args.command == "collect":
             asyncio.run(cmd_collect(config))
-        elif args.command == "convert":
-            asyncio.run(cmd_convert(config))
         elif args.command == "broker-config":
             asyncio.run(cmd_broker_config(config))
         elif args.command == "status":
