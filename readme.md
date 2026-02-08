@@ -4,8 +4,8 @@
 
 > ⚠️ **No financial advice.** This software is for educational and research purposes only.
 
-> **Version:** 1.0 Alpha  
-> **Status:** Core Collection Implemented  
+> **Version:** 1.0  
+> **Status:** Production Ready  
 > **Target:** Developers who need reliable tick data for backtesting systems
 
 ---
@@ -14,13 +14,14 @@
 
 FiniexDataCollector is a real-time tick data collection system that captures market data from cryptocurrency exchanges and forex brokers. It produces standardized JSON tick files compatible with FiniexTestingIDE for backtesting.
 
-**1.0 Alpha delivers:**
+**1.0 delivers:**
 - ✅ Kraken WebSocket v2 ticker collection (8 crypto pairs)
 - ✅ JSON output format matching MT5 TickCollector
 - ✅ Automatic file rotation at 50,000 ticks
 - ✅ Lock file protection for active files
-- ✅ Weekly Parquet conversion (Saturday 06:00 UTC)
-- ✅ Telegram alerts for errors and weekly reports
+- ✅ Live monitoring with disk space, folder scanning, reconnect tracking
+- ✅ Telegram bot with commands (/report, /help) for on-demand reports
+- ✅ Weekly summary reports (configurable day/time)
 
 ---
 
@@ -28,34 +29,50 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 
 ### Data Collection
 - **Kraken WebSocket v2** - Real-time ticker stream for crypto pairs
-- **Multi-Symbol Support** - 8 symbols simultaneously (BTC, ETH, SOL, ADA, MATIC, AVAX, LINK, DOT)
-- **Automatic Reconnection** - Exponential backoff (1s → 60s max)
-- **Heartbeat Monitoring** - Detects stale connections
+- **Multi-Symbol Support** - 8 symbols simultaneously (BTC, ETH, SOL, ADA, XRP, DASH, LTC, ETH/EUR)
+- **Automatic Reconnection** - Exponential backoff (1s → 60s max) with tracking
+- **Heartbeat Monitoring** - Detects stale connections and forces reconnect
+- **Reconnect Tracking** - Records all reconnect events with duration
 
 ### Output Format
 - **MT5-Compatible JSON** - Identical structure to TickCollector.mq5 output
-- **50k Tick Rotation** - Files close at 50,000 ticks
+- **Configurable Rotation** - Files close at N ticks (default: 50,000)
 - **Lock File Protection** - `.lock` files prevent processing of active files
 - **Quality Metrics** - Spread calculation, tick frequency, error tracking
 
-### Weekly Processing
-- **Parquet Conversion** - JSON → Parquet every Saturday 06:00 UTC
-- **Broker Config Fetch** - Symbol specifications from Kraken API
-- **Telegram Reports** - Weekly summary with statistics
+### Monitoring & Health
+- **Live Display** - Real-time status with Rich TUI interface
+- **Disk Space Monitoring** - Continuous tracking with critical alerts (<20% free)
+- **Folder Scanning** - Automatic file counting per broker/symbol
+- **Reconnect Tracking** - Duration tracking with configurable alerts
+- **Connection Health** - WebSocket status and error tracking
 
-### Alerting
-- **Telegram Bot Integration** - Error alerts, rotation notices, weekly reports
-- **Configurable Triggers** - Enable/disable per alert type
+### Telegram Integration
+- **Bot Commands**:
+  - `/report` - Generate weekly report on demand
+  - `/help` - Show available commands
+- **Automatic Alerts**:
+  - File rotation notices (optional)
+  - Reconnect warnings (with cooldown)
+  - Critical disk space alerts
+  - Collector start/stop notifications
+- **Weekly Reports** - Scheduled summary with folder sizes, statistics
+
+### Configuration System
+- **Pydantic Validation** - Type-safe configuration with clear error messages
+- **User Override Pattern** - `user_configs/app_config.json` overrides base config
+- **Environment Separation** - Gitignored user config for secrets (bot tokens)
+- **Flexible Scheduling** - Configurable report day/hour/minute in UTC
 
 ---
 
 ## Quick Start
 
 ```
-1. Configure Telegram    →  configs/app_config.json
+1. Configure Telegram    →  user_configs/app_config.json
 2. Start collector       →  docker-compose up -d
 3. Fetch broker config   →  docker-compose run broker-config
-4. Weekly conversion     →  Automatic (Saturday 06:00 UTC)
+4. Monitor via Telegram  →  /report command for status
 ```
 
 ### Detailed Setup
@@ -64,21 +81,25 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 # 1. Clone/Extract project
 cd FiniexDataCollector
 
-# 2. Configure (edit configs/app_config.json)
-#    - Set telegram.bot_token and telegram.chat_id
-#    - Adjust symbols if needed
+# 2. Create user config
+cp user_configs/app_config.example.json user_configs/app_config.json
 
-# 3. Start collection
+# 3. Configure (edit user_configs/app_config.json)
+#    - Set telegram.bot_token and telegram.chat_id
+#    - Adjust symbols if needed (or use defaults)
+#    - Set max_ticks_per_file (default: 50000)
+
+# 4. Start collection
 docker-compose up -d collector
 
-# 4. Monitor logs
+# 5. Monitor logs
 docker logs -f finiex-data-collector
 
-# 5. Fetch broker config (once)
+# 6. Fetch broker config (once)
 docker-compose run --rm broker-config
 
-# 6. Manual conversion (optional)
-docker-compose run --rm converter
+# 7. Check status via Telegram
+#    Send /report to your bot
 ```
 
 ### Without Docker
@@ -93,16 +114,13 @@ python python/main.py collect
 # Fetch broker config
 python python/main.py broker-config
 
-# Run conversion
-python python/main.py convert
-
 # Check status
 python python/main.py status
 ```
 
 ---
 
-## Collected Symbols
+## Collected Symbols (Default)
 
 | Symbol | Description | Tick Size | Digits |
 |--------|-------------|-----------|--------|
@@ -110,10 +128,10 @@ python python/main.py status
 | ETHUSD | Ethereum vs US Dollar | 0.01 | 2 |
 | SOLUSD | Solana vs US Dollar | 0.001 | 3 |
 | ADAUSD | Cardano vs US Dollar | 0.00001 | 5 |
-| MATICUSD | Polygon vs US Dollar | 0.00001 | 5 |
-| AVAXUSD | Avalanche vs US Dollar | 0.001 | 3 |
-| LINKUSD | Chainlink vs US Dollar | 0.001 | 3 |
-| DOTUSD | Polkadot vs US Dollar | 0.001 | 3 |
+| XRPUSD | Ripple vs US Dollar | 0.00001 | 5 |
+| DASHUSD | Dash vs US Dollar | 0.001 | 3 |
+| LTCUSD | Litecoin vs US Dollar | 0.001 | 3 |
+| ETHEUR | Ethereum vs Euro | 0.01 | 2 |
 
 ---
 
@@ -135,28 +153,54 @@ python python/main.py status
 │         │                                                       │
 │         ▼                                                       │
 │  ┌─────────────────────────────────────────────────────────┐    │
+│  │  MONITORING & STATS                                     │    │
+│  │  • Disk space tracking                                  │    │
+│  │  • Folder file counts                                   │    │
+│  │  • Reconnect events                                     │    │
+│  │  • Live display updates                                 │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐    │
 │  │  JSON TICK WRITER                                       │    │
 │  │  50k rotation, .lock protection, atomic writes          │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │         │                                                       │
 │         ▼                                                       │
-│  data/raw/kraken/{SYMBOL}/{SYMBOL}_{TIMESTAMP}_ticks.json       │
-│         │                                                       │
-│         │ (Saturday 06:00 UTC)                                  │
-│         ▼                                                       │
+│  data/raw/kraken/{SYMBOL}_{TIMESTAMP}_ticks.json                │
+│                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │  PARQUET CONVERTER                                      │    │
-│  │  JSON → Parquet, metadata preservation                  │    │
+│  │  TELEGRAM BOT                                           │    │
+│  │  • Commands: /report, /help                             │    │
+│  │  • Alerts: rotation, reconnect, disk space              │    │
+│  │  • Weekly reports (scheduled)                           │    │
 │  └─────────────────────────────────────────────────────────┘    │
-│         │                                                       │
-│         ▼                                                       │
-│  data/processed/kraken/ticks/{SYMBOL}/*.parquet                 │
-│         │                                                       │
-│         │ (Transfer to FiniexTestingIDE)                        │
-│         ▼                                                       │
-│  FiniexTestingIDE/data/processed/kraken/ticks/                  │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Live Display
+
+FiniexDataCollector includes a rich terminal UI showing real-time status:
+
+```
+╭────────────────────────────── 📡 FiniexDataCollector Live ──────────────────────────────╮
+│ 📋 Streams: trade │ ⏱️ Uptime: 02:15:33 │ 📁 Files: 24 │ 🔌 WS: ● connected             │
+│                                                                                         │
+│ 💾 Disk: 503.3 GB free (53%) ✅ │ Last Check: Sun 08.02 17:30                           │
+│                                                                                         │
+│   Symbol       Current File      Files    Last Price    Volume    Status               │
+│  ─────────────────────────────────────────────────────────────────────────────          │
+│   BTCUSD      5,234 / 50,000    2        71,158.30     0.0004     ✅ Active            │
+│   ETHUSD      12,456 / 50,000   1         2,112.35     0.0010     ✅ Active            │
+│   ...                                                                                   │
+│                                                                                         │
+│ 📁 Storage: Kraken: 24 files │ MT5: - │ Logs: 3 files │ Reconnects: 1                  │
+│                                                                                         │
+│ 📄 Last file: BTCUSD_20260208_160013_ticks.json (50,000 ticks)                         │
+╰─────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ---
@@ -218,36 +262,169 @@ BTCUSD_20250113_143052_ticks.json.lock
 
 ## Configuration
 
-### Main Config (configs/app_config.json)
+### Configuration Files Structure
+
+```
+FiniexDataCollector/
+├── configs/
+│   └── app_config.json          # Base configuration (version controlled)
+└── user_configs/
+    ├── app_config.json          # User overrides (gitignored, for secrets)
+    └── app_config.example.json  # Template for user config
+```
+
+**Configuration Loading:**
+1. Load `configs/app_config.json` (base)
+2. Merge with `user_configs/app_config.json` (overrides)
+3. Validate with Pydantic schemas
+
+### Base Config (configs/app_config.json)
 
 ```json
 {
   "kraken": {
     "enabled": true,
-    "symbols": ["BTC/USD", "ETH/USD", ...],
-    "max_ticks_per_file": 50000
+    "symbols": ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "XRP/USD", "DASH/USD", "LTC/USD", "ETH/EUR"],
+    "max_ticks_per_file": 50000,
+    "streams": ["trade"]
+  },
+  "mt5": {
+    "enabled": false,
+    "raw_data_path": ""
+  },
+  "paths": {
+    "raw_data_dir": "./data/raw",
+    "processed_data_dir": "./data/processed",
+    "logs_dir": "./logs"
+  },
+  "logging": {
+    "console_level": "INFO",
+    "file_level": "DEBUG"
+  },
+  "monitoring": {
+    "disk_space_check_interval_seconds": 60,
+    "folder_scan_interval_seconds": 60,
+    "reconnect_alert_cooldown_minutes": 30
   },
   "telegram": {
-    "enabled": true,
-    "bot_token": "YOUR_BOT_TOKEN",
-    "chat_id": "YOUR_CHAT_ID",
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "send_on_rotation": false,
     "send_on_error": true,
     "send_weekly_report": true
   },
   "scheduler": {
-    "conversion_day": "saturday",
-    "conversion_hour_utc": 6
+    "report_day": "sunday",
+    "report_hour_utc": 8,
+    "report_minute_utc": 0
   }
 }
 ```
+
+### User Config Override (user_configs/app_config.json)
+
+```json
+{
+  "telegram": {
+    "enabled": true,
+    "bot_token": "YOUR_BOT_TOKEN_HERE",
+    "chat_id": "YOUR_CHAT_ID_HERE",
+    "send_on_rotation": true
+  },
+  "kraken": {
+    "symbols": ["BTC/USD", "ETH/USD"],
+    "max_ticks_per_file": 100
+  }
+}
+```
+
+### Configuration Options
+
+#### Kraken Section
+- `enabled` - Enable Kraken collection
+- `symbols` - Array of Kraken symbol pairs (e.g., "BTC/USD")
+- `max_ticks_per_file` - Ticks before file rotation (min: 100)
+- `streams` - WebSocket streams to subscribe (default: ["trade"])
+
+#### Monitoring Section
+- `disk_space_check_interval_seconds` - How often to check disk space (10-600s)
+- `folder_scan_interval_seconds` - How often to scan folders (10-600s)
+- `reconnect_alert_cooldown_minutes` - Min time between reconnect alerts (1-1440min)
+
+#### Telegram Section
+- `enabled` - Enable Telegram integration
+- `bot_token` - Telegram bot token from @BotFather
+- `chat_id` - Your Telegram chat ID from @userinfobot
+- `send_on_rotation` - Alert when files rotate
+- `send_on_error` - Alert on errors
+- `send_weekly_report` - Send scheduled reports
+
+#### Scheduler Section
+- `report_day` - Day for weekly report (monday-sunday)
+- `report_hour_utc` - Hour for report (0-23 UTC)
+- `report_minute_utc` - Minute for report (0-59)
 
 ### Telegram Bot Setup
 
 1. Message [@BotFather](https://t.me/botfather) on Telegram
 2. Create new bot: `/newbot`
-3. Copy the bot token to `app_config.json`
+3. Copy the bot token to `user_configs/app_config.json`
 4. Get your chat ID (message [@userinfobot](https://t.me/userinfobot))
 5. Set `telegram.enabled: true`
+6. Test with `/help` command
+
+**Available Commands:**
+- `/report` - Generate weekly summary on demand
+- `/help` - Show available commands
+
+---
+
+## Telegram Alerts
+
+### File Rotation Notice
+```
+📁 File Rotation: BTCUSD
+File: BTCUSD_20260208_160013_ticks.json
+Ticks: 50,000
+```
+
+### Reconnect Warning
+```
+🔌 Connection Restored
+WebSocket reconnected after 3m downtime
+```
+
+### Weekly Report
+```
+📊 Weekly Collection Report
+Sunday, 08.02.2026 08:00 UTC
+
+⏱️ Uptime
+• Runtime: 167.5 hours
+• Files Created: 248
+• Errors: 0 | Warnings: 2
+
+📁 Data Storage
+• Kraken: 2.45 GB (248 files)
+• MT5: 0.00 GB (0 files)
+• Logs: 0.15 GB (7 files)
+• Total Data: 2.60 GB
+
+💾 Disk Space
+• Total: 952.6 GB
+• Used: 449.3 GB (47%)
+• Free: 503.3 GB (53%) ✅
+
+🔌 Connection Health
+• Reconnects This Week: 3
+• Current Status: connected
+
+📈 Per Symbol
+• BTCUSD: 42 files created
+• ETHUSD: 38 files created
+• ...
+```
 
 ---
 
@@ -262,6 +439,9 @@ pytest tests/ -v
 # Run specific test file
 pytest tests/test_message_parser.py -v
 pytest tests/test_json_writer.py -v
+
+# Run with coverage
+pytest tests/ --cov=python --cov-report=html
 ```
 
 ### Test Coverage
@@ -278,56 +458,109 @@ pytest tests/test_json_writer.py -v
 ```
 FiniexDataCollector/
 ├── configs/
-│   ├── app_config.json           # Main configuration
+│   ├── app_config.json           # Base configuration (version controlled)
 │   └── brokers/
-│       └── kraken_demo.json      # Generated broker config
+│       └── kraken/
+│           └── kraken_public.json  # Generated broker config
+├── user_configs/
+│   ├── app_config.json           # User overrides (gitignored)
+│   └── app_config.example.json   # Template
 ├── data/
-│   ├── raw/kraken/{SYMBOL}/      # JSON tick files
-│   └── processed/kraken/ticks/   # Parquet files
+│   ├── raw/
+│   │   └── kraken/               # JSON tick files (flat structure)
+│   │       ├── BTCUSD_*.json
+│   │       ├── ETHUSD_*.json
+│   │       └── ...
+│   └── processed/                # For future Parquet processing
 ├── logs/                         # Application logs
+│   └── collector_YYYYMMDD.log
 ├── python/
 │   ├── collectors/kraken/        # WebSocket client
 │   ├── writers/                  # JSON tick writer
-│   ├── converters/               # Parquet converter
+│   ├── converters/               # Broker config fetcher
 │   ├── alerts/                   # Telegram integration
 │   ├── scheduler/                # Weekly jobs
+│   ├── utils/                    # Config, logging, display
+│   ├── types/                    # Data types, stats
 │   └── main.py                   # Entry point
 └── tests/                        # Unit tests
 ```
 
 ---
 
-## Current Limitations (Alpha)
+## Current Limitations
 
 - **Kraken Only** - No MT5 live collection (uses existing MQL5 scripts)
 - **Spot Markets Only** - No futures or margin data
-- **No Automatic Transfer** - Manual copy to FiniexTestingIDE required
+- **JSON Only** - No automatic Parquet conversion (manual processing needed)
 - **Single Instance** - No horizontal scaling
 
-> **Note on 24/7 Operation:** Crypto markets never close. The collector runs continuously with automatic reconnection. Weekly conversion only processes completed files (no .lock).
+> **Note on 24/7 Operation:** Crypto markets never close. The collector runs continuously with automatic reconnection. Monitor via Telegram bot commands.
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+**Q: Configuration validation failed**
+```
+A: Check your user_configs/app_config.json syntax (valid JSON)
+   Ensure required fields are present (bot_token, chat_id)
+   Min values: max_ticks_per_file >= 100
+```
+
+**Q: Telegram bot not responding**
+```
+A: Verify bot_token is correct
+   Check chat_id matches your Telegram user
+   Ensure bot is started (send any message first)
+   Check network connectivity
+```
+
+**Q: Folder scan shows 0 files but files exist**
+```
+A: Files are counted every 60s (configurable)
+   Wait one interval after rotation
+   Check folder_scan_interval_seconds in config
+```
+
+**Q: Off-by-one tick count in logs**
+```
+A: Fixed in 1.0 - stats are now reset on rotation
+   Writer log shows correct count (100 ticks)
+   Display and alerts now match writer count
+```
 
 ---
 
 ## Vision & Roadmap
 
-### Post-Alpha (Next)
-- MT5 JSON consolidation (from existing TickCollector.mq5)
-- Automatic rsync transfer to FiniexTestingIDE
-- More crypto exchanges (Binance, Coinbase)
+### Current: 1.0 Production
+- ✅ Kraken WebSocket collection
+- ✅ Live monitoring and health tracking
+- ✅ Telegram bot with commands
+- ✅ Configurable scheduling
 
-### Phase 2: Multi-Source
+### Phase 2: Processing Pipeline
+- Automatic Parquet conversion
+- Gap detection and reporting
+- Data quality metrics
+- Automatic transfer to FiniexTestingIDE
+
+### Phase 3: Multi-Source
 | Source | Type | Status |
 |--------|------|--------|
-| Kraken WebSocket | Crypto Spot | ✅ Alpha |
+| Kraken WebSocket | Crypto Spot | ✅ 1.0 |
 | MT5 TickCollector | Forex/CFD | Planned |
 | Binance WebSocket | Crypto Spot | Planned |
 
-### Phase 3: Distribution
+### Phase 4: Distribution
 - Compressed Parquet delivery
 - Weekly data packages
 - Cloud storage integration
 
-### Phase 4: Service Layer
+### Phase 5: Service Layer
 - REST API for data queries
 - Real-time streaming to clients
 - Multi-tenant support
@@ -336,18 +569,57 @@ FiniexDataCollector/
 
 ## Integration with FiniexTestingIDE
 
-FiniexDataCollector outputs are designed for direct use with FiniexTestingIDE:
+FiniexDataCollector outputs JSON tick files that can be processed for use with FiniexTestingIDE.
+
+### Manual Processing Workflow
 
 ```bash
-# After weekly conversion, copy to FiniexTestingIDE
+# 1. Collect data with FiniexDataCollector
+python python/main.py collect
+
+# 2. Process JSON to Parquet (external script needed)
+# Use FiniexTestingIDE's importer or custom script
+
+# 3. Copy to FiniexTestingIDE
 cp -r data/processed/kraken/* /path/to/FiniexTestingIDE/data/processed/kraken/
 
-# Rebuild indexes in FiniexTestingIDE
+# 4. Rebuild indexes in FiniexTestingIDE
 python python/cli/data_index_cli.py rebuild
 python python/cli/bar_index_cli.py render --clean
 ```
 
-The Parquet format is identical - no conversion needed.
+---
+
+## Debug Mode
+
+For troubleshooting, enable DEBUG logging:
+
+```json
+{
+  "logging": {
+    "console_level": "DEBUG",
+    "file_level": "DEBUG"
+  }
+}
+```
+
+Debug logs include structured markers for filtering:
+- `[TICK]` - Tick processing
+- `[ROTATION]` - File rotation events
+- `[STATUS]` - WebSocket status changes
+- `[RECONNECT]` - Reconnect tracking
+- `[FOLDER_SCAN]` - Folder monitoring
+- `[DISK_MONITOR]` - Disk space checks
+- `[TELEGRAM]` - Telegram operations
+
+**Filter logs:**
+```bash
+# Live filtering
+tail -f logs/collector_*.log | grep "\[ROTATION\]\|\[RECONNECT\]"
+
+# Search for specific events
+grep "\[RECONNECT\]" logs/collector_20260208.log
+```
 
 ---
 
