@@ -278,50 +278,6 @@ FiniexDataCollector/
 2. Merge with `user_configs/app_config.json` (overrides)
 3. Validate with Pydantic schemas
 
-### Base Config (configs/app_config.json)
-
-```json
-{
-  "kraken": {
-    "enabled": true,
-    "symbols": ["BTC/USD", "ETH/USD", "SOL/USD", "ADA/USD", "XRP/USD", "DASH/USD", "LTC/USD", "ETH/EUR"],
-    "max_ticks_per_file": 50000,
-    "streams": ["trade"]
-  },
-  "mt5": {
-    "enabled": false,
-    "raw_data_path": ""
-  },
-  "paths": {
-    "raw_data_dir": "./data/raw",
-    "processed_data_dir": "./data/processed",
-    "logs_dir": "./logs"
-  },
-  "logging": {
-    "console_level": "INFO",
-    "file_level": "DEBUG"
-  },
-  "monitoring": {
-    "disk_space_check_interval_seconds": 60,
-    "folder_scan_interval_seconds": 60,
-    "reconnect_alert_cooldown_minutes": 30
-  },
-  "telegram": {
-    "enabled": false,
-    "bot_token": "",
-    "chat_id": "",
-    "send_on_rotation": false,
-    "send_on_error": true,
-    "send_weekly_report": true
-  },
-  "scheduler": {
-    "report_day": "sunday",
-    "report_hour_utc": 8,
-    "report_minute_utc": 0
-  }
-}
-```
-
 ### User Config Override (user_configs/app_config.json)
 
 ```json
@@ -426,169 +382,18 @@ Sunday, 08.02.2026 08:00 UTC
 • ...
 ```
 
----
-
-## Testing
-
-### Unit Tests (21 tests)
-
-```bash
-# Run all tests
-pytest tests/ -v
-
-# Run specific test file
-pytest tests/test_message_parser.py -v
-pytest tests/test_json_writer.py -v
-
-# Run with coverage
-pytest tests/ --cov=python --cov-report=html
-```
-
-### Test Coverage
-
-| Module | Tests | Coverage |
-|--------|-------|----------|
-| Message Parser | 12 | Symbol normalization, tick parsing, error detection |
-| JSON Writer | 9 | File rotation, lock files, content format |
-
----
-
-## Directory Structure
-
-```
-FiniexDataCollector/
-├── configs/
-│   ├── app_config.json           # Base configuration (version controlled)
-│   └── brokers/
-│       └── kraken/
-│           └── kraken_public.json  # Generated broker config
-├── user_configs/
-│   ├── app_config.json           # User overrides (gitignored)
-│   └── app_config.example.json   # Template
-├── data/
-│   ├── raw/
-│   │   └── kraken/               # JSON tick files (flat structure)
-│   │       ├── BTCUSD_*.json
-│   │       ├── ETHUSD_*.json
-│   │       └── ...
-│   └── processed/                # For future Parquet processing
-├── logs/                         # Application logs
-│   └── collector_YYYYMMDD.log
-├── python/
-│   ├── collectors/kraken/        # WebSocket client
-│   ├── writers/                  # JSON tick writer
-│   ├── converters/               # Broker config fetcher
-│   ├── alerts/                   # Telegram integration
-│   ├── scheduler/                # Weekly jobs
-│   ├── utils/                    # Config, logging, display
-│   ├── types/                    # Data types, stats
-│   └── main.py                   # Entry point
-└── tests/                        # Unit tests
-```
-
----
-
-## Current Limitations
-
-- **Kraken Only** - No MT5 live collection (uses existing MQL5 scripts)
-- **Spot Markets Only** - No futures or margin data
-- **JSON Only** - No automatic Parquet conversion (manual processing needed)
-- **Single Instance** - No horizontal scaling
-
-> **Note on 24/7 Operation:** Crypto markets never close. The collector runs continuously with automatic reconnection. Monitor via Telegram bot commands.
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Q: Configuration validation failed**
-```
-A: Check your user_configs/app_config.json syntax (valid JSON)
-   Ensure required fields are present (bot_token, chat_id)
-   Min values: max_ticks_per_file >= 100
-```
-
-**Q: Telegram bot not responding**
-```
-A: Verify bot_token is correct
-   Check chat_id matches your Telegram user
-   Ensure bot is started (send any message first)
-   Check network connectivity
-```
-
-**Q: Folder scan shows 0 files but files exist**
-```
-A: Files are counted every 60s (configurable)
-   Wait one interval after rotation
-   Check folder_scan_interval_seconds in config
-```
-
-**Q: Off-by-one tick count in logs**
-```
-A: Fixed in 1.0 - stats are now reset on rotation
-   Writer log shows correct count (100 ticks)
-   Display and alerts now match writer count
-```
-
----
-
 ## Vision & Roadmap
 
-### Current: 1.0 Production
-- ✅ Kraken WebSocket collection
-- ✅ Live monitoring and health tracking
-- ✅ Telegram bot with commands
-- ✅ Configurable scheduling
+For Vision & Roadmap see issue:
 
-### Phase 2: Processing Pipeline
-- Automatic Parquet conversion
-- Gap detection and reporting
-- Data quality metrics
-- Automatic transfer to FiniexTestingIDE
-
-### Phase 3: Multi-Source
-| Source | Type | Status |
-|--------|------|--------|
-| Kraken WebSocket | Crypto Spot | ✅ 1.0 |
-| MT5 TickCollector | Forex/CFD | Planned |
-| Binance WebSocket | Crypto Spot | Planned |
-
-### Phase 4: Distribution
-- Compressed Parquet delivery
-- Weekly data packages
-- Cloud storage integration
-
-### Phase 5: Service Layer
-- REST API for data queries
-- Real-time streaming to clients
-- Multi-tenant support
-
----
+- [#8 — FiniexDataCollector Vision & Roadmap](https://github.com/dc-deal/FiniexDataCollector/issues/8)
 
 ## Integration with FiniexTestingIDE
 
-FiniexDataCollector outputs JSON tick files that can be processed for use with FiniexTestingIDE.
+FiniexDataCollector outputs JSON tick files that can be processed for use with FiniexTestingIDE. See:
 
-### Manual Processing Workflow
+- [#138 — FiniexTestingIDE Vision & Roadmap](https://github.com/dc-deal/FiniexTestingIDE/issues/138)
 
-```bash
-# 1. Collect data with FiniexDataCollector
-python python/main.py collect
-
-# 2. Process JSON to Parquet (external script needed)
-# Use FiniexTestingIDE's importer or custom script
-
-# 3. Copy to FiniexTestingIDE
-cp -r data/processed/kraken/* /path/to/FiniexTestingIDE/data/processed/kraken/
-
-# 4. Rebuild indexes in FiniexTestingIDE
-python python/cli/data_index_cli.py rebuild
-python python/cli/bar_index_cli.py render --clean
-```
-
----
 
 ## Debug Mode
 
@@ -626,5 +431,3 @@ grep "\[RECONNECT\]" logs/collector_20260208.log
 ## License
 
 MIT License - see [LICENSE](LICENSE)
-
-**Trademarks:** Finiex™ is property of Frank Krätzig
