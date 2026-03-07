@@ -173,6 +173,7 @@ class KrakenMessageParser:
                 chart_tick_volume=self._tick_counter[symbol],
                 spread_points=spread_points,
                 spread_pct=round(spread_pct, 6),
+                collected_msc=int(time.time() * 1000),
                 tick_flags="BID ASK",
                 session="24h",
                 server_time=server_time_str
@@ -263,6 +264,7 @@ class KrakenMessageParser:
                 chart_tick_volume=self._tick_counter[symbol],
                 spread_points=0,
                 spread_pct=0.0,
+                collected_msc=int(time.time() * 1000),
                 tick_flags=side if side else "TRADE",
                 session="24h",
                 server_time=server_time_str

@@ -28,6 +28,7 @@ class TickData:
     chart_tick_volume: int = 0
     spread_points: int = 0
     spread_pct: float = 0.0
+    collected_msc: int = 0
     tick_flags: str = "BID ASK"
     session: str = "24h"              # "24h" for crypto, forex has sessions
     server_time: str = ""
@@ -83,7 +84,7 @@ class TickFileMetadata:
     timeframe: str = "TICK"
     volume_timeframe: str = "PERIOD_M1"
     volume_timeframe_minutes: int = 1
-    data_format_version: str = "1.2.0"
+    data_format_version: str = "1.3.0"
     data_collector: str = "kraken"
     collection_purpose: str = "backtesting"
     operator: str = "automated"
