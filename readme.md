@@ -215,8 +215,7 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
     "symbol": "BTCUSD",
     "broker": "Kraken",
     "server": "kraken_spot",
-    "data_format_version": "1.0.5",
-    "data_collector": "kraken",
+    "data_format_version": "1.3.0",
     "symbol_info": {
       "point_value": 0.1,
       "digits": 1,
@@ -230,6 +229,7 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
     {
       "timestamp": "2025.01.13 14:30:45",
       "time_msc": 1736775045123,
+      "collected_msc": 1736775045098,
       "bid": 45000.0,
       "ask": 45010.0,
       "last": 45005.0,
@@ -397,16 +397,18 @@ FiniexDataCollector outputs JSON tick files that can be processed for use with F
 
 ## Debug Mode
 
-For troubleshooting, enable DEBUG logging:
+The default logging config writes DEBUG to file only, keeping the console clean for the Live Display:
 
 ```json
 {
   "logging": {
-    "console_level": "DEBUG",
+    "console_level": "INFO",
     "file_level": "DEBUG"
   }
 }
 ```
+
+For troubleshooting, temporarily set `console_level` to `"DEBUG"` (note: this will cause flickering with the Live Display).
 
 Debug logs include structured markers for filtering:
 - `[TICK]` - Tick processing
