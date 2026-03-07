@@ -9,8 +9,8 @@
     "logs_dir": "./logs"
   },
   "logging": {
-    "console_level": "DEBUG",
-    "file_level": "INFO"
+    "console_level": "INFO",
+    "file_level": "DEBUG"
   },
   "kraken": {
     "enabled": true,
