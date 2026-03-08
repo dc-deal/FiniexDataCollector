@@ -31,7 +31,6 @@ class TickData:
     collected_msc: int = 0
     tick_flags: str = "BID ASK"
     session: str = "24h"              # "24h" for crypto, forex has sessions
-    server_time: str = ""
 
 
 @dataclass

@@ -408,8 +408,7 @@ class JsonTickWriter(AbstractTickWriter):
             "spread_points": tick.spread_points,
             "spread_pct": tick.spread_pct,
             "tick_flags": tick.tick_flags,
-            "session": tick.session,
-            "server_time": tick.server_time
+            "session": tick.session
         }
 
     def _summary_to_dict(self, summary: TickFileSummary) -> Dict[str, Any]:

@@ -154,7 +154,6 @@ class KrakenMessageParser:
             # Format timestamp
             dt_utc = datetime.now(timezone.utc)
             timestamp_str = dt_utc.strftime("%Y.%m.%d %H:%M:%S")
-            server_time_str = timestamp_str
 
             # Increment tick counter for chart_tick_volume
             if symbol not in self._tick_counter:
@@ -175,8 +174,7 @@ class KrakenMessageParser:
                 spread_pct=round(spread_pct, 6),
                 collected_msc=int(time.time() * 1000),
                 tick_flags="BID ASK",
-                session="24h",
-                server_time=server_time_str
+                session="24h"
             )
 
         except (KeyError, ValueError, TypeError) as e:
@@ -241,7 +239,6 @@ class KrakenMessageParser:
                 time_msc = int(time.time() * 1000)
 
             timestamp_str = dt_utc.strftime("%Y.%m.%d %H:%M:%S")
-            server_time_str = timestamp_str
 
             # Increment tick counter for chart_tick_volume
             if symbol not in self._tick_counter:
@@ -266,8 +263,7 @@ class KrakenMessageParser:
                 spread_pct=0.0,
                 collected_msc=int(time.time() * 1000),
                 tick_flags=side if side else "TRADE",
-                session="24h",
-                server_time=server_time_str
+                session="24h"
             )
 
         except (KeyError, ValueError, TypeError) as e:
