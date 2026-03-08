@@ -232,8 +232,10 @@ class JsonTickWriter(AbstractTickWriter):
             server=self._server,
             broker_type=self._broker_type,
             broker_utc_offset_hours=0,
-            local_device_time=now.strftime("%Y.%m.%d %H:%M:%S"),
-            broker_server_time=now.strftime("%Y.%m.%d %H:%M:%S"),
+            local_device_time=self._file_start_time.strftime(
+                "%Y.%m.%d %H:%M:%S") if self._file_start_time else "",
+            broker_server_time=self._file_start_time.strftime(
+                "%Y.%m.%d %H:%M:%S") if self._file_start_time else "",
             start_time=self._file_start_time.strftime(
                 "%Y.%m.%d %H:%M:%S") if self._file_start_time else "",
             start_time_unix=int(self._file_start_time.timestamp()
