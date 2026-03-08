@@ -34,6 +34,7 @@ class SymbolStats:
     last_spread_pct: float = 0.0
     last_volume: float = 0.0
     last_tick_time: Optional[datetime] = None
+    start_time: Optional[datetime] = None
     errors_count: int = 0
     file_count: int = 0
     folder_file_count: int = 0
@@ -247,6 +248,8 @@ class CollectorStats:
         stats.last_spread_pct = spread_pct
         stats.last_volume = real_volume
         stats.last_tick_time = datetime.now(timezone.utc)
+        if stats.start_time is None:
+            stats.start_time = datetime.now(timezone.utc)
 
     def record_file_created(self, symbol: str, filename: str, tick_count: int) -> None:
         """

@@ -15,7 +15,7 @@ Location: python/utils/live_display.py
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 
 from rich.console import Console
@@ -137,8 +137,18 @@ class LiveDisplay:
             box=box.ROUNDED
         )
 
+    def _get_local_tz_label(self) -> str:
+        """Get local timezone label like 'GMT+1' or 'GMT-5'."""
+        offset = datetime.now().astimezone().utcoffset()
+        total_seconds = int(offset.total_seconds())
+        hours = total_seconds // 3600
+        minutes = abs(total_seconds) % 3600 // 60
+        if minutes:
+            return f"GMT{hours:+d}:{minutes:02d}"
+        return f"GMT{hours:+d}"
+
     def _build_header(self) -> Text:
-        """Build header with uptime, files, and WebSocket status."""
+        """Build header with uptime, files, WebSocket status, and clocks."""
         uptime = self._format_uptime(self._stats.get_uptime_seconds())
 
         # WebSocket status with color
@@ -153,7 +163,12 @@ class LiveDisplay:
         # Streams display
         streams_str = ", ".join(self._streams)
 
-        header = (
+        # Time displays
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now()
+        tz_label = self._get_local_tz_label()
+
+        line1 = (
             f"[bold]📋 Streams:[/bold] [magenta]{streams_str}[/magenta] │ "
             f"[bold]⏱️ Uptime:[/bold] {uptime} │ "
             f"[bold]📁 Files:[/bold] {self._stats.total_files} │ "
@@ -161,7 +176,12 @@ class LiveDisplay:
             f"[bold]⚠️ Errors:[/bold] [red]{self._stats.total_errors}[/red]"
         )
 
-        return Text.from_markup(header)
+        line2 = (
+            f"[bold]🕐 Broker:[/bold] [cyan]{now_utc.strftime('%H:%M:%S')}[/cyan] [dim](UTC)[/dim] │ "
+            f"[bold]🏠 Local:[/bold] [green]{now_local.strftime('%H:%M:%S')}[/green] [dim]({tz_label})[/dim]"
+        )
+
+        return Text.from_markup(f"{line1}\n{line2}")
 
     def _build_monitoring_status(self) -> Text:
         """Build monitoring status line with disk space and last check."""
@@ -212,6 +232,7 @@ class LiveDisplay:
 
         # Columns
         table.add_column("Symbol", width=10)
+        table.add_column("Start (UTC)", width=12)
         table.add_column("Current File", justify="right", width=22)
         table.add_column("Files", justify="right", width=12)
 
@@ -229,7 +250,7 @@ class LiveDisplay:
         # No symbols yet
         if not self._stats.symbols:
             table.add_row(
-                "[dim]Waiting...[/dim]", "", "", "", "", "", ""
+                "[dim]Waiting...[/dim]", "", "", "", "", "", "", ""
             )
             return table
 
@@ -261,6 +282,12 @@ class LiveDisplay:
             else:
                 files_display = f"{stats.file_count} created"
 
+            # Start time display
+            start_str = (
+                f"[cyan]{stats.start_time.strftime('%H:%M:%S')}[/cyan]"
+                if stats.start_time else "[dim]-[/dim]"
+            )
+
             # Format based on stream type
             if "trade" in self._streams and "ticker" not in self._streams:
                 # Trade stream: show last price and volume
@@ -269,6 +296,7 @@ class LiveDisplay:
 
                 table.add_row(
                     f"[bold]{symbol}[/bold]",
+                    start_str,
                     file_progress,
                     files_display,
                     price_str,
@@ -283,6 +311,7 @@ class LiveDisplay:
 
                 table.add_row(
                     f"[bold]{symbol}[/bold]",
+                    start_str,
                     file_progress,
                     files_display,
                     bid_str,

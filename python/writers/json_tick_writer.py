@@ -82,6 +82,7 @@ class JsonTickWriter(AbstractTickWriter):
         self._current_lock: Optional[Path] = None
         self._ticks_buffer: List[TickData] = []
         self._file_start_time: Optional[datetime] = None
+        self._file_start_local_time: Optional[datetime] = None
         self._errors: List[Dict[str, Any]] = []
 
         # Ensure output directory exists
@@ -166,6 +167,7 @@ class JsonTickWriter(AbstractTickWriter):
 
         # Reset state
         self._file_start_time = now
+        self._file_start_local_time = datetime.now()
         self._ticks_buffer = []
         self._current_tick_count = 0
         self._errors = []
@@ -232,8 +234,8 @@ class JsonTickWriter(AbstractTickWriter):
             server=self._server,
             broker_type=self._broker_type,
             broker_utc_offset_hours=0,
-            local_device_time=self._file_start_time.strftime(
-                "%Y.%m.%d %H:%M:%S") if self._file_start_time else "",
+            local_device_time=self._file_start_local_time.strftime(
+                "%Y.%m.%d %H:%M:%S") if self._file_start_local_time else "",
             broker_server_time=self._file_start_time.strftime(
                 "%Y.%m.%d %H:%M:%S") if self._file_start_time else "",
             start_time=self._file_start_time.strftime(
