@@ -142,7 +142,7 @@ class BrokerConfig:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.get(url, params=params, ssl=False, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
         except (aiohttp.ClientError, TimeoutError) as e:
