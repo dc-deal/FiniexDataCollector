@@ -35,16 +35,3 @@ services:
     environment:
       - PYTHONPATH=/app
     command: python python/main.py convert
-
-  # Fetch broker config (run once)
-  broker-config:
-    build: .
-    container_name: finiex-broker-config
-    profiles:
-      - tools
-    volumes:
-      - ./configs:/app/configs
-      - ./logs:/app/logs
-    environment:
-      - PYTHONPATH=/app
-    command: python python/main.py broker-config

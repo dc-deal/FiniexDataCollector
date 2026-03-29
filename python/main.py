@@ -4,7 +4,6 @@ CLI and daemon mode for tick data collection.
 
 Usage:
     python main.py collect              # Start collectors
-    python main.py broker-config        # Fetch broker config
     python main.py status               # Show collector status
 
 Location: python/main.py
@@ -31,7 +30,6 @@ from python.collectors.kraken.websocket_client import KrakenWebSocketClient
 from python.writers.json_tick_writer import JsonTickWriter
 from python.alerts.telegram_bot import TelegramAlertProvider
 from python.scheduler.weekly_jobs import WeeklyJobScheduler
-from python.converters.broker_config_fetcher import fetch_kraken_broker_config
 
 
 def validate_symbols(symbols: List[str]) -> None:
@@ -854,46 +852,6 @@ class FiniexDataCollector:
         self._logger.info("Shutdown complete")
 
 
-async def ensure_broker_config(config: AppConfig, logger) -> Path:
-    """
-    Ensure broker config exists, fetch from API if not.
-
-    Args:
-        config: Application config
-        logger: Logger instance
-
-    Returns:
-        Path to broker config file
-
-    Raises:
-        ConfigurationError: If symbols invalid or API fails
-    """
-    broker_config_dir = Path(config.paths.broker_configs_dir) / "kraken"
-    broker_config_path = broker_config_dir / "kraken_public.json"
-
-    # Always fetch fresh from API at collect start
-    logger.info("Fetching broker configuration from Kraken API...")
-
-    try:
-        filepath, _ = await fetch_kraken_broker_config(
-            output_dir=broker_config_dir,
-            symbols=config.kraken.symbols,
-            broker_type=config.kraken.broker_type
-        )
-        logger.info(f"Broker config ready: {filepath}")
-        return filepath
-
-    except Exception as e:
-        # If fetch fails but we have cached config, use it
-        if broker_config_path.exists():
-            logger.warning(
-                f"API fetch failed ({e}), using cached broker config"
-            )
-            return broker_config_path
-
-        # No cache, re-raise
-        raise
-
 
 async def cmd_collect(config: AppConfig) -> None:
     """Run collection daemon."""
@@ -905,13 +863,11 @@ async def cmd_collect(config: AppConfig) -> None:
     logger.info("Validating configuration...")
     validate_symbols(config.kraken.symbols)
 
-    # 2. Fetch/ensure broker config (validates symbols against Kraken API)
-    broker_config_path = await ensure_broker_config(config, logger)
-
-    # 3. Load BrokerConfig singleton
-    BrokerConfig.load_from_file(broker_config_path)
+    # 2. Load symbol config from Kraken API
+    logger.info("Fetching symbol configuration from Kraken API...")
+    await BrokerConfig.load_from_api(config.kraken.symbols)
     logger.info(
-        f"Loaded {len(BrokerConfig.get_all_symbols())} symbols from broker config")
+        f"Loaded {len(BrokerConfig.get_all_symbols())} symbols from Kraken API")
 
     # 4. Verify all configured symbols are in broker config
     for symbol in config.kraken.symbols:
@@ -929,24 +885,6 @@ async def cmd_collect(config: AppConfig) -> None:
     app = FiniexDataCollector(config)
     await app.start_collection()
 
-
-async def cmd_broker_config(config: AppConfig) -> None:
-    """Fetch and save broker configuration."""
-    logger = get_logger("FiniexDataCollector")
-    logger.info("Fetching Kraken broker configuration...")
-
-    # Validate symbols first
-    validate_symbols(config.kraken.symbols)
-
-    output_dir = Path(config.paths.broker_configs_dir) / "kraken"
-
-    filepath, _ = await fetch_kraken_broker_config(
-        output_dir=output_dir,
-        symbols=config.kraken.symbols,
-        broker_type=config.kraken.broker_type
-    )
-
-    logger.info(f"Broker config saved: {filepath}")
 
 
 def cmd_status(config: AppConfig) -> None:
@@ -988,7 +926,7 @@ def main():
 
     parser.add_argument(
         "command",
-        choices=["collect", "broker-config", "status"],
+        choices=["collect", "status"],
         help="Command to execute"
     )
 
@@ -1025,8 +963,6 @@ def main():
     try:
         if args.command == "collect":
             asyncio.run(cmd_collect(config))
-        elif args.command == "broker-config":
-            asyncio.run(cmd_broker_config(config))
         elif args.command == "status":
             cmd_status(config)
     except ConfigurationError as e:

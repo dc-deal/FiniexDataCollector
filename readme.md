@@ -71,8 +71,7 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 ```
 1. Configure Telegram    →  user_configs/app_config.json
 2. Start collector       →  docker-compose up -d
-3. Fetch broker config   →  docker-compose run broker-config
-4. Monitor via Telegram  →  /report command for status
+3. Monitor via Telegram  →  /report command for status
 ```
 
 ### Detailed Setup
@@ -95,10 +94,7 @@ docker-compose up -d collector
 # 5. Monitor logs
 docker logs -f finiex-data-collector
 
-# 6. Fetch broker config (once)
-docker-compose run --rm broker-config
-
-# 7. Check status via Telegram
+# 6. Check status via Telegram
 #    Send /report to your bot
 ```
 
@@ -110,9 +106,6 @@ pip install -r requirements.txt
 
 # Start collector
 python python/main.py collect
-
-# Fetch broker config
-python python/main.py broker-config
 
 # Check status
 python python/main.py status

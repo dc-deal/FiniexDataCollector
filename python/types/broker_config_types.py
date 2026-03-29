@@ -1,8 +1,6 @@
 """
 FiniexDataCollector - Broker Configuration Types
-Loads and provides symbol configuration from broker_config.json.
-
-Replaces hardcoded values in symbols.py with dynamic API-sourced data.
+Loads symbol configuration from Kraken public API or JSON file.
 
 Location: python/types/broker_config_types.py
 """
@@ -11,6 +9,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
+
+import aiohttp
 
 from python.exceptions.collector_exceptions import ConfigurationError
 
@@ -44,12 +44,14 @@ class BrokerConfig:
     """
     Broker configuration singleton.
 
-    Loads symbol configs from broker_config.json and provides
+    Broker configuration singleton.
+
+    Loads symbol configs from Kraken API and provides
     lookup methods for tick collection components.
 
     Usage:
         # Load once at startup
-        BrokerConfig.load_from_file(path)
+        await BrokerConfig.load_from_api(symbols)
 
         # Get config anywhere
         config = BrokerConfig.get_symbol("BTCUSD")
@@ -123,6 +125,71 @@ class BrokerConfig:
         cls._config_path = config_path
 
     @classmethod
+    async def load_from_api(cls, symbols: list) -> None:
+        """
+        Load symbol configuration from Kraken public AssetPairs API.
+
+        Args:
+            symbols: List of symbols from config (e.g., ["BTC/USD", "ETH/USD"])
+
+        Raises:
+            ConfigurationError: If API fails or symbols not found
+        """
+        # Build pair keys: "BTC/USD" -> "BTCUSD"
+        pair_keys = [s.replace("/", "") for s in symbols]
+        url = "https://api.kraken.com/0/public/AssetPairs"
+        params = {"pair": ",".join(pair_keys)}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise ConfigurationError(
+                f"Failed to fetch symbol config from Kraken API: {e}"
+            )
+
+        errors = data.get("error", [])
+        if errors:
+            raise ConfigurationError(
+                f"Kraken API error: {', '.join(errors)}"
+            )
+
+        result = data.get("result", {})
+        if not result:
+            raise ConfigurationError(
+                "Kraken API returned no symbol data"
+            )
+
+        cls._symbols = {}
+        for _pair_key, info in result.items():
+            wsname = info.get("wsname", "")
+            if not wsname:
+                continue
+
+            normalized = normalize_symbol(wsname)
+            tick_size = float(info.get("tick_size", "0.01"))
+            digits = int(info.get("pair_decimals", 2))
+
+            base, _, quote = wsname.partition("/")
+
+            cls._symbols[normalized] = SymbolConfig(
+                symbol=normalized,
+                digits=digits,
+                tick_size=tick_size,
+                point=tick_size,
+                volume_min=float(info.get("ordermin", "0.001")),
+                volume_max=10000.0,
+                base_currency=base,
+                quote_currency=quote
+            )
+
+        cls._broker_type = "kraken_spot"
+        cls._loaded = True
+        cls._config_path = None
+
+    @classmethod
     def is_loaded(cls) -> bool:
         """Check if config is loaded."""
         return cls._loaded
@@ -143,7 +210,7 @@ class BrokerConfig:
         """
         if not cls._loaded:
             raise ConfigurationError(
-                "Broker config not loaded. Call BrokerConfig.load_from_file() first."
+                "Broker config not loaded. Call BrokerConfig.load_from_api() first."
             )
 
         if symbol not in cls._symbols:
@@ -186,7 +253,7 @@ class BrokerConfig:
         """
         if not cls._loaded:
             raise ConfigurationError(
-                "Broker config not loaded. Call BrokerConfig.load_from_file() first."
+                "Broker config not loaded. Call BrokerConfig.load_from_api() first."
             )
         return cls._broker_type
 
@@ -200,7 +267,7 @@ class BrokerConfig:
         """
         if not cls._loaded:
             raise ConfigurationError(
-                "Broker config not loaded. Call BrokerConfig.load_from_file() first."
+                "Broker config not loaded. Call BrokerConfig.load_from_api() first."
             )
         return cls._server_name
 
