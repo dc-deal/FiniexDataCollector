@@ -21,6 +21,8 @@ from typing import Optional, List, Dict, Any
 
 from python.writers.base import AbstractTickWriter
 from python.types.tick_types import (
+    COLLECTED_MSC_TIMEBASE,
+    DATA_FORMAT_VERSION,
     TickData,
     TickFileMetadata,
     TickFileContent,
@@ -233,7 +235,6 @@ class JsonTickWriter(AbstractTickWriter):
             broker=self._broker,
             server=self._server,
             broker_type=self._broker_type,
-            broker_utc_offset_hours=0,
             local_device_time=self._file_start_local_time.strftime(
                 "%Y.%m.%d %H:%M:%S") if self._file_start_local_time else "",
             broker_server_time=self._file_start_time.strftime(
@@ -245,8 +246,9 @@ class JsonTickWriter(AbstractTickWriter):
             timeframe="TICK",
             volume_timeframe="PERIOD_M1",
             volume_timeframe_minutes=1,
-            data_format_version="1.3.0",
+            data_format_version=DATA_FORMAT_VERSION,
             data_collector=self._data_collector,
+            collected_msc_timebase=COLLECTED_MSC_TIMEBASE,
             collection_purpose="backtesting",
             operator="automated",
             symbol_info=self._get_symbol_info(),
@@ -379,7 +381,6 @@ class JsonTickWriter(AbstractTickWriter):
             "broker": metadata.broker,
             "server": metadata.server,
             "broker_type": metadata.broker_type,
-            "broker_utc_offset_hours": metadata.broker_utc_offset_hours,
             "local_device_time": metadata.local_device_time,
             "broker_server_time": metadata.broker_server_time,
             "start_time": metadata.start_time,
@@ -388,6 +389,8 @@ class JsonTickWriter(AbstractTickWriter):
             "volume_timeframe": metadata.volume_timeframe,
             "volume_timeframe_minutes": metadata.volume_timeframe_minutes,
             "data_format_version": metadata.data_format_version,
+            "data_collector": metadata.data_collector,
+            "collected_msc_timebase": metadata.collected_msc_timebase,
             "collection_purpose": metadata.collection_purpose,
             "operator": metadata.operator,
             "symbol_info": asdict(metadata.symbol_info) if metadata.symbol_info else {},

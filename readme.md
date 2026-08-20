@@ -207,8 +207,13 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
   "metadata": {
     "symbol": "BTCUSD",
     "broker": "Kraken",
-    "server": "kraken_spot",
-    "data_format_version": "1.3.0",
+    "server": "kraken_websocket",
+    "broker_type": "kraken_spot",
+    "local_device_time": "2026.03.29 11:34:47",
+    "broker_server_time": "2026.03.29 09:34:47",
+    "data_format_version": "1.5.0",
+    "data_collector": "kraken",
+    "collected_msc_timebase": "utc",
     "symbol_info": {
       "point_value": 0.1,
       "digits": 1,
@@ -222,7 +227,7 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
     {
       "timestamp": "2025.01.13 14:30:45",
       "time_msc": 1736775045123,
-      "collected_msc": 1736775045098,
+      "collected_msc": 1736775045130,
       "bid": 45000.0,
       "ask": 45010.0,
       "last": 45005.0,
@@ -239,6 +244,22 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
   }
 }
 ```
+
+### Key Metadata Fields
+
+- `data_format_version`: Schema version of the collector output. A constant of the
+  code, not a configurable input - it identifies the code that wrote the file.
+  Scoped per collector, so it does not move in lockstep with the MT5 collector.
+- `collected_msc_timebase`: Time base of `collected_msc`, `"utc"` from 1.5.0 onwards.
+  Every tick is stamped from the OS clock in Unix epoch milliseconds UTC, so the
+  value lands a few milliseconds after the event time in `time_msc`. Files without
+  the field predate the declaration; the import pipeline reads its absence as
+  device-local time and refuses to guess.
+- `local_device_time` / `broker_server_time`: Wall clock of the collecting machine and
+  of the exchange at file creation. Informational - nothing downstream derives a UTC
+  offset from them.
+- `broker_type`: Broker identifier, `"kraken_spot"`. Selects the offset registry entry
+  on import, which is 0 h for Kraken.
 
 ### File Naming Convention
 

@@ -10,6 +10,17 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 
+# Schema version of the files this collector writes. A constant of the code,
+# not a configurable input - it identifies the code that wrote the file.
+# 1.5.0 means: this schema declares the time base of collected_msc.
+DATA_FORMAT_VERSION = "1.5.0"
+
+# Time base of collected_msc. Every tick is stamped from time.time(), which is
+# Unix epoch milliseconds in UTC, so this holds for every file written by this
+# code. See KrakenMessageParser, which is the only producer of the value.
+COLLECTED_MSC_TIMEBASE = "utc"
+
+
 @dataclass
 class TickData:
     """
@@ -75,7 +86,6 @@ class TickFileMetadata:
     broker: str
     server: str
     broker_type: str = ""
-    broker_utc_offset_hours: int = 0
     local_device_time: str = ""
     broker_server_time: str = ""
     start_time: str = ""
@@ -83,8 +93,9 @@ class TickFileMetadata:
     timeframe: str = "TICK"
     volume_timeframe: str = "PERIOD_M1"
     volume_timeframe_minutes: int = 1
-    data_format_version: str = "1.3.0"
+    data_format_version: str = DATA_FORMAT_VERSION
     data_collector: str = "kraken"
+    collected_msc_timebase: str = COLLECTED_MSC_TIMEBASE
     collection_purpose: str = "backtesting"
     operator: str = "automated"
     symbol_info: Optional[SymbolInfo] = None
