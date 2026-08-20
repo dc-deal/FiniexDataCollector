@@ -6,13 +6,13 @@ Location: python/collectors/kraken/message_parser.py
 """
 
 import json
-import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
 from python.types.tick_types import TickData, KrakenTickerMessage
 from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import MessageParseError
+from python.utils.collection_clock import CollectionClock
 
 
 class KrakenMessageParser:
@@ -22,8 +22,16 @@ class KrakenMessageParser:
     Converts ticker and trade updates to TickData format matching MT5 output.
     """
 
-    def __init__(self):
-        """Initialize parser."""
+    def __init__(self, clock: CollectionClock):
+        """
+        Initialize parser.
+
+        Args:
+            clock: Session clock stamping collected_msc. Required rather than
+                created here, because the writers report its counters and must
+                read the same instance that issued the timestamps.
+        """
+        self._clock = clock
         self._tick_counter: Dict[str, int] = {}  # Per-symbol tick counter
 
     def parse_message(self, raw_message: str) -> Optional[List[TickData]]:
@@ -78,7 +86,7 @@ class KrakenMessageParser:
         if not ticker_data:
             return None
 
-        receive_time_msc = int(time.time() * 1000)
+        receive_time_msc = self._clock.next_msc()
         ticks = []
 
         for ticker in ticker_data:
@@ -151,9 +159,12 @@ class KrakenMessageParser:
             spread_points = int(spread_raw / tick_size) if tick_size > 0 else 0
             spread_pct = (spread_raw / bid * 100) if bid > 0 else 0.0
 
-            # Format timestamp
-            dt_utc = datetime.now(timezone.utc)
-            timestamp_str = dt_utc.strftime("%Y.%m.%d %H:%M:%S")
+            # Derived from time_msc, not read from the clock again: the string
+            # has to describe the same moment as time_msc, and a second reading
+            # can land on the other side of a clock correction.
+            timestamp_str = datetime.fromtimestamp(
+                receive_time_msc / 1000, tz=timezone.utc
+            ).strftime("%Y.%m.%d %H:%M:%S")
 
             # Increment tick counter for chart_tick_volume
             if symbol not in self._tick_counter:
@@ -172,7 +183,7 @@ class KrakenMessageParser:
                 chart_tick_volume=self._tick_counter[symbol],
                 spread_points=spread_points,
                 spread_pct=round(spread_pct, 6),
-                collected_msc=int(time.time() * 1000),
+                collected_msc=self._clock.next_msc(),
                 tick_flags="BID ASK",
                 session="24h"
             )
@@ -223,22 +234,23 @@ class KrakenMessageParser:
             # Get symbol config from BrokerConfig
             digits = BrokerConfig.get_digits(symbol)
 
-            # Parse Kraken timestamp (ISO format)
+            # Parse Kraken timestamp (ISO format). Falling back to our own clock
+            # loses the exchange's event time, but a trade without a usable
+            # stamp is still worth more than a dropped tick.
             timestamp_str_kraken = trade.get("timestamp", "")
             if timestamp_str_kraken:
                 try:
-                    dt_utc = datetime.fromisoformat(
+                    time_msc = int(datetime.fromisoformat(
                         timestamp_str_kraken.replace("Z", "+00:00")
-                    )
-                    time_msc = int(dt_utc.timestamp() * 1000)
+                    ).timestamp() * 1000)
                 except ValueError:
-                    dt_utc = datetime.now(timezone.utc)
-                    time_msc = int(time.time() * 1000)
+                    time_msc = self._clock.next_msc()
             else:
-                dt_utc = datetime.now(timezone.utc)
-                time_msc = int(time.time() * 1000)
+                time_msc = self._clock.next_msc()
 
-            timestamp_str = dt_utc.strftime("%Y.%m.%d %H:%M:%S")
+            timestamp_str = datetime.fromtimestamp(
+                time_msc / 1000, tz=timezone.utc
+            ).strftime("%Y.%m.%d %H:%M:%S")
 
             # Increment tick counter for chart_tick_volume
             if symbol not in self._tick_counter:
@@ -261,7 +273,7 @@ class KrakenMessageParser:
                 chart_tick_volume=self._tick_counter[symbol],
                 spread_points=0,
                 spread_pct=0.0,
-                collected_msc=int(time.time() * 1000),
+                collected_msc=self._clock.next_msc(),
                 tick_flags=side if side else "TRADE",
                 session="24h"
             )

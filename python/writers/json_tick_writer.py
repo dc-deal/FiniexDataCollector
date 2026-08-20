@@ -27,6 +27,7 @@ from python.types.tick_types import (
     TickFileMetadata,
     TickFileContent,
     TickFileSummary,
+    AnchorSummary,
     QualityMetrics,
     TimingSummary,
     SymbolInfo,
@@ -38,6 +39,7 @@ from python.exceptions.collector_exceptions import (
     TickWriteError,
     FileRotationError
 )
+from python.utils.collection_clock import CollectionClock
 from python.utils.logging_setup import get_collector_logger
 
 
@@ -53,6 +55,7 @@ class JsonTickWriter(AbstractTickWriter):
         self,
         output_dir: Path,
         symbol: str,
+        clock: CollectionClock,
         broker: str = "Kraken",
         server: str = "kraken_spot",
         broker_type: str = "",
@@ -65,6 +68,9 @@ class JsonTickWriter(AbstractTickWriter):
         Args:
             output_dir: Base output directory
             symbol: Trading symbol (normalized, e.g., "BTCUSD")
+            clock: The session clock that stamped the incoming ticks. Required
+                without a default, because a writer that invented its own would
+                report zero corrections for a clock it never read.
             broker: Broker name
             server: Server identifier
             broker_type: Broker type identifier (e.g., "kraken_spot")
@@ -73,6 +79,7 @@ class JsonTickWriter(AbstractTickWriter):
         """
         super().__init__(output_dir, symbol, max_ticks_per_file)
 
+        self._clock = clock
         self._broker = broker
         self._server = server
         self._broker_type = broker_type
@@ -85,6 +92,8 @@ class JsonTickWriter(AbstractTickWriter):
         self._ticks_buffer: List[TickData] = []
         self._file_start_time: Optional[datetime] = None
         self._file_start_local_time: Optional[datetime] = None
+        self._file_start_resyncs = 0
+        self._file_start_max_correction_ms = 0
         self._errors: List[Dict[str, Any]] = []
 
         # Ensure output directory exists
@@ -167,9 +176,13 @@ class JsonTickWriter(AbstractTickWriter):
         # Create lock file
         self._current_lock.touch()
 
-        # Reset state
+        # Reset state. The anchor counters are cumulative over the session, so
+        # the opening state is captured here and the closing state is read at
+        # finalize - a file whose two states differ contains a clamped tick.
         self._file_start_time = now
         self._file_start_local_time = datetime.now()
+        self._file_start_resyncs = self._clock.resyncs
+        self._file_start_max_correction_ms = self._clock.max_correction_ms
         self._ticks_buffer = []
         self._current_tick_count = 0
         self._errors = []
@@ -249,6 +262,8 @@ class JsonTickWriter(AbstractTickWriter):
             data_format_version=DATA_FORMAT_VERSION,
             data_collector=self._data_collector,
             collected_msc_timebase=COLLECTED_MSC_TIMEBASE,
+            anchor_resyncs=self._file_start_resyncs,
+            anchor_max_correction_ms=self._file_start_max_correction_ms,
             collection_purpose="backtesting",
             operator="automated",
             symbol_info=self._get_symbol_info(),
@@ -286,6 +301,10 @@ class JsonTickWriter(AbstractTickWriter):
                 end_time=now.strftime("%Y.%m.%d %H:%M:%S"),
                 duration_minutes=duration_minutes,
                 avg_ticks_per_minute=avg_ticks_per_minute
+            ),
+            anchor=AnchorSummary(
+                resyncs=self._clock.resyncs,
+                max_correction_ms=self._clock.max_correction_ms
             ),
             recommendations=self._get_recommendations()
         )
@@ -391,6 +410,8 @@ class JsonTickWriter(AbstractTickWriter):
             "data_format_version": metadata.data_format_version,
             "data_collector": metadata.data_collector,
             "collected_msc_timebase": metadata.collected_msc_timebase,
+            "anchor_resyncs": metadata.anchor_resyncs,
+            "anchor_max_correction_ms": metadata.anchor_max_correction_ms,
             "collection_purpose": metadata.collection_purpose,
             "operator": metadata.operator,
             "symbol_info": asdict(metadata.symbol_info) if metadata.symbol_info else {},
@@ -424,5 +445,6 @@ class JsonTickWriter(AbstractTickWriter):
             "data_stream_status": summary.data_stream_status,
             "quality_metrics": asdict(summary.quality_metrics) if summary.quality_metrics else {},
             "timing": asdict(summary.timing) if summary.timing else {},
+            "anchor": asdict(summary.anchor) if summary.anchor else {},
             "recommendations": summary.recommendations
         }

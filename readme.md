@@ -214,6 +214,8 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
     "data_format_version": "1.5.0",
     "data_collector": "kraken",
     "collected_msc_timebase": "utc",
+    "anchor_resyncs": 0,
+    "anchor_max_correction_ms": 0,
     "symbol_info": {
       "point_value": 0.1,
       "digits": 1,
@@ -240,7 +242,11 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
   "summary": {
     "total_ticks": 50000,
     "total_errors": 0,
-    "data_stream_status": "HEALTHY"
+    "data_stream_status": "HEALTHY",
+    "anchor": {
+      "resyncs": 0,
+      "max_correction_ms": 0
+    }
   }
 }
 ```
@@ -255,6 +261,11 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
   value lands a few milliseconds after the event time in `time_msc`. Files without
   the field predate the declaration; the import pipeline reads its absence as
   device-local time and refuses to guess.
+- `anchor_resyncs` / `anchor_max_correction_ms`: How often a `collected_msc` stamp had
+  to be held back because the OS clock stepped backwards, and the largest such step.
+  Cumulative over the collection session. They appear again in `summary.anchor` with
+  the state at file close, so a file whose closing count exceeds its opening count is
+  one that absorbed a correction. Both zero is the normal case.
 - `local_device_time` / `broker_server_time`: Wall clock of the collecting machine and
   of the exchange at file creation. Informational - nothing downstream derives a UTC
   offset from them.

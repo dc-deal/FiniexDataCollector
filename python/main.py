@@ -20,6 +20,7 @@ from typing import Optional, List
 
 import psutil
 
+from python.utils.collection_clock import CollectionClock
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import setup_logging, get_logger
 from python.utils.live_display import LiveDisplay
@@ -404,6 +405,11 @@ class FiniexDataCollector:
         self._logger.info(
             f"Starting Kraken collector for {len(self._config.kraken.symbols)} symbols")
 
+        # One clock for the whole session: a globally non-decreasing series is
+        # non-decreasing per symbol too, and a clock correction is counted once
+        # rather than once per symbol.
+        clock = CollectionClock()
+
         # Create writers for each symbol
         raw_dir = Path(self._config.paths.raw_data_dir)
 
@@ -413,6 +419,7 @@ class FiniexDataCollector:
             writer = JsonTickWriter(
                 output_dir=raw_dir,
                 symbol=normalized,
+                clock=clock,
                 broker="Kraken",
                 server=self._config.kraken.server_name,
                 broker_type=self._config.kraken.broker_type,
@@ -425,6 +432,7 @@ class FiniexDataCollector:
         # Create collector
         collector = KrakenWebSocketClient(
             symbols=self._config.kraken.symbols,
+            clock=clock,
             streams=self._config.kraken.streams,
             url=self._config.kraken.websocket_url,
             reconnect_initial_delay=self._config.kraken.reconnect_initial_delay_seconds,

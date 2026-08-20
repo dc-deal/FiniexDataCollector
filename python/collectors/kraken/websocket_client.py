@@ -29,6 +29,7 @@ from python.exceptions.collector_exceptions import (
     WebSocketSubscriptionError,
     CollectorHealthReport
 )
+from python.utils.collection_clock import CollectionClock
 from python.utils.logging_setup import get_collector_logger
 
 
@@ -50,6 +51,7 @@ class KrakenWebSocketClient(AbstractCollector):
     def __init__(
         self,
         symbols: List[str],
+        clock: CollectionClock,
         streams: List[str] = None,
         url: str = DEFAULT_URL,
         reconnect_initial_delay: float = 1.0,
@@ -61,6 +63,7 @@ class KrakenWebSocketClient(AbstractCollector):
 
         Args:
             symbols: List of symbols to subscribe (e.g., ["BTC/USD", "ETH/USD"])
+            clock: Session clock handed to the parser, which stamps collected_msc
             streams: List of streams to subscribe (e.g., ["ticker"], ["trade"], ["ticker", "trade"])
             url: WebSocket URL
             reconnect_initial_delay: Initial reconnect delay in seconds
@@ -82,7 +85,7 @@ class KrakenWebSocketClient(AbstractCollector):
                     f"Invalid stream '{stream}'. Valid: {self.VALID_STREAMS}")
 
         self._websocket: Optional[Any] = None
-        self._parser = KrakenMessageParser()
+        self._parser = KrakenMessageParser(clock)
         self._logger = get_collector_logger("kraken")
 
         self._connection_status = "disconnected"

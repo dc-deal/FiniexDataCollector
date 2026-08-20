@@ -96,6 +96,8 @@ class TickFileMetadata:
     data_format_version: str = DATA_FORMAT_VERSION
     data_collector: str = "kraken"
     collected_msc_timebase: str = COLLECTED_MSC_TIMEBASE
+    anchor_resyncs: int = 0
+    anchor_max_correction_ms: int = 0
     collection_purpose: str = "backtesting"
     operator: str = "automated"
     symbol_info: Optional[SymbolInfo] = None
@@ -141,6 +143,18 @@ class TimingSummary:
 
 
 @dataclass
+class AnchorSummary:
+    """
+    State of the collection clock at file close.
+
+    Repeats the cumulative counters from the metadata header. A file whose
+    closing count exceeds its opening count contains a clamped tick.
+    """
+    resyncs: int = 0
+    max_correction_ms: int = 0
+
+
+@dataclass
 class TickFileSummary:
     """Summary section of tick JSON file."""
     total_ticks: int = 0
@@ -148,6 +162,7 @@ class TickFileSummary:
     data_stream_status: str = "HEALTHY"
     quality_metrics: Optional[QualityMetrics] = None
     timing: Optional[TimingSummary] = None
+    anchor: Optional[AnchorSummary] = None
     recommendations: str = ""
 
 
