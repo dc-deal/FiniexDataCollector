@@ -5,10 +5,16 @@
     "workspaceFolder": "/app",
     "customizations": {
         "vscode": {
+            // Kept in step with .vscode/extensions.json, which is the same set plus
+            // the host-side entry a fresh clone needs before this file can be used.
             "extensions": [
                 "ms-python.python",
+                "ms-python.vscode-pylance",
                 "ms-python.debugpy",
-                "ms-python.autopep8"
+                "ms-python.autopep8",
+                "ms-python.isort",
+                "anthropic.claude-code",
+                "ezforo.copy-relative-path-and-line-numbers"
             ],
             "settings": {
                 "python.defaultInterpreterPath": "/usr/local/bin/python",

@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional, List
 from python.types.tick_types import TickData, KrakenTickerMessage
 from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import MessageParseError
+from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
 
 
@@ -22,7 +23,7 @@ class KrakenMessageParser:
     Converts ticker and trade updates to TickData format matching MT5 output.
     """
 
-    def __init__(self, clock: CollectionClock):
+    def __init__(self, clock: CollectionClock, quote_cache: QuoteCache):
         """
         Initialize parser.
 
@@ -30,8 +31,13 @@ class KrakenMessageParser:
             clock: Session clock stamping collected_msc. Required rather than
                 created here, because the writers report its counters and must
                 read the same instance that issued the timestamps.
+            quote_cache: Holds the last bid/ask per symbol. Ticker updates fill
+                it and trade ticks read it - that is how an execution, which
+                happens at one price, comes to carry the spread it executed
+                against.
         """
         self._clock = clock
+        self._quote_cache = quote_cache
         self._tick_counter: Dict[str, int] = {}  # Per-symbol tick counter
 
     def parse_message(self, raw_message: str) -> Optional[List[TickData]]:
@@ -86,15 +92,25 @@ class KrakenMessageParser:
         if not ticker_data:
             return None
 
-        receive_time_msc = self._clock.next_msc()
-        ticks = []
+        observed_msc = self._clock.next_msc()
 
         for ticker in ticker_data:
-            tick = self._parse_ticker_to_tick(ticker, receive_time_msc)
-            if tick:
-                ticks.append(tick)
+            kraken_symbol = ticker.get("symbol", "")
+            if not kraken_symbol:
+                continue
 
-        return ticks if ticks else None
+            self._quote_cache.update(
+                symbol=normalize_symbol(kraken_symbol),
+                bid=float(ticker.get("bid", 0)),
+                ask=float(ticker.get("ask", 0)),
+                observed_msc=observed_msc
+            )
+
+        # Deliberately no ticks: a ticker tick's time_msc is our local receive
+        # time while a trade's is the exchange's event time, and interleaving
+        # the two in one file steps time_msc backwards on nearly every channel
+        # change - which the import pipeline rejects the whole file for.
+        return None
 
     def _parse_trade_message(self, data: Dict[str, Any]) -> Optional[List[TickData]]:
         """
@@ -118,82 +134,6 @@ class KrakenMessageParser:
                 ticks.append(tick)
 
         return ticks if ticks else None
-
-    def _parse_ticker_to_tick(
-        self,
-        ticker: Dict[str, Any],
-        receive_time_msc: int
-    ) -> Optional[TickData]:
-        """
-        Convert single ticker message to TickData.
-
-        Args:
-            ticker: Ticker data dict from Kraken
-            receive_time_msc: Local receive timestamp in milliseconds
-
-        Returns:
-            TickData instance or None if invalid
-        """
-        try:
-            kraken_symbol = ticker.get("symbol", "")
-            if not kraken_symbol:
-                return None
-
-            symbol = normalize_symbol(kraken_symbol)
-
-            bid = float(ticker.get("bid", 0))
-            ask = float(ticker.get("ask", 0))
-            last = float(ticker.get("last", 0))
-            volume = float(ticker.get("volume", 0))
-
-            # Skip invalid ticks
-            if bid <= 0 or ask <= 0:
-                return None
-
-            # Get symbol config from BrokerConfig
-            tick_size = BrokerConfig.get_tick_size(symbol)
-            digits = BrokerConfig.get_digits(symbol)
-
-            # Calculate spread
-            spread_raw = ask - bid
-            spread_points = int(spread_raw / tick_size) if tick_size > 0 else 0
-            spread_pct = (spread_raw / bid * 100) if bid > 0 else 0.0
-
-            # Derived from time_msc, not read from the clock again: the string
-            # has to describe the same moment as time_msc, and a second reading
-            # can land on the other side of a clock correction.
-            timestamp_str = datetime.fromtimestamp(
-                receive_time_msc / 1000, tz=timezone.utc
-            ).strftime("%Y.%m.%d %H:%M:%S")
-
-            # Increment tick counter for chart_tick_volume
-            if symbol not in self._tick_counter:
-                self._tick_counter[symbol] = 0
-            self._tick_counter[symbol] += 1
-
-            return TickData(
-                symbol=symbol,
-                timestamp=timestamp_str,
-                time_msc=receive_time_msc,
-                bid=round(bid, digits),
-                ask=round(ask, digits),
-                last=round(last, digits),
-                tick_volume=0,
-                real_volume=round(volume, 2),
-                chart_tick_volume=self._tick_counter[symbol],
-                spread_points=spread_points,
-                spread_pct=round(spread_pct, 6),
-                collected_msc=self._clock.next_msc(),
-                tick_flags="BID ASK",
-                session="24h"
-            )
-
-        except (KeyError, ValueError, TypeError) as e:
-            raise MessageParseError(
-                f"Failed to parse ticker: {e}",
-                raw_message=str(ticker),
-                symbol=ticker.get("symbol")
-            )
 
     def _parse_trade_to_tick(self, trade: Dict[str, Any]) -> Optional[TickData]:
         """
@@ -257,25 +197,55 @@ class KrakenMessageParser:
                 self._tick_counter[symbol] = 0
             self._tick_counter[symbol] += 1
 
-            # Trade price becomes bid/ask/last
-            # No spread info in trades
             rounded_price = round(price, digits)
+            collected_msc = self._clock.next_msc()
+
+            # The execution happened at one price; the quote it executed against
+            # comes from the ticker channel. Without one - the first trades after
+            # a start or reconnect - the trade price stands in for both sides, as
+            # it always did, and quote_age_ms stays None to say so. Zero would
+            # claim a quote observed in the same millisecond.
+            quote = self._quote_cache.get(symbol)
+
+            if quote:
+                tick_size = BrokerConfig.get_tick_size(symbol)
+                spread_raw = quote.ask - quote.bid
+
+                bid = round(quote.bid, digits)
+                ask = round(quote.ask, digits)
+                # round, not int: bid and ask both sit on the tick grid, so the
+                # quotient is an integer in exact arithmetic - but 53.53 - 53.52
+                # is 0.009999999999997 in IEEE754, and truncating that reports a
+                # genuine one-tick spread as zero. Measured on LTCUSD: 59 % of
+                # ticks. A spread_points of 0 reads as "no spread", which is the
+                # one thing this field must never say when there is one.
+                spread_points = round(
+                    spread_raw / tick_size) if tick_size > 0 else 0
+                spread_pct = round(spread_raw / quote.bid * 100, 6)
+                quote_age_ms = collected_msc - quote.observed_msc
+            else:
+                bid = rounded_price
+                ask = rounded_price
+                spread_points = 0
+                spread_pct = 0.0
+                quote_age_ms = None
 
             return TickData(
                 symbol=symbol,
                 timestamp=timestamp_str,
                 time_msc=time_msc,
-                bid=rounded_price,
-                ask=rounded_price,
+                bid=bid,
+                ask=ask,
                 last=rounded_price,
                 tick_volume=0,
                 real_volume=round(qty, 8),
                 chart_tick_volume=self._tick_counter[symbol],
-                spread_points=0,
-                spread_pct=0.0,
-                collected_msc=self._clock.next_msc(),
+                spread_points=spread_points,
+                spread_pct=spread_pct,
+                collected_msc=collected_msc,
                 tick_flags=side if side else "TRADE",
-                session="24h"
+                session="24h",
+                quote_age_ms=quote_age_ms
             )
 
         except (KeyError, ValueError, TypeError) as e:

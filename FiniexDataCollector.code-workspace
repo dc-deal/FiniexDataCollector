@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"terminal.integrated.fontFamily": "Cascadia Code PL",
+		"debug.console.fontFamily": "Cascadia Code PL",
+		"workbench.colorTheme": "Red"
+	}
+}

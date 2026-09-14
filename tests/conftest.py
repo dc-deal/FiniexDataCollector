@@ -78,6 +78,15 @@ def loaded_broker_config(tmp_path_factory) -> None:
                 "point": 0.01,
                 "base_currency": "ETH",
                 "quote_currency": "USD"
+            },
+            # Prices around 53 with a 0.01 tick are what exposed the float
+            # truncation in spread_points - see the regression test.
+            "LTCUSD": {
+                "digits": 2,
+                "tick_size": 0.01,
+                "point": 0.01,
+                "base_currency": "LTC",
+                "quote_currency": "USD"
             }
         }
     }), encoding="utf-8")

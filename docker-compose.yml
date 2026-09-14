@@ -17,6 +17,15 @@ services:
       - ./logs:/app/logs
       # Output for transfer
       - ./output:/app/output
+      # Developer tool state — Claude Code session transcripts and shell history. Without
+      # this mount a container rebuild deletes every session, silently and with no prompt.
+      - ~/.claude:/root/.claude
+      # Cross-project conversation bus — a sibling host folder shared with the other Finiex
+      # projects. Indirected through a variable so this public file carries no private path,
+      # and defaulted to a tracked empty stub so a clone without the folder mounts something
+      # harmless instead of Docker materialising a root-owned directory beside the checkout.
+      # `:-` not `-`: an EMPTY value (as shipped in .env.example) must fall back too.
+      - ${FINIEX_BUS_PATH:-./.devcontainer/bus_placeholder}:/bus
     environment:
       - PYTHONPATH=/app
       - TZ=UTC

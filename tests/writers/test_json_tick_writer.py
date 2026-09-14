@@ -92,9 +92,9 @@ def test_declares_collected_msc_timebase_as_utc(written_file: Dict[str, Any]) ->
     assert written_file["metadata"]["collected_msc_timebase"] == "utc"
 
 
-def test_declares_data_format_version_1_5_0(written_file: Dict[str, Any]) -> None:
-    """1.5.0 is the version at which the schema states its time base."""
-    assert written_file["metadata"]["data_format_version"] == "1.5.0"
+def test_declares_data_format_version_1_6_0(written_file: Dict[str, Any]) -> None:
+    """1.6.0 is the version at which a trade tick carries a real spread."""
+    assert written_file["metadata"]["data_format_version"] == "1.6.0"
 
 
 def test_declared_values_come_from_the_module_constants(

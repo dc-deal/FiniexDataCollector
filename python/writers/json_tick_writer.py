@@ -433,6 +433,7 @@ class JsonTickWriter(AbstractTickWriter):
             "chart_tick_volume": tick.chart_tick_volume,
             "spread_points": tick.spread_points,
             "spread_pct": tick.spread_pct,
+            "quote_age_ms": tick.quote_age_ms,
             "tick_flags": tick.tick_flags,
             "session": tick.session
         }

@@ -21,6 +21,8 @@ class SymbolStats:
         last_bid: Last bid price
         last_ask: Last ask price
         last_spread_pct: Last spread as percentage
+        last_quote_age_ms: Age of the quote the spread came from, None when no
+            quote was known - a spread without its age cannot be judged
         last_volume: Last real volume
         last_tick_time: Timestamp of last tick
         errors_count: Errors for this symbol
@@ -32,6 +34,7 @@ class SymbolStats:
     last_bid: float = 0.0
     last_ask: float = 0.0
     last_spread_pct: float = 0.0
+    last_quote_age_ms: Optional[int] = None
     last_volume: float = 0.0
     last_tick_time: Optional[datetime] = None
     start_time: Optional[datetime] = None
@@ -230,7 +233,8 @@ class CollectorStats:
             self.symbols[symbol] = SymbolStats(symbol=symbol)
         return self.symbols[symbol]
 
-    def record_tick(self, symbol: str, bid: float, ask: float, spread_pct: float, real_volume: float) -> None:
+    def record_tick(self, symbol: str, bid: float, ask: float, spread_pct: float,
+                    real_volume: float, quote_age_ms: Optional[int] = None) -> None:
         """
         Record a received tick.
 
@@ -239,6 +243,7 @@ class CollectorStats:
             bid: Bid price
             ask: Ask price
             spread_pct: Spread percentage
+            quote_age_ms: Age of the quote it was derived from
             real_volume: Real volume
         """
         stats = self.get_symbol_stats(symbol)
@@ -246,6 +251,7 @@ class CollectorStats:
         stats.last_bid = bid
         stats.last_ask = ask
         stats.last_spread_pct = spread_pct
+        stats.last_quote_age_ms = quote_age_ms
         stats.last_volume = real_volume
         stats.last_tick_time = datetime.now(timezone.utc)
         if stats.start_time is None:

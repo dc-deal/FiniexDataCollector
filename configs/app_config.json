@@ -1,7 +1,7 @@
 {
   "_comment": "FiniexDataCollector Configuration",
   "app_name": "FiniexDataCollector",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "environment": "production",
   "paths": {
     "raw_data_dir": "./data/raw",
@@ -28,7 +28,8 @@
       "ETH/EUR"
     ],
     "streams": [
-      "trade"
+      "trade",
+      "ticker"
     ],
     "reconnect_max_delay_seconds": 60,
     "reconnect_initial_delay_seconds": 1,

@@ -29,8 +29,19 @@ from python.exceptions.collector_exceptions import (
     WebSocketSubscriptionError,
     CollectorHealthReport
 )
+from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
 from python.utils.logging_setup import get_collector_logger
+
+
+# What makes Kraken push a ticker update. The API default is "trades", which
+# ties the quote to the trade stream: the cache then only refreshes when someone
+# trades, and a trade tick reads a quote as old as the gap since the last one -
+# measured at a median of 464 ms and over a second for a third of all ticks.
+# "bbo" pushes whenever the best bid or offer moves, which is what the quote on a
+# trade tick is supposed to describe. quote_age_ms is the instrument that shows
+# the difference, so this is a measured setting, not a guessed one.
+TICKER_EVENT_TRIGGER = "bbo"
 
 
 class KrakenWebSocketClient(AbstractCollector):
@@ -52,6 +63,7 @@ class KrakenWebSocketClient(AbstractCollector):
         self,
         symbols: List[str],
         clock: CollectionClock,
+        quote_cache: QuoteCache,
         streams: List[str] = None,
         url: str = DEFAULT_URL,
         reconnect_initial_delay: float = 1.0,
@@ -64,6 +76,8 @@ class KrakenWebSocketClient(AbstractCollector):
         Args:
             symbols: List of symbols to subscribe (e.g., ["BTC/USD", "ETH/USD"])
             clock: Session clock handed to the parser, which stamps collected_msc
+            quote_cache: Last bid/ask per symbol, filled from the ticker channel
+                and stated on every trade tick
             streams: List of streams to subscribe (e.g., ["ticker"], ["trade"], ["ticker", "trade"])
             url: WebSocket URL
             reconnect_initial_delay: Initial reconnect delay in seconds
@@ -85,7 +99,7 @@ class KrakenWebSocketClient(AbstractCollector):
                     f"Invalid stream '{stream}'. Valid: {self.VALID_STREAMS}")
 
         self._websocket: Optional[Any] = None
-        self._parser = KrakenMessageParser(clock)
+        self._parser = KrakenMessageParser(clock, quote_cache)
         self._logger = get_collector_logger("kraken")
 
         self._connection_status = "disconnected"
@@ -198,12 +212,17 @@ class KrakenWebSocketClient(AbstractCollector):
 
         # Subscribe to each configured stream
         for stream in self._streams:
+            params = {
+                "channel": stream,
+                "symbol": kraken_symbols
+            }
+
+            if stream == "ticker":
+                params["event_trigger"] = TICKER_EVENT_TRIGGER
+
             subscribe_msg = {
                 "method": "subscribe",
-                "params": {
-                    "channel": stream,
-                    "symbol": kraken_symbols
-                }
+                "params": params
             }
 
             try:

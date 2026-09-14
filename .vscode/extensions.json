@@ -1,10 +1,23 @@
 {
-    "recommendations": [
-        "ms-python.python",
-        "ms-python.vscode-pylance",
-        "ms-python.autopep8",
-        "ms-python.isort",
-        "ms-vscode-remote.remote-containers",
-        "ms-azuretools.vscode-docker"
-    ]
+  // What a fresh clone is offered. The same set the dev container installs
+  // (.devcontainer/devcontainer.json), plus the one entry that belongs on the HOST —
+  // Dev Containers is what opens the container, so it cannot live inside it.
+  "recommendations": [
+    // Core Python development
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-python.debugpy",
+    // Formatting. This project is on double quotes and autopep8; the sister projects
+    // are on ruff with single quotes. Do not mix the two here — one tool holds one
+    // rule, and a half-converted tree is worse than either convention.
+    "ms-python.autopep8",
+    "ms-python.isort",
+    // Editor tooling
+    "anthropic.claude-code",
+    // Copies a path with line numbers — the form every code reference in this project's
+    // reviews and issue bodies uses (path/to/file.py#L12-L20).
+    "ezforo.copy-relative-path-and-line-numbers",
+    // Docker / Dev Containers — HOST side only
+    "ms-vscode-remote.remote-containers"
+  ]
 }

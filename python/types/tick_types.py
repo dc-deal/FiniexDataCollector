@@ -12,8 +12,11 @@ from typing import Dict, List, Optional, Any
 
 # Schema version of the files this collector writes. A constant of the code,
 # not a configurable input - it identifies the code that wrote the file.
-# 1.5.0 means: this schema declares the time base of collected_msc.
-DATA_FORMAT_VERSION = "1.5.0"
+# 1.5.0: declares the time base of collected_msc.
+# 1.6.0: bid/ask on a trade tick are the quote it executed against, taken from
+#        the ticker channel, with quote_age_ms stating how old that quote was.
+#        Below 1.6.0 a Kraken trade tick has bid == ask and a spread of zero.
+DATA_FORMAT_VERSION = "1.6.0"
 
 # Time base of collected_msc. Every tick is stamped from time.time(), which is
 # Unix epoch milliseconds in UTC, so this holds for every file written by this
@@ -42,6 +45,10 @@ class TickData:
     collected_msc: int = 0
     tick_flags: str = "BID ASK"
     session: str = "24h"              # "24h" for crypto, forex has sessions
+    # Age of the quote bid/ask were taken from, at the moment this tick arrived.
+    # None means no quote had been observed yet - distinct from 0, which would
+    # claim the quote was taken in the same millisecond.
+    quote_age_ms: Optional[int] = None
 
 
 @dataclass

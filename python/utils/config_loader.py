@@ -201,7 +201,7 @@ class AppConfig(BaseModel):
         monitoring: Monitoring configuration
     """
     app_name: str = "FiniexDataCollector"
-    version: str = "1.0.0"
+    version: str = "1.1.0"
     environment: str = "production"
 
     logging: LoggingConfig

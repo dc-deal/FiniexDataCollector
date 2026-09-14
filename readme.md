@@ -4,7 +4,7 @@
 
 > ⚠️ **No financial advice.** This software is for educational and research purposes only.
 
-> **Version:** 1.0  
+> **Version:** 1.1.0  
 > **Status:** Production Ready  
 > **Target:** Developers who need reliable tick data for backtesting systems
 
@@ -211,7 +211,7 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
     "broker_type": "kraken_spot",
     "local_device_time": "2026.03.29 11:34:47",
     "broker_server_time": "2026.03.29 09:34:47",
-    "data_format_version": "1.5.0",
+    "data_format_version": "1.6.0",
     "data_collector": "kraken",
     "collected_msc_timebase": "utc",
     "anchor_resyncs": 0,
@@ -235,8 +235,9 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
       "last": 45005.0,
       "spread_points": 100,
       "spread_pct": 0.022,
+      "quote_age_ms": 84,
       "session": "24h",
-      "tick_flags": "BID ASK"
+      "tick_flags": "BUY"
     }
   ],
   "summary": {
@@ -250,6 +251,23 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
   }
 }
 ```
+
+### Key Tick Fields
+
+- `last`: The execution price - what was actually traded.
+- `bid` / `ask` / `spread_points` / `spread_pct`: The quote the trade executed against,
+  taken from the ticker channel. Kraken's trade channel reports executions only, so
+  without the ticker subscription these would all collapse onto the trade price with a
+  spread of zero. A backtest that pays no spread produces a curve that is too
+  favourable, and a parameter sweep then optimises against a cost that does not exist.
+- `quote_age_ms`: How old the quote was when the trade arrived. `null` means no quote
+  had been observed yet - the first trades after a start or reconnect - and the trade
+  price fills both sides, as it did before 1.6.0. Never `0` in that case: zero would
+  claim a quote seen in the same millisecond. This field is what separates a measured
+  spread from a stale one.
+- `tick_flags`: The taker side, `BUY` or `SELL`. A buy lifted the ask, a sell hit the
+  bid, which is what makes a later spread reconstruction of older files tractable -
+  only the width stays unknown, not the direction.
 
 ### Key Metadata Fields
 

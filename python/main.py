@@ -20,6 +20,7 @@ from typing import Optional, List
 
 import psutil
 
+from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import setup_logging, get_logger
@@ -126,6 +127,7 @@ class FiniexDataCollector:
         # Components
         self._collectors = []
         self._writers = {}
+        self._clock: Optional[CollectionClock] = None
         self._telegram: Optional[TelegramAlertProvider] = None
         self._scheduler: Optional[WeeklyJobScheduler] = None
 
@@ -196,7 +198,8 @@ class FiniexDataCollector:
         # Start live display
         self._live_display = LiveDisplay(
             self._stats,
-            streams=self._config.kraken.streams
+            streams=self._config.kraken.streams,
+            clock=self._clock
         )
         await self._live_display.start()
 
@@ -409,6 +412,11 @@ class FiniexDataCollector:
         # non-decreasing per symbol too, and a clock correction is counted once
         # rather than once per symbol.
         clock = CollectionClock()
+        self._clock = clock
+
+        # One cache for the session, like the clock: the ticker channel fills it
+        # and every symbol's trade ticks read their own entry out of it.
+        quote_cache = QuoteCache()
 
         # Create writers for each symbol
         raw_dir = Path(self._config.paths.raw_data_dir)
@@ -433,6 +441,7 @@ class FiniexDataCollector:
         collector = KrakenWebSocketClient(
             symbols=self._config.kraken.symbols,
             clock=clock,
+            quote_cache=quote_cache,
             streams=self._config.kraken.streams,
             url=self._config.kraken.websocket_url,
             reconnect_initial_delay=self._config.kraken.reconnect_initial_delay_seconds,
@@ -598,7 +607,8 @@ class FiniexDataCollector:
                 bid=tick.bid,
                 ask=tick.ask,
                 spread_pct=tick.spread_pct,
-                real_volume=tick.real_volume
+                real_volume=tick.real_volume,
+                quote_age_ms=tick.quote_age_ms
             )
 
             # Get count AFTER increment - this is the FINAL count for this file
@@ -666,7 +676,8 @@ class FiniexDataCollector:
                 bid=tick.bid,
                 ask=tick.ask,
                 spread_pct=tick.spread_pct,
-                real_volume=tick.real_volume
+                real_volume=tick.real_volume,
+                quote_age_ms=tick.quote_age_ms
             )
 
     def _get_symbol_from_tick(self, tick) -> str:

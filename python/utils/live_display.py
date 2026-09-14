@@ -26,6 +26,8 @@ from rich.layout import Layout
 from rich.text import Text
 from rich import box
 
+from python.types.broker_config_types import BrokerConfig
+from python.utils.collection_clock import CollectionClock
 from python.types.collector_stats import CollectorStats
 
 
@@ -42,7 +44,8 @@ class LiveDisplay:
         stats: CollectorStats,
         streams: List[str] = None,
         update_interval: float = 1.0,
-        max_log_lines: int = 5
+        max_log_lines: int = 5,
+        clock: Optional[CollectionClock] = None
     ):
         """
         Initialize live display.
@@ -52,8 +55,11 @@ class LiveDisplay:
             streams: List of active streams (e.g., ["ticker"], ["trade"])
             update_interval: Display update interval in seconds
             max_log_lines: Maximum log lines to show
+            clock: Session clock, read live rather than copied - a mirrored
+                counter can disagree with the one that writes the files
         """
         self._stats = stats
+        self._clock = clock
         self._streams = streams if streams else ["ticker"]
         self._update_interval = update_interval
         self._max_log_lines = max_log_lines
@@ -212,6 +218,19 @@ class LiveDisplay:
 
         lines.append(disk_line)
 
+        # The collection clock. Silent while the OS behaves, loud when it does
+        # not: a clamped stamp is invisible in the data by design, so if it is
+        # not shown here nobody learns the machine's clock is stepping. It fired
+        # 14 times in one night on this host without anyone noticing.
+        if self._clock is not None:
+            if self._clock.resyncs == 0:
+                lines.append("[dim]🕐 Clock: steady[/dim]")
+            else:
+                lines.append(
+                    f"[bold]🕐 Clock:[/bold] [yellow]{self._clock.resyncs} "
+                    f"correction(s), max {self._clock.max_correction_ms} ms[/yellow]"
+                )
+
         # Last check time
         if disk.last_checked:
             last_check = disk.last_checked.strftime("%a %d.%m %H:%M")
@@ -244,6 +263,9 @@ class LiveDisplay:
             table.add_column("Bid", justify="right", width=12)
             table.add_column("Ask", justify="right", width=12)
             table.add_column("Spread %", justify="right", width=10)
+            # A spread without the age of the quote it came from cannot be
+            # judged: 0.05 % off a 40 ms quote and off a 7 s quote look the same.
+            table.add_column("Quote age", justify="right", width=11)
 
         table.add_column("Status", width=12)
 
@@ -256,13 +278,11 @@ class LiveDisplay:
 
         # Add rows for each symbol
         for symbol, stats in sorted(self._stats.symbols.items()):
-            # Status indicator
-            if stats.is_active:
-                status = "[green]✅ Active[/green]"
-            elif stats.current_file_ticks > 0:
-                status = "[yellow]⸻ Idle[/yellow]"
-            else:
-                status = "[dim]⏳ Waiting[/dim]"
+            # Status carries how long ago the last tick arrived, not just
+            # whether it was recent. A thin symbol can hold "Active" for hours
+            # while filling nothing - DASHUSD took 4.5 h for one file and never
+            # looked different from a busy one.
+            status = self._format_last_tick(stats.last_tick_time)
 
             # File progress
             from python.utils.config_loader import load_config
@@ -305,9 +325,13 @@ class LiveDisplay:
                 )
             else:
                 # Ticker stream: show bid/ask/spread
-                bid_str = f"{stats.last_bid:,.2f}" if stats.last_bid > 0 else "-"
-                ask_str = f"{stats.last_ask:,.2f}" if stats.last_ask > 0 else "-"
+                digits = self._digits_for(symbol)
+                bid_str = (f"{stats.last_bid:,.{digits}f}"
+                           if stats.last_bid > 0 else "-")
+                ask_str = (f"{stats.last_ask:,.{digits}f}"
+                           if stats.last_ask > 0 else "-")
                 spread_str = f"{stats.last_spread_pct:.4f}" if stats.last_spread_pct > 0 else "-"
+                age_str = self._format_quote_age(stats.last_quote_age_ms)
 
                 table.add_row(
                     f"[bold]{symbol}[/bold]",
@@ -317,6 +341,7 @@ class LiveDisplay:
                     bid_str,
                     ask_str,
                     spread_str,
+                    age_str,
                     status
                 )
 
@@ -350,11 +375,15 @@ class LiveDisplay:
         reconnect_count = len(self._stats.reconnect_events)
         if self._stats.last_reconnect:
             last = self._stats.last_reconnect
-            duration = int(last.duration_seconds / 60)
+            # Seconds below three minutes: whole minutes rendered a 105 s
+            # outage as "1m" and a 45 s one as "0m", which is the range these
+            # actually fall in.
+            secs = last.duration_seconds
+            down = f"{secs:.0f}s" if secs < 180 else f"{secs / 60:.0f}m"
             time_str = last.reconnected_at.strftime(
                 "%a %d.%m %H:%M") if last.reconnected_at else "unknown"
             parts.append(
-                f"Reconnects: {reconnect_count} (Last: {time_str}, {duration}m down)")
+                f"Reconnects: {reconnect_count} (Last: {time_str}, {down} down)")
         else:
             parts.append(f"Reconnects: {reconnect_count}")
 
@@ -411,6 +440,74 @@ class LiveDisplay:
             lines.append("[dim]No errors or warnings[/dim]")
 
         return Text.from_markup("\n".join(lines))
+
+    def _format_last_tick(self, last: Optional[datetime]) -> str:
+        """
+        Render how long ago a symbol last produced a tick.
+
+        Replaces a boolean "active within 30 s" with the measurement behind it:
+        a quiet symbol and a dead one are both "not recent", and only the
+        elapsed time tells them apart.
+
+        Args:
+            last: Timestamp of the last tick, or None
+
+        Returns:
+            Rich-markup string
+        """
+        if last is None:
+            return "[dim]⏳ waiting[/dim]"
+
+        secs = (datetime.now(timezone.utc) - last).total_seconds()
+
+        if secs < 30:
+            return f"[green]✅ {secs:.0f}s[/green]"
+        if secs < 300:
+            return f"[yellow]⸻ {secs:.0f}s[/yellow]"
+        if secs < 3600:
+            return f"[yellow]⸻ {secs / 60:.0f}m[/yellow]"
+        return f"[red]⚠ {secs / 3600:.1f}h[/red]"
+
+    def _digits_for(self, symbol: str) -> int:
+        """
+        Decimal places for a symbol, from the broker specification.
+
+        Two fixed places rendered ADAUSD's 0.2103 / 0.2104 as 0.21 and 0.21 -
+        a display asserting bid == ask where the book has a spread. The same
+        mistake the data had in spread_points, one layer up.
+
+        Args:
+            symbol: Normalized symbol
+
+        Returns:
+            Digit count, 2 when the specification is unavailable
+        """
+        try:
+            return BrokerConfig.get_digits(symbol)
+        except Exception:
+            return 2
+
+    def _format_quote_age(self, age_ms: Optional[int]) -> str:
+        """
+        Render the age of the quote a spread was taken from.
+
+        None means no quote had been observed - distinct from a fresh one, and
+        the reason the field is nullable at all. Colour marks the threshold at
+        which a quoted spread stops describing the current book.
+
+        Args:
+            age_ms: Age in milliseconds, or None
+
+        Returns:
+            Rich-markup string
+        """
+        if age_ms is None:
+            return "[dim]no quote[/dim]"
+        if age_ms < 250:
+            return f"[green]{age_ms} ms[/green]"
+        if age_ms < 1000:
+            return f"[yellow]{age_ms} ms[/yellow]"
+        return f"[red]{age_ms / 1000:.1f} s[/red]"
 
     def _format_uptime(self, seconds: float) -> str:
         """

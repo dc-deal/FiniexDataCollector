@@ -70,3 +70,15 @@ Thumbs.db
 INTERNAL_*.md
 ISSUE_*.md
 SESSION_*.md
+
+
+# GitHub issues export (local reference only)
+github_issues/
+export_github_issues.sh
+
+# Local environment — the tracked counterpart is .env.example
+.env
+
+# Local MCP server registration; carries the peer name this checkout writes the bus as.
+# .mcp.json.example is the tracked counterpart, like .env.example and user_configs/.
+.mcp.json
