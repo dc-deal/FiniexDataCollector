@@ -7,6 +7,13 @@ found at startup, or which symbol stopped producing. Reaching it meant an RDP
 session, which is why the questions it answers were usually answered by guessing
 instead.
 
+Every line is passed through the shared credential vocabulary before it leaves.
+A log is free text: a bot token inside a URL, a bearer header in a traceback or a
+DSN password echoed by a driver all reach it by accident, and a diagnostic route
+that serves them turns a convenience into a leak. Lines that were altered are
+counted and the count is reported, because a reader trusts what a diagnostic hands
+them.
+
 One property to state, because the sister project documents the opposite as a
 trap: **our timestamps are UTC in both places.** Each line is stamped
 `YYYY-MM-DD HH:MM:SS UTC` and each file is named for the UTC date. So a UTC range
@@ -21,6 +28,8 @@ import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from python.api.redaction import redact_line
 
 # `2026-03-29 09:34:35 UTC | INFO     | FiniexDataCollector | message`
 LINE = re.compile(
@@ -115,6 +124,7 @@ def read_log(
     threshold = LEVELS.index(min_level) if min_level in LEVELS else 0
     kept: List[Dict[str, Any]] = []
     total = 0
+    masked = 0
 
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for raw in handle:
@@ -129,8 +139,10 @@ def read_log(
                 # Continuation of a multi-line entry; it belongs to whatever was
                 # kept last, so it is kept only if that was.
                 if kept:
+                    text, changed = redact_line(raw)
+                    masked += changed
                     kept.append({"timestamp": None, "level": None,
-                                 "logger": None, "message": raw})
+                                 "logger": None, "message": text})
                 continue
 
             level = match.group("level")
@@ -150,11 +162,14 @@ def read_log(
             if contains and contains.lower() not in message.lower():
                 continue
 
+            text, changed = redact_line(message)
+            masked += changed
+
             kept.append({
                 "timestamp": stamp.isoformat(),
                 "level": level,
                 "logger": match.group("logger").strip(),
-                "message": message
+                "message": text
             })
 
     truncated = len(kept) > limit
@@ -166,6 +181,7 @@ def read_log(
         "line_count": len(kept[-limit:]),
         "lines_scanned": total,
         "truncated": truncated,
+        "redacted_lines": masked,
         "lines": kept[-limit:],
         "available_days": available_days(log_dir)
     }

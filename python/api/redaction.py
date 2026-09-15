@@ -7,19 +7,30 @@ and the honest answer contains a Telegram bot token and every consumer token thi
 API accepts. Serving those would turn a diagnostic into a credential leak, and the
 route that leaks is the one nobody reviews again after it works.
 
-Redaction is by key name, applied recursively, rather than by a list of paths to
-hide. A path list is a promise about today's configuration shape: add a section
-with a secret in it and the list is silently wrong. A name rule covers a key that
-did not exist when it was written, which is the case that matters.
+Two nets, and they catch different things.
 
-The cost is the opposite error - a harmless key called `market_key` would be
-redacted for nothing. That trade is deliberate: an over-redacted diagnostic is an
-annoyance, an under-redacted one is an incident.
+**By key name**, recursively, rather than by a list of paths to hide. A path list is
+a promise about today's configuration shape: add a section with a secret in it and
+the list is silently wrong. A name rule covers a key that did not exist when it was
+written, which is the case that matters. The cost is the opposite error - a harmless
+key called `market_key` is redacted for nothing. An over-redacted diagnostic is an
+annoyance; an under-redacted one is an incident.
+
+**By shape**, using `finiex_auth.redaction` - the vocabulary shared with the sister
+projects, which recognises a bearer token, a DSN password or a bot token wherever it
+sits inside a string. That is deliberately not reimplemented here: a second copy of a
+security vocabulary is worse than none, because the copy nobody updates is the one
+that leaks and nothing fails when they drift.
+
+The key rule cannot see a secret that reached a value by accident, and the shape rule
+cannot know that `chat_id` is private. Hence both.
 
 Location: python/api/redaction.py
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
+
+from finiex_auth.redaction import redact as redact_text
 
 REDACTED = "<redacted>"
 
@@ -70,6 +81,10 @@ def redact(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [redact(inner) for inner in value]
 
+    if isinstance(value, str):
+        masked, _ = redact_text(value)
+        return masked
+
     return value
 
 
@@ -84,3 +99,23 @@ def redact_config(config: Dict[str, Any]) -> Dict[str, Any]:
         A copy safe to serve
     """
     return redact(config)
+
+
+def redact_line(text: str) -> Tuple[str, bool]:
+    """
+    Mask anything credential-shaped in one line of free text.
+
+    Log lines are not structured, so the key rule has nothing to work with - what
+    reaches them is a bearer token in a traceback or a bot token inside a URL.
+
+    The boolean is returned rather than swallowed because the package asks every
+    caller to surface it: a reader trusts a diagnostic surface, so a line that was
+    altered without saying so is worse than one that was withheld.
+
+    Args:
+        text: One log line
+
+    Returns:
+        Tuple of the masked line and whether anything was masked
+    """
+    return redact_text(text)

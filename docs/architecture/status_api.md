@@ -1,0 +1,210 @@
+# The status API — what the collector will tell you about itself
+
+The collector produces files somebody else consumes, and for a long time the only way to
+learn whether it was running, which version, or what it had written was to open a session
+on the machine. On 2026-09-15 that cost something concrete twice: which of two releases
+was live had to be derived from process uptime against commit timestamps, and a question
+from the consuming project — *which tick files span the host migration window* — went
+unanswered past its deadline because the person with the question had no access to the
+archive.
+
+This document covers the routes and what each answers. **How to reach it and how tokens
+work is [connect_contract.md](connect_contract.md)**; this file assumes you are already
+authenticated.
+
+Not in here: bar rendering, parquet conversion, downloads. The surface is read-only and
+stays that way — see *Boundaries* at the end.
+
+---
+
+## The routes
+
+```
+GET /v1/health     open              is it alive, since when, is it connected
+GET /v1/build      open              which code is running
+GET /v1/status     status:detail     the complete live metrics
+GET /v1/configs    config:effective  the settings actually in force
+GET /v1/archive    archive:index     what has been written, per file
+GET /v1/logs       logs:collector    one UTC day of the log, filtered
+```
+
+Two are open. That exemption is written down rather than implied, and the reasoning is
+per route rather than a general policy — see below.
+
+---
+
+## `GET /v1/health` — open
+
+Liveness, uptime and connection state:
+
+```json
+{
+  "status": "ok",
+  "websocket_status": "connected",
+  "uptime_seconds": 241200,
+  "started_at": "2026-09-12T05:00:00+00:00"
+}
+```
+
+`status` is `ok` while the WebSocket is connected and `degraded` otherwise.
+
+**Open because an uptime probe carries no credential**, and a probe that needs one is a
+probe that stops working the day a token rotates.
+
+**It publishes no symbol names, tick counts or file names.** Those describe what is being
+traded and how much of it, which an uptime probe does not need. That is the whole reason
+`/v1/status` exists as a separate, gated route rather than as more fields here. A test
+asserts the absence rather than trusting the intent.
+
+## `GET /v1/build` — open
+
+```json
+{
+  "version": "1.1.0",
+  "data_format_version": "1.6.0",
+  "commit": "0c2f88e",
+  "dirty": false,
+  "started_at": "2026-09-15T10:00:00+00:00"
+}
+```
+
+Two properties are deliberate.
+
+**Sampled once, at startup, and never re-read.** A hash read per request would describe
+the working tree at that moment — so after a `git pull` without a restart it would report
+the new commit while the old code serves. That is wrong in exactly the one case the route
+exists for. A running process does not acquire code, and this field says so.
+
+**Its own route rather than a field on `/v1/health`.** Health is state and gets polled on
+an interval; build identity is constant for the process's lifetime. Keeping them apart
+leaves the health payload, which a consumer reads on a schedule, unchanged.
+
+**Open because this repository is public** — a commit hash discloses nothing that is not
+already readable on GitHub. Behind a private repository the same field would fingerprint
+the exact version and therefore its known defects. If this repository ever goes private,
+this route is the first thing to gate.
+
+Note `version` and `data_format_version` are different numbers and move for different
+reasons: the first is what this program is, the second is what its output files promise.
+
+## `GET /v1/status` — `status:detail`
+
+The live `CollectorStats` object, serialized whole: per-symbol tick counts, last quote and
+its age, file counts, reconnect history, recent log entries, disk space and uptime.
+
+The conversion is **structural rather than enumerated** — dataclasses become objects,
+datetimes become UTC ISO strings, and a field added to `CollectorStats` appears here
+without anyone editing the serializer. A route that picked fields by hand would drift the
+moment the collector grew one, which is how a status endpoint ends up describing last
+month's system.
+
+Two deliberate exceptions:
+
+- `max_recent_logs` and `max_reconnect_history` are **omitted**. They describe how much
+  history the terminal display keeps, which is configuration, not measurement.
+- `disk_space` is **extended** with `free_gb`, `total_gb`, `percent_free` and `status`.
+  Those are computed properties, so a plain dataclass conversion drops them — and they are
+  the part a monitor acts on.
+
+## `GET /v1/configs` — `config:effective`
+
+The configuration actually in force, after `user_configs/app_config.json` has been merged
+over the tracked defaults. `/v1/build` says which code runs; this says with which settings.
+
+**Every credential is removed before it leaves**, by two independent rules:
+
+- **By key name**, recursively — anything containing `token`, `secret`, `password`,
+  `credential` or `apikey`, plus `chat_id`. Not by a list of paths: a path list is a
+  promise about today's configuration shape, and a section added later would silently not
+  be in it.
+- **By shape**, using the credential vocabulary shared with the sister projects, which
+  recognises a bearer token, a DSN password or a bot token wherever it sits inside a
+  string value.
+
+The key rule cannot see a secret that reached a value by accident; the shape rule cannot
+know that `chat_id` is private. Hence both. The cost is the opposite error — a harmless
+key named `market_key` is redacted for nothing. An over-redacted diagnostic is an
+annoyance; an under-redacted one is an incident.
+
+A test plants a real-shaped bot token and a consumer token in the configuration and
+asserts neither appears anywhere in the response body — not in the field they are expected
+in, in the body.
+
+## `GET /v1/archive` — `archive:index`
+
+What the collector has written. Per file: symbol, tick count, the declared count from the
+summary, event and arrival bounds, format version, and the anchor counters.
+
+```
+?symbol=BTCUSD          one symbol
+?only_corrected=true    only files that absorbed a clock correction
+```
+
+**`absorbed_clock_correction`** is the field this route was built for. A file whose
+`anchor_resyncs` grew between its header (written at open) and its summary (written at
+close) contains a tick whose timestamp was held back by the monotonicity clamp. That is
+the only durable record of a clock correction — the clamp works precisely by making the
+event invisible everywhere else, which is what makes it safe for the import and invisible
+for an investigation.
+
+The rule is computed here rather than left to the caller: it is a detail of our file
+format, and a consumer reimplementing it would be reimplementing ours.
+
+**Metadata only.** The tick arrays are the bulk of a file — 425 bytes per tick, up to
+50,000 of them — and no inventory question needs them. `open_write_ahead_logs` lists any
+`.jsonl.part` without its archive file: the run that is collecting now, or a crashed one
+waiting for recovery.
+
+## `GET /v1/logs` — `logs:collector`
+
+One UTC day of the log.
+
+```
+?day=2026-09-15         required, YYYY-MM-DD
+?min_level=WARNING      default INFO
+?since= / ?until=       ISO timestamps
+?contains=reconnect     substring of the message
+?limit=500              capped at 2000
+```
+
+**Every timestamp is UTC** — in the request, in the file name, and in each line, which is
+stamped `YYYY-MM-DD HH:MM:SS UTC`. Nothing is converted at either end. This is worth
+stating because the sister project documents the opposite as a trap: their query is UTC
+while their file carries the server's local clock, and the offset has to be applied by
+hand. Do not add a conversion here; it would be wrong.
+
+**Every line passes through the credential vocabulary before it leaves**, and the number
+of lines that were altered is reported as `redacted_lines`. A log is free text, so the key
+rule has nothing to work with — what reaches it is a bot token inside a URL or a bearer
+header in a traceback. The count is surfaced rather than swallowed: a reader trusts what a
+diagnostic hands them, so a line altered without saying so is worse than one withheld.
+
+**The day is a query parameter, not a path segment.** A path segment becomes the grant
+name — `logs:2026-09-15` — which would demand a grant per calendar day. Without one, the
+surface itself is the permission. The same reasoning applies to `symbol` on `/v1/archive`.
+
+A line that does not match the expected shape — a traceback's continuation — is carried
+through with whatever was kept before it. A stack trace whose first line survived the
+level filter and whose body vanished is worse than no excerpt.
+
+An unknown day answers `exists: false` with `available_days`, rather than a 404 that
+leaves the caller guessing. A malformed day is a 400.
+
+---
+
+## Boundaries
+
+**Read-only, and it cannot change anything.** Every route reads through a provider
+callable rather than holding a reference to the collector, so the surface is read-only by
+construction rather than by discipline.
+
+**It cannot take the collector down.** The server runs as a task on the collector's own
+event loop with its own exception guard. A status surface that stops the collection is
+worse than no status surface.
+
+**It is off unless `api.enabled` is set**, and it binds loopback. The port never gets a
+firewall rule; reaching it from elsewhere is the reverse proxy's job.
+
+**No route from the auth package.** `finiex_auth` ships dependencies, the token registry,
+the credential vocabulary and a route walk — not routes. Every route above is this
+project's own.

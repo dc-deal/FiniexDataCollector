@@ -36,6 +36,8 @@ API_TOKEN = "planted-consumer-secret"
 FULL = {"token": "tok-full", "grants": [
     "status:detail", "config:effective", "logs:collector", "archive:index"]}
 NARROW = {"token": "tok-narrow", "grants": ["status:detail"]}
+# Authenticated, entitled to nothing - the floor every gated route must refuse.
+NOBODY = {"token": "tok-nobody", "grants": []}
 
 HEADERS = {"Authorization": f"Bearer {FULL['token']}"}
 NARROW_HEADERS = {"Authorization": f"Bearer {NARROW['token']}"}
@@ -132,7 +134,8 @@ def client(tmp_path: Path) -> TestClient:
         build=BUILD,
         health_provider=lambda: {"status": "ok"},
         detail_provider=lambda: {"symbols": {}},
-        registry=load_token_registry({"full": FULL, "narrow": NARROW}),
+        registry=load_token_registry(
+            {"full": FULL, "narrow": NARROW, "nobody": NOBODY}),
         config_provider=config_with_secrets,
         raw_data_dir=raw,
         log_dir=logs
@@ -283,3 +286,79 @@ def test_the_log_route_refuses_a_token_without_that_surface(
     """The log carries everything the collector says about itself."""
     assert client.get(
         "/v1/logs?day=2026-09-15", headers=NARROW_HEADERS).status_code == 403
+
+
+# =============================================================================
+# THE SURFACE AS A WHOLE
+# =============================================================================
+
+OPEN_ROUTES = {"/v1/health", "/v1/build"}
+
+
+def test_no_route_is_authenticated_but_ungated(client: TestClient) -> None:
+    """
+    The one weakness of this auth model, walked rather than read.
+
+    Authentication is inherited from the shared bearer dependency, so a route
+    added later cannot forget it. The surface half is declared per route, and a
+    route mounted without it is authenticated but **ungated** - reachable by any
+    valid token, and indistinguishable from a gated one by reading the code.
+
+    The package ships `assert_no_identity_route_is_ungated` for this, but it
+    only covers routes carrying a path identity and refuses to run without one.
+    Every route here is a collection route by design - a date or a symbol is not
+    something a grant is written against - so the equivalent is walked here.
+    """
+    nobody = {"Authorization": f"Bearer {NOBODY['token']}"}
+    walked = []
+
+    for route in client.app.routes:
+        path = getattr(route, "path", "")
+        if not path.startswith("/v1/") or path in OPEN_ROUTES:
+            continue
+
+        walked.append(path)
+        response = client.get(path, headers=nobody, params={"day": "2026-09-15"})
+
+        assert response.status_code == 403, (
+            f"{path} answered {response.status_code} to a token holding "
+            f"nothing - it is authenticated but ungated")
+
+    assert sorted(walked) == ["/v1/archive", "/v1/configs", "/v1/logs",
+                              "/v1/status"], (
+        "a gated route disappeared from the app; the walk would stay green "
+        "while the surface it protected went unreachable")
+
+
+def test_the_open_routes_stay_open(client: TestClient) -> None:
+    """
+    The other direction. An uptime probe that suddenly needs a credential is an
+    outage nobody sees until the probe has been red for a day.
+    """
+    for path in sorted(OPEN_ROUTES):
+        assert client.get(path).status_code == 200, path
+
+
+def test_credentials_in_a_log_line_are_masked(tmp_path: Path) -> None:
+    """
+    A log is free text, so the key-name rule has nothing to work with. What
+    reaches it is a bot token inside a URL or a bearer header in a traceback,
+    and a diagnostic route that serves them turns a convenience into a leak.
+    """
+    from datetime import date
+
+    from python.api.log_reader import read_log
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "finiexdatacollector_2026-09-15.log").write_text(
+        "2026-09-15 08:00:00 UTC | INFO     | X | GET https://api.telegram.org"
+        "/bot8256155493:AAHHwyeyjy8s0DEOo14VOSQ1JKD4pXwPS7Q/sendMessage\n"
+        "2026-09-15 08:01:00 UTC | INFO     | X | nothing secret here\n",
+        encoding="utf-8")
+
+    excerpt = read_log(logs, date(2026, 9, 15))
+
+    assert excerpt["redacted_lines"] == 1, "the count has to be surfaced"
+    assert "AAHHwyeyjy8s0DEOo14VOSQ1JKD4pXwPS7Q" not in json.dumps(excerpt)
+    assert "nothing secret here" in json.dumps(excerpt)

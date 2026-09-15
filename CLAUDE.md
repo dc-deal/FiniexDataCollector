@@ -284,6 +284,13 @@ suite gets an entry in `docs/tests/test_overview.md` in the same change.
   ordering could not fail on the happy path at all — it needed a write that throws.
   **A guard whose failure mode only appears when something else fails needs a test that makes
   that something else fail.**
+- **Before a route counts as done, start the collector and call it.** Not a suite
+  requirement — a hand check, once, after startup is through. `TestClient` is an in-process
+  ASGI transport: it never binds a port, never starts the server, never exercises the bind
+  address. Twenty-eight API tests passed while nothing had ever listened. The bind address
+  is what this catches — `0.0.0.0` is required inside a container, where containment comes
+  from the compose publish, and wrong on the server, where the process runs in a virtualenv
+  with no publish rule in front of it.
 - **Test the contract, not the implementation.** The invariant tests assert what the
   importer enforces, so they keep meaning after a refactor.
 

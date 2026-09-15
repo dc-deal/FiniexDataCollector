@@ -7,6 +7,8 @@ Links only. Order within a section is reading priority — the first entry is wh
 - [Output contract](architecture/output_contract.md)
 - [Time model](architecture/time_model.md)
 - [Durability](architecture/durability.md)
+- [Status API](architecture/status_api.md)
+- [Connect contract](architecture/connect_contract.md)
 
 ## Operations
 

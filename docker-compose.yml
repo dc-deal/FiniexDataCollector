@@ -33,6 +33,14 @@ services:
       # harmless instead of Docker materialising a root-owned directory beside the checkout.
       # `:-` not `-`: an EMPTY value (as shipped in .env.example) must fall back too.
       - ${FINIEX_BUS_PATH:-./.devcontainer/bus_placeholder}:/bus
+    ports:
+      # Loopback only. The status API authenticates and is read-only, but the
+      # port still must not reach the network: TLS termination is the reverse
+      # proxy's job, and a published port would bypass it.
+      # Docker Desktop routes a container's `host.docker.internal` to a loopback
+      # publish; plain Linux Docker does not - verify a consumer's route after
+      # changing this.
+      - "127.0.0.1:8110:8110"
     environment:
       - PYTHONPATH=/app
       - TZ=UTC
