@@ -15,7 +15,7 @@
 FiniexDataCollector is a real-time tick data collection system that captures market data from cryptocurrency exchanges and forex brokers. It produces standardized JSON tick files compatible with FiniexTestingIDE for backtesting.
 
 **1.0 delivers:**
-- ✅ Kraken WebSocket v2 ticker collection (8 crypto pairs)
+- ✅ Kraken WebSocket v2 trade + ticker collection, see the symbol table below
 - ✅ JSON output format matching MT5 TickCollector
 - ✅ Automatic file rotation at 50,000 ticks
 - ✅ Lock file protection for active files
@@ -28,8 +28,9 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 ## Features
 
 ### Data Collection
-- **Kraken WebSocket v2** - Real-time ticker stream for crypto pairs
-- **Multi-Symbol Support** - 8 symbols simultaneously (BTC, ETH, SOL, ADA, XRP, DASH, LTC, ETH/EUR)
+- **Kraken WebSocket v2** - trade stream for the ticks, ticker stream for the quote each
+  trade executed against
+- **Multi-Symbol Support** - every symbol in `kraken.symbols` collected in parallel
 - **Automatic Reconnection** - Exponential backoff (1s → 60s max) with tracking
 - **Heartbeat Monitoring** - Detects stale connections and forces reconnect
 - **Reconnect Tracking** - Records all reconnect events with duration
@@ -37,7 +38,12 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 ### Output Format
 - **MT5-Compatible JSON** - Identical structure to TickCollector.mq5 output
 - **Configurable Rotation** - Files close at N ticks (default: 50,000)
-- **Lock File Protection** - `.lock` files prevent processing of active files
+- **Atomic Writes** - a `*_ticks.json` never exists in a partial state: it is written to a
+  temp file and renamed into place. This is what protects a consumer, not the `.lock`
+  sidecar, which nothing reads. Do not "simplify" it into a direct write to the final path.
+- **Write-Ahead Log** - every tick is appended to a `.jsonl.part` sidecar before it counts as
+  collected, and that log is removed only after the archive file exists. A crash costs the
+  last tick rather than the whole buffer; the next start rebuilds the file from the log.
 - **Quality Metrics** - Spread calculation, tick frequency, error tracking
 
 ### Monitoring & Health
@@ -119,12 +125,18 @@ python python/main.py status
 |--------|-------------|-----------|--------|
 | BTCUSD | Bitcoin vs US Dollar | 0.1 | 1 |
 | ETHUSD | Ethereum vs US Dollar | 0.01 | 2 |
-| SOLUSD | Solana vs US Dollar | 0.001 | 3 |
-| ADAUSD | Cardano vs US Dollar | 0.00001 | 5 |
+| SOLUSD | Solana vs US Dollar | 0.01 | 2 |
+| ADAUSD | Cardano vs US Dollar | 0.000001 | 6 |
 | XRPUSD | Ripple vs US Dollar | 0.00001 | 5 |
 | DASHUSD | Dash vs US Dollar | 0.001 | 3 |
-| LTCUSD | Litecoin vs US Dollar | 0.001 | 3 |
+| LTCUSD | Litecoin vs US Dollar | 0.01 | 2 |
 | ETHEUR | Ethereum vs Euro | 0.01 | 2 |
+| DOTUSD | Polkadot vs US Dollar | 0.0001 | 4 |
+
+These are fetched from Kraken's AssetPairs API at every start and are reproduced here for
+orientation only - `BrokerConfig` is the authority. SOLUSD, ADAUSD and LTCUSD were wrong in
+this table until 2026-09-15, and those two columns decide `spread_points` and the rounding of
+every price written.
 
 ---
 
@@ -156,7 +168,7 @@ python python/main.py status
 │         ▼                                                       │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │  JSON TICK WRITER                                       │    │
-│  │  50k rotation, .lock protection, atomic writes          │    │
+│  │  50k rotation, write-ahead log, atomic writes            │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │         │                                                       │
 │         ▼                                                       │

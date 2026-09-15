@@ -25,7 +25,8 @@
       "XRP/USD",
       "DASH/USD",
       "LTC/USD",
-      "ETH/EUR"
+      "ETH/EUR",
+      "DOT/USD"
     ],
     "streams": [
       "trade",

@@ -29,18 +29,4 @@ services:
     environment:
       - PYTHONPATH=/app
       - TZ=UTC
-    command: tail -f /dev/null 
-    
-  # One-off conversion job (run manually)
-  converter:
-    build: .
-    container_name: finiex-converter
-    profiles:
-      - tools
-    volumes:
-      - ./data:/app/data
-      - ./configs:/app/configs
-      - ./logs:/app/logs
-    environment:
-      - PYTHONPATH=/app
-    command: python python/main.py convert
+    command: tail -f /dev/null
