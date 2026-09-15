@@ -28,12 +28,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
+from fastapi.responses import FileResponse
 from finiex_auth.bearer_auth import build_bearer_dependency
 from finiex_auth.grant_auth import build_grant_dependency
 from finiex_auth.token_registry import TokenRegistry
 
 from python.api.archive_reader import read_archive
 from python.api.build_info import BuildInfo
+from python.api.file_server import resolve_archive_file
 from python.api.log_reader import MAX_LINES, read_log
 from python.api.redaction import redact_config
 
@@ -138,7 +140,9 @@ def create_api(
             symbol: Optional[str] = Query(None),
             only_corrected: bool = Query(
                 False,
-                description="Only files whose anchor counters grew while open")
+                description="Only files whose anchor counters grew while open"),
+            with_checksum: bool = Query(
+                False, description="Include a SHA-256 per file")
         ) -> Dict[str, Any]:
             """
             What has been written: per file, its symbol, tick count, event and
@@ -148,8 +152,42 @@ def create_api(
             inventory question needs them.
             """
             return read_archive(
-                raw_data_dir, data_collector,
-                symbol=symbol, only_corrected=only_corrected)
+                raw_data_dir, data_collector, symbol=symbol,
+                only_corrected=only_corrected, with_checksum=with_checksum)
+
+        @app.get(
+            "/v1/files/{name}",
+            dependencies=[
+                Depends(verify_bearer),
+                Security(verify_grant, scopes=["files"])
+            ],
+            response_class=FileResponse
+        )
+        def archive_file(name: str) -> FileResponse:
+            """
+            Hand out one finished archive file.
+
+            **Only finished files can be reached, and not because of a check
+            here.** A `*_ticks.json` is written to a temporary file and renamed
+            into place, so the name never exists before the content is complete.
+            What is still being collected has no `.json` yet - it lives in memory
+            and in a `.jsonl.part`, which this route's name pattern does not
+            match.
+
+            The name is a path parameter, so the grant is `files:<name>`. A
+            consumer entitled to the archive holds `files:*`; a per-file grant is
+            possible and is what the model is for, not what it expects.
+            """
+            path = resolve_archive_file(raw_data_dir, data_collector, name)
+
+            if path is None:
+                # 404 whether the name was malformed, pointed outside the
+                # archive, or simply is not there. Distinguishing them would
+                # turn the route into a probe for what exists on the disk.
+                raise HTTPException(status_code=404, detail=f"no such file: {name}")
+
+            return FileResponse(
+                path, media_type="application/json", filename=path.name)
 
     if log_dir is not None:
         @app.get(

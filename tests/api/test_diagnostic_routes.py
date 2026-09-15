@@ -12,6 +12,7 @@ Location: tests/api/test_diagnostic_routes.py
 """
 
 import json
+import re
 import warnings
 from pathlib import Path
 from typing import Any, Dict
@@ -292,7 +293,10 @@ def test_the_log_route_refuses_a_token_without_that_surface(
 # THE SURFACE AS A WHOLE
 # =============================================================================
 
-OPEN_ROUTES = {"/v1/health", "/v1/build"}
+# Every route that answers without a credential, named on purpose. The third
+# one is FastAPI's own schema: it exists by default rather than by decision, and
+# a surface that nobody wrote down is one nobody reviews.
+OPEN_ROUTES = {"/v1/health", "/v1/build", "/openapi.json"}
 
 
 def test_no_route_is_authenticated_but_ungated(client: TestClient) -> None:
@@ -314,20 +318,26 @@ def test_no_route_is_authenticated_but_ungated(client: TestClient) -> None:
 
     for route in client.app.routes:
         path = getattr(route, "path", "")
-        if not path.startswith("/v1/") or path in OPEN_ROUTES:
+        if not path or path in OPEN_ROUTES:
             continue
 
         walked.append(path)
-        response = client.get(path, headers=nobody, params={"day": "2026-09-15"})
+
+        # A path parameter needs a value before the route resolves at all. Any
+        # value does: the grant is refused before the name is looked up.
+        callable_path = re.sub(r"\{[^}]+\}", "x", path)
+        response = client.get(
+            callable_path, headers=nobody, params={"day": "2026-09-15"})
 
         assert response.status_code == 403, (
             f"{path} answered {response.status_code} to a token holding "
             f"nothing - it is authenticated but ungated")
 
-    assert sorted(walked) == ["/v1/archive", "/v1/configs", "/v1/logs",
-                              "/v1/status"], (
-        "a gated route disappeared from the app; the walk would stay green "
-        "while the surface it protected went unreachable")
+    assert sorted(walked) == ["/v1/archive", "/v1/configs", "/v1/files/{name}",
+                              "/v1/logs", "/v1/status"], (
+        "a gated route appeared or disappeared; listing them here is what keeps "
+        "a router that drops out of the app from leaving the walk green while "
+        "the surface it protected goes unreachable")
 
 
 def test_the_open_routes_stay_open(client: TestClient) -> None:
@@ -337,6 +347,16 @@ def test_the_open_routes_stay_open(client: TestClient) -> None:
     """
     for path in sorted(OPEN_ROUTES):
         assert client.get(path).status_code == 200, path
+
+
+def test_the_interactive_docs_are_not_served(client: TestClient) -> None:
+    """
+    The schema is enough for a consumer to integrate against. A rendered,
+    try-it-out console on a diagnostic surface is a different thing, and it was
+    never decided on.
+    """
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
 
 
 def test_credentials_in_a_log_line_are_masked(tmp_path: Path) -> None:
@@ -362,3 +382,168 @@ def test_credentials_in_a_log_line_are_masked(tmp_path: Path) -> None:
     assert excerpt["redacted_lines"] == 1, "the count has to be surfaced"
     assert "AAHHwyeyjy8s0DEOo14VOSQ1JKD4pXwPS7Q" not in json.dumps(excerpt)
     assert "nothing secret here" in json.dumps(excerpt)
+
+
+# =============================================================================
+# HANDING OUT A FILE
+# =============================================================================
+
+DOWNLOADER = {"token": "tok-dl", "grants": ["archive:index", "files:*"]}
+
+
+@pytest.fixture
+def download_client(tmp_path: Path) -> TestClient:
+    """
+    A client holding `files:*`, over an archive with one finished file and one
+    write-ahead log that has not become a file yet.
+
+    Args:
+        tmp_path: pytest temp directory
+
+    Returns:
+        TestClient over the application
+    """
+    raw = tmp_path / "raw"
+    kraken = raw / "kraken"
+    write_archive_file(kraken, "BTCUSD_20260915_100000_ticks.json")
+    (kraken / "ETHUSD_20260915_110000_ticks.jsonl.part").write_text(
+        '{"symbol": "ETHUSD"}\n', encoding="utf-8")
+    (kraken / ".collector.lock").write_text("{}", encoding="utf-8")
+
+    return TestClient(create_api(
+        build=BUILD,
+        health_provider=lambda: {"status": "ok"},
+        detail_provider=lambda: {"symbols": {}},
+        registry=load_token_registry(
+            {"dl": DOWNLOADER, "narrow": NARROW, "nobody": NOBODY}),
+        raw_data_dir=raw
+    ))
+
+
+def dl_headers() -> Dict[str, str]:
+    """Authorization header for the token holding `files:*`."""
+    return {"Authorization": f"Bearer {DOWNLOADER['token']}"}
+
+
+def test_a_finished_file_is_handed_out(download_client: TestClient) -> None:
+    """The transfer this replaces SFTP for."""
+    response = download_client.get(
+        "/v1/files/BTCUSD_20260915_100000_ticks.json", headers=dl_headers())
+
+    assert response.status_code == 200
+    assert response.json()["metadata"]["symbol"] == "BTCUSD"
+
+
+def test_the_register_can_carry_a_checksum(download_client: TestClient) -> None:
+    """
+    What makes a transfer verifiable. Off by default, because hashing reads the
+    whole archive and a register is asked for far more often than a transfer is
+    checked.
+    """
+    plain = download_client.get("/v1/archive", headers=dl_headers()).json()
+    hashed = download_client.get(
+        "/v1/archive?with_checksum=true", headers=dl_headers()).json()
+
+    assert plain["files"][0]["sha256"] is None
+    assert len(hashed["files"][0]["sha256"]) == 64
+
+
+def test_the_checksum_matches_what_is_served(
+    download_client: TestClient
+) -> None:
+    """A digest a consumer cannot reproduce from the bytes is worse than none."""
+    import hashlib
+
+    entry = download_client.get(
+        "/v1/archive?with_checksum=true", headers=dl_headers()).json()["files"][0]
+    body = download_client.get(
+        f"/v1/files/{entry['file']}", headers=dl_headers()).content
+
+    assert hashlib.sha256(body).hexdigest() == entry["sha256"]
+
+
+def test_an_unfinished_file_cannot_be_reached(
+    download_client: TestClient
+) -> None:
+    """
+    The property the operator asked for, and it holds by construction rather
+    than by a check: what is still being collected has no `.json` name yet.
+    """
+    response = download_client.get(
+        "/v1/files/ETHUSD_20260915_110000_ticks.jsonl.part",
+        headers=dl_headers())
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("name", [
+    "../../../etc/passwd",
+    r"..\windows\win.ini",
+    ".collector.lock",
+    "BTCUSD_20260915_100000_ticks.json.bak",
+    "%2e%2e%2fsecret",
+])
+def test_nothing_outside_the_archive_can_be_requested(
+    download_client: TestClient,
+    name: str
+) -> None:
+    """
+    The name is the only thing standing between a request and the file system.
+
+    All of these answer 404 rather than distinguishing "malformed" from "not
+    there" - the difference would turn the route into a probe for what exists.
+
+    Args:
+        download_client: Client holding `files:*`
+        name: A name that must not resolve
+    """
+    response = download_client.get(f"/v1/files/{name}", headers=dl_headers())
+
+    assert response.status_code in (404, 400), name
+    assert b"root:" not in response.content
+
+
+def test_a_token_without_the_files_surface_is_refused(
+    download_client: TestClient
+) -> None:
+    """Holding the register is not holding the archive."""
+    response = download_client.get(
+        "/v1/files/BTCUSD_20260915_100000_ticks.json",
+        headers={"Authorization": f"Bearer {NOBODY['token']}"})
+
+    assert response.status_code == 403
+
+
+def test_a_path_escaping_the_archive_is_refused_even_if_the_name_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The second net, tested by breaking the first one.
+
+    After the name check, `target / name` cannot escape by path arithmetic - the
+    pattern permits no separators. What it cannot see is a symlink or a junction
+    planted in the archive directory under a valid archive name, which resolves
+    somewhere else entirely.
+
+    Rather than plant one - creating a symlink needs privileges on Windows, and a
+    guard that is only tested where it does not run is not tested - the first
+    check is disabled and the second is asked to hold alone. That is exactly the
+    situation it exists for: a name pattern loosened by a later change.
+
+    Args:
+        tmp_path: pytest temp directory
+        monkeypatch: pytest patching helper
+    """
+    from python.api import file_server
+
+    secret = tmp_path / "secret.json"
+    secret.write_text('{"not": "yours"}', encoding="utf-8")
+    (tmp_path / "raw" / "kraken").mkdir(parents=True)
+
+    monkeypatch.setattr(file_server, "is_servable_name", lambda name: True)
+
+    escaped = file_server.resolve_archive_file(
+        tmp_path / "raw", "kraken", "../../secret.json")
+
+    assert escaped is None, "a resolved path outside the archive was served"

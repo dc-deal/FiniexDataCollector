@@ -12,23 +12,25 @@ This document covers the routes and what each answers. **How to reach it and how
 work is [connect_contract.md](connect_contract.md)**; this file assumes you are already
 authenticated.
 
-Not in here: bar rendering, parquet conversion, downloads. The surface is read-only and
-stays that way — see *Boundaries* at the end.
+Not in here: bar rendering or parquet conversion. Nothing on this surface changes
+anything — see *Boundaries* at the end.
 
 ---
 
 ## The routes
 
 ```
-GET /v1/health     open              is it alive, since when, is it connected
-GET /v1/build      open              which code is running
-GET /v1/status     status:detail     the complete live metrics
-GET /v1/configs    config:effective  the settings actually in force
-GET /v1/archive    archive:index     what has been written, per file
-GET /v1/logs       logs:collector    one UTC day of the log, filtered
+GET /v1/health         open              is it alive, since when, is it connected
+GET /v1/build          open              which code is running
+GET /openapi.json      open              the schema: every route and parameter
+GET /v1/status         status:detail     the complete live metrics
+GET /v1/configs        config:effective  the settings actually in force
+GET /v1/archive        archive:index     what has been written, per file
+GET /v1/files/{name}   files:*           one finished archive file
+GET /v1/logs           logs:collector    one UTC day of the log, filtered
 ```
 
-Two are open. That exemption is written down rather than implied, and the reasoning is
+Three are open. That exemption is written down rather than implied, and the reasoning is
 per route rather than a general policy — see below.
 
 ---
@@ -86,6 +88,20 @@ this route is the first thing to gate.
 
 Note `version` and `data_format_version` are different numbers and move for different
 reasons: the first is what this program is, the second is what its output files promise.
+
+## `GET /openapi.json` — open
+
+The schema: every route, every parameter, every response shape. FastAPI generates it, so
+it exists whether or not anyone decided on it — which is the reason it is named here.
+A consumer integrates against this rather than against a hand-kept list that drifts.
+
+`/docs` and `/redoc`, the rendered consoles, are **off**. The schema is what a consumer
+needs; a try-it-out console on a diagnostic surface is a different thing and was never
+decided on. A test asserts both stay 404.
+
+Open because it describes the shape of the surface and none of its contents. Note it does
+list the route names, so it tells a reader that an archive and a log exist — behind a
+private repository that would be worth weighing, the way `/v1/build` is.
 
 ## `GET /v1/status` — `status:detail`
 
@@ -154,6 +170,34 @@ format, and a consumer reimplementing it would be reimplementing ours.
 50,000 of them — and no inventory question needs them. `open_write_ahead_logs` lists any
 `.jsonl.part` without its archive file: the run that is collecting now, or a crashed one
 waiting for recovery.
+
+## `GET /v1/files/{name}` — `files:*`
+
+Hands out one finished archive file. This is the transfer that replaces SFTP, which would
+have meant shell access to a machine running three services in order to move files out of
+one directory.
+
+**Only finished files can be reached, and that is a property of the writer rather than a
+check performed here.** A `*_ticks.json` is written to a temporary file and `os.replace()`-d
+into position, so the name never exists before the content is complete. What is still being
+collected lives in memory and in a `.jsonl.part`, which has no `.json` counterpart and does
+not match this route's name pattern. The daily close adds a coarser boundary on top: once a
+UTC day ends, that day's file is final.
+
+**The name is the only thing between a request and the file system.** It is matched whole
+against the archive pattern — anchored, so nothing longer containing a valid name passes —
+and the resolved path is then required to sit inside the collector directory. The second
+check exists for what the first cannot see: a symlink planted in that directory under a
+valid name. Everything that fails either check is a `404`, including a malformed name, so
+the route cannot be used to probe what exists on the disk.
+
+Pair it with `/v1/archive?with_checksum=true`, which adds a SHA-256 per file. Hashing is
+off by default because it reads the whole archive, and a register is asked for far more
+often than a transfer is verified.
+
+The name is a path parameter, so the grant is `files:<name>` and a consumer entitled to the
+archive holds `files:*`. A per-file grant is possible; it is what the model allows, not
+what it expects.
 
 ## `GET /v1/logs` — `logs:collector`
 

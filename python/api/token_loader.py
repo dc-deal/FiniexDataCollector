@@ -39,7 +39,7 @@ class ConsumerToken(ConsumerTokenBase):
 
     A bare `*` also parses. It is never written into this project's configuration.
     """
-    GRANT_SURFACES = ("status", "config", "logs", "archive")
+    GRANT_SURFACES = ("status", "config", "logs", "archive", "files")
 
 
 def load_token_registry(

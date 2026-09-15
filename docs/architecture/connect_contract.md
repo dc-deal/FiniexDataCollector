@@ -49,7 +49,7 @@ A bearer token in the `Authorization` header:
 Authorization: Bearer <token>
 ```
 
-Two routes need none — `/v1/health` and `/v1/build`. Every other route needs a token
+Three routes need none — `/v1/health`, `/v1/build` and `/openapi.json`. Every other route needs a token
 **and** a grant naming the surface it touches.
 
 ```
@@ -63,7 +63,7 @@ token. The refusal names what the token *does* hold.
 
 ## Grants
 
-A grant is `<surface>:<name>`. This collector declares four surfaces:
+A grant is `<surface>:<name>`. The surfaces this collector declares:
 
 | Surface | Route | What it exposes |
 |---|---|---|
@@ -71,6 +71,7 @@ A grant is `<surface>:<name>`. This collector declares four surfaces:
 | `config` | `/v1/configs` | the effective configuration, credentials removed |
 | `archive` | `/v1/archive` | the file inventory |
 | `logs` | `/v1/logs` | log excerpts |
+| `files` | `/v1/files/{name}` | a finished archive file, handed out |
 
 **The surface vocabulary is closed and checked when the configuration is parsed.** A grant
 naming a surface that does not exist — `statsu:detail` — is refused at boot rather than
@@ -78,10 +79,12 @@ becoming a denial at request time nobody can explain. The *name* after the colon
 checked: `status:detial` parses and then denies. So a surface typo cannot reach production
 and a name typo can, reading as a permission problem.
 
-**Every route here is a collection route**, with no path parameter. That is not an
-accident: `finiex_auth` derives the grant name from the path parameter, so a date or a
-symbol in the path would demand a grant per calendar day or per instrument. Filters are
-query parameters for that reason, and the surface itself is the permission.
+**Filters are query parameters, identities are path parameters**, and the difference
+decides the grant. `finiex_auth` derives the grant name from the path parameter, so a date
+or a symbol there would demand a grant per calendar day or per instrument — those are
+query parameters, and the surface itself is the permission. A file name *is* an identity,
+so `/v1/files/{name}` gates on `files:<name>` and a consumer entitled to the archive holds
+`files:*`.
 
 ## Issuing a token
 

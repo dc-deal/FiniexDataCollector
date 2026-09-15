@@ -19,8 +19,13 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from python.api.file_server import checksum
 
-def _file_entry(path: Path) -> Optional[Dict[str, Any]]:
+
+def _file_entry(
+    path: Path,
+    with_checksum: bool = False
+) -> Optional[Dict[str, Any]]:
     """
     Describe one archive file.
 
@@ -30,6 +35,9 @@ def _file_entry(path: Path) -> Optional[Dict[str, Any]]:
 
     Args:
         path: The `*_ticks.json` to describe
+        with_checksum: Hash the file as well. Off by default - hashing every file
+            on every request reads the whole archive, and a register is asked for
+            far more often than a transfer is verified.
 
     Returns:
         Its inventory entry, or None if it is not a tick file at all
@@ -72,7 +80,8 @@ def _file_entry(path: Path) -> Optional[Dict[str, Any]]:
         # left to the caller: the rule is ours, and a consumer reimplementing it
         # would be reimplementing a detail of our format.
         "absorbed_clock_correction": closed_resyncs > opened_resyncs,
-        "size_bytes": path.stat().st_size
+        "size_bytes": path.stat().st_size,
+        "sha256": checksum(path) if with_checksum else None
     }
 
 
@@ -80,7 +89,8 @@ def read_archive(
     output_dir: Path,
     data_collector: str,
     symbol: Optional[str] = None,
-    only_corrected: bool = False
+    only_corrected: bool = False,
+    with_checksum: bool = False
 ) -> Dict[str, Any]:
     """
     Inventory the archive files on disk.
@@ -90,6 +100,7 @@ def read_archive(
         data_collector: Collector subdirectory, e.g. "kraken"
         symbol: Restrict to one symbol
         only_corrected: Return only files that absorbed a clock correction
+        with_checksum: Include a SHA-256 per file, for verifying a transfer
 
     Returns:
         Inventory document with the files and a short summary
@@ -104,7 +115,7 @@ def read_archive(
     entries: List[Dict[str, Any]] = []
 
     for path in sorted(target.glob(pattern)):
-        entry = _file_entry(path)
+        entry = _file_entry(path, with_checksum=with_checksum)
         if entry is None:
             continue
         if only_corrected and not entry.get("absorbed_clock_correction"):
