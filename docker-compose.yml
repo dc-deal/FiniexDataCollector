@@ -9,6 +9,13 @@ services:
     volumes:
       # Application code (for development)
       - .:/app
+      # Named volume for the root home. The editor server lives in
+      # /root/.vscode-server, so without this every rebuild re-downloads every
+      # extension listed in .devcontainer/devcontainer.json - slow, and it fails
+      # outright without network. Shell history survives with it.
+      # The ~/.claude bind below sits INSIDE this volume and wins for that path:
+      # transcripts belong on the host, where the backup can reach them.
+      - devhome:/root
       # Persistent data storage
       - ./data:/app/data
       # Configuration
@@ -30,3 +37,8 @@ services:
       - PYTHONPATH=/app
       - TZ=UTC
     command: tail -f /dev/null
+
+volumes:
+  # Survives `docker compose down` and a rebuild; removed only by
+  # `docker compose down -v`, which is what makes that flag worth hesitating over.
+  devhome:

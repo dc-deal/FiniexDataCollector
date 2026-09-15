@@ -604,6 +604,36 @@ class JsonTickWriter(AbstractTickWriter):
         }
 
 
+def _drop_log(wal_path: Path, logger) -> bool:
+    """
+    Remove a write-ahead log that is no longer needed, without letting one
+    undeletable file end the recovery.
+
+    A bare unlink() here aborts the whole startup, because main.py iterates this
+    function's result directly. On Windows a handle held by another process -
+    antivirus, a backup agent, or a second collector the instance lock did not
+    catch - makes that outcome reachable. Skipping one log costs a duplicate on
+    the next start, which the "archive already exists" branch above then drops.
+
+    Args:
+        wal_path: The log to remove
+        logger: Where to report a refusal
+
+    Returns:
+        True if the file is gone
+    """
+    try:
+        wal_path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        logger.warning(
+            f"Could not remove {wal_path.name} ({e}) - left in place, "
+            f"the next start will find it again")
+        return False
+
+
 def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path]:
     """
     Turn write-ahead logs left by a crashed run into archive files.
@@ -643,7 +673,7 @@ def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path
         if archive_path.exists():
             logger.info(
                 f"{archive_path.name} already written, dropping its log")
-            wal_path.unlink()
+            _drop_log(wal_path, logger)
             continue
 
         try:
@@ -653,7 +683,7 @@ def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path
             continue
 
         if not lines:
-            wal_path.unlink()
+            _drop_log(wal_path, logger)
             continue
 
         try:
@@ -692,7 +722,7 @@ def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path
                 }
 
         if not ticks:
-            wal_path.unlink()
+            _drop_log(wal_path, logger)
             logger.info(f"{wal_path.name} held no ticks, removed")
             continue
 
@@ -752,7 +782,7 @@ def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path
                 os.unlink(temp_path)
             continue
 
-        wal_path.unlink()
+        _drop_log(wal_path, logger)
         recovered.append(archive_path)
         logger.info(
             f"Recovered {archive_path.name} from its write-ahead log "

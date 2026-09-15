@@ -17,8 +17,8 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 **1.0 delivers:**
 - ✅ Kraken WebSocket v2 trade + ticker collection, see the symbol table below
 - ✅ JSON output format matching MT5 TickCollector
-- ✅ Automatic file rotation at 50,000 ticks
-- ✅ Lock file protection for active files
+- ✅ Automatic file rotation at 50,000 ticks or the UTC day boundary
+- ✅ Write-ahead log, so a crash costs the last tick rather than the whole buffer
 - ✅ Live monitoring with disk space, folder scanning, reconnect tracking
 - ✅ Telegram bot with commands (/report, /help) for on-demand reports
 - ✅ Weekly summary reports (configurable day/time)
@@ -45,6 +45,16 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
   collected, and that log is removed only after the archive file exists. A crash costs the
   last tick rather than the whole buffer; the next start rebuilds the file from the log.
 - **Quality Metrics** - Spread calculation, tick frequency, error tracking
+
+### Status API
+- **Loopback HTTP surface** - the collector answers what it is doing without an RDP session
+- **`GET /v1/health`** - liveness, uptime, connection state. Open: an uptime probe carries no credential
+- **`GET /v1/build`** - version, schema version, commit and start time, sampled once at startup
+- **`GET /v1/status`** - the full live metrics, behind a token granting `status:detail`
+- **`GET /v1/configs`** - the settings actually in force, credentials removed
+- **`GET /v1/archive`** - what has been written per file, including which files absorbed a clock correction
+- **`GET /v1/logs`** - one UTC day of the log, filtered by level, time range or text
+- **Off by default** - `api.enabled` in the configuration; the port never reaches the internet directly
 
 ### Monitoring & Health
 - **Live Display** - Real-time status with Rich TUI interface
@@ -314,6 +324,83 @@ BTCUSD_20250113_143052_ticks.jsonl.part
 ```
 
 ---
+
+## Status API
+
+Off unless `api.enabled` is set. It binds the loopback interface and gets no firewall
+rule; a reverse proxy terminates TLS in front of it when the surface should be reachable
+from elsewhere.
+
+```
+GET /v1/health     open              is it alive, since when, is it connected
+GET /v1/build      open              version, data_format_version, commit, dirty, started_at
+GET /v1/status     status:detail     the complete live metrics
+GET /v1/configs    config:effective  the settings actually in force, credentials removed
+GET /v1/archive    archive:index     what has been written, per file
+GET /v1/logs       logs:collector    one UTC day of the log, filtered
+```
+
+**`/v1/archive`** answers per file: symbol, tick count, event and arrival bounds, and
+whether it absorbed a clock correction - the header and summary anchor counters differing
+is what says so. `?only_corrected=true` returns just those, `?symbol=BTCUSD` narrows it.
+Metadata only; the tick arrays are the bulk of a file and no inventory question needs them.
+
+**`/v1/logs?day=YYYY-MM-DD`** takes `min_level`, `since`, `until`, `contains` and `limit`.
+The day is a query parameter rather than a path segment on purpose: a path segment becomes
+the grant name, so a date there would demand a grant per calendar day. Every timestamp -
+in the request, in the file name and in each line - is UTC, so nothing has to be converted
+at either end.
+
+**`/v1/configs`** removes secrets by key name rather than by a list of paths. A path list
+is a promise about today's configuration shape; a section added later would not be in it.
+
+**Why two of the three are open.** An uptime probe needs `/v1/health` without a
+credential, so the exemption is written down rather than implied - and that route answers
+liveness only. Symbol names, tick counts and buffer depths describe what is being traded
+and how much of it, which is why they sit behind `/v1/status` instead.
+
+`/v1/build` is open because this repository is public: a commit hash discloses nothing
+that is not already readable on GitHub. Behind a private repository the same field would
+fingerprint the exact version and therefore its known defects.
+
+**`/v1/build` is sampled once, at startup, and never re-read.** A hash read per request
+would describe the working tree at that moment - so after a pull without a restart it
+would report the new commit while the old code serves, which is wrong in exactly the one
+case the route exists for.
+
+### Tokens
+
+Every token names what it may reach. The configuration lives in the gitignored
+`user_configs/app_config.json`; the tracked file carries an empty set, and an empty
+registry refuses every gated route.
+
+```json
+"api": {
+  "enabled": true,
+  "host": "127.0.0.1",
+  "port": 8110,
+  "tokens": {
+    "testingide": {
+      "token": "<generate one>",
+      "grants": ["status:detail"],
+      "note": "status probe"
+    }
+  }
+}
+```
+
+Generate a token with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Grants are `<surface>:<name>`. This collector declares four surfaces - `status`,
+`config`, `logs` and `archive`. A
+grant naming an unknown surface is refused when the configuration is parsed, at boot,
+rather than becoming a denial at request time nobody can explain. Do not use the bare
+`name: token` string form the auth package also accepts - it grants every surface,
+including ones added later.
 
 ## Configuration
 

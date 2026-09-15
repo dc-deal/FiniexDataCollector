@@ -71,6 +71,24 @@ def read_document(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def simulate_process_death(writer: JsonTickWriter) -> None:
+    """
+    Release the write-ahead log the way a dying process does: the handle goes,
+    the file stays.
+
+    Recovery runs at startup, on logs left behind by a process that no longer
+    exists. A test that calls it while this process still holds the handle open
+    is testing something that cannot happen - and on Windows it cannot even be
+    executed, because a file with an open handle refuses to be deleted. That
+    divergence is invisible in the Linux dev container and fails on the
+    production platform.
+
+    Args:
+        writer: The writer whose log should survive its owner
+    """
+    writer._close_wal(delete=False)
+
+
 # =============================================================================
 # THE LOG WHILE COLLECTING
 # =============================================================================
@@ -289,6 +307,8 @@ def test_a_log_with_no_ticks_produces_no_file(tmp_path: Path) -> None:
 
     assert len(wal_files(tmp_path)) == 1
 
+    simulate_process_death(writer)
+
     assert recover_orphaned_buffers(tmp_path, "kraken") == []
     assert not wal_files(tmp_path)
     assert not archive_files(tmp_path)
@@ -382,7 +402,50 @@ def test_a_failed_write_leaves_the_log_in_place(
     assert wal_files(tmp_path), "the ticks must still be somewhere"
 
     monkeypatch.undo()
+    simulate_process_death(writer)
     recovered = recover_orphaned_buffers(tmp_path, "kraken")
 
     assert len(recovered) == 1
     assert len(read_document(recovered[0])["ticks"]) == len(tick_series)
+
+
+def test_one_undeletable_log_does_not_end_the_recovery(
+    tmp_path: Path,
+    tick_series: List[TickData],
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Recovery runs in main.py's startup path without a guard of its own, so an
+    exception here means the collector does not start at all.
+
+    On Windows a handle held by anything else - antivirus, a backup agent, a
+    second instance the lock did not catch - makes a refused unlink reachable.
+    One log that will not go must cost that log's cleanup, not the other
+    symbols' recovery.
+    """
+    for symbol in ("BTCUSD", "ETHUSD"):
+        writer = JsonTickWriter(
+            output_dir=tmp_path, symbol=symbol, clock=CollectionClock(),
+            broker="Kraken", server="kraken_websocket",
+            broker_type="kraken_spot", max_ticks_per_file=50000,
+            data_collector="kraken")
+        for tick in tick_series:
+            writer.write_tick(tick)
+        del writer
+
+    assert len(wal_files(tmp_path)) == 2
+
+    real_unlink = Path.unlink
+
+    def refuse_one(self, *args, **kwargs):
+        if self.name.startswith("BTCUSD"):
+            raise PermissionError(32, "held by another process")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_one)
+
+    recovered = recover_orphaned_buffers(tmp_path, "kraken")
+
+    assert len(recovered) == 2, "both symbols must still be rebuilt"
+    assert len(wal_files(tmp_path)) == 1, "only the undeletable log remains"
+    assert wal_files(tmp_path)[0].name.startswith("BTCUSD")

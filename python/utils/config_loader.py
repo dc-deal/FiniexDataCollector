@@ -170,6 +170,24 @@ class PathsConfig(BaseModel):
     logs_dir: str = "./logs"
 
 
+class ApiConfig(BaseModel):
+    """
+    Status API configuration.
+
+    Args:
+        enabled: Whether to serve the API at all
+        host: Interface to bind. Loopback by design - a reverse proxy terminates
+            TLS and forwards here, and the port never gets a firewall rule
+        port: Loopback port
+        tokens: Consumer credentials, `name -> {token, grants, active, note}`.
+            Belongs in the gitignored user_configs overlay, never here
+    """
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=8110, ge=1024, le=65535)
+    tokens: Dict[str, Any] = Field(default_factory=dict)
+
+
 class MonitoringConfig(BaseModel):
     """
     Monitoring configuration for disk space and folder scanning.
@@ -199,6 +217,7 @@ class AppConfig(BaseModel):
         telegram: Telegram alerts configuration
         scheduler: Scheduler configuration
         monitoring: Monitoring configuration
+        api: Status API configuration
     """
     app_name: str = "FiniexDataCollector"
     version: str = "1.1.0"
@@ -211,6 +230,7 @@ class AppConfig(BaseModel):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
 
 
 class ConfigLoader:

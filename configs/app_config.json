@@ -58,5 +58,11 @@
     "disk_space_check_interval_seconds": 60,
     "folder_scan_interval_seconds": 60,
     "reconnect_alert_cooldown_minutes": 30
+  },
+  "api": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 8110,
+    "tokens": {}
   }
 }

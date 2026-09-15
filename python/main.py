@@ -20,8 +20,13 @@ from typing import Optional, List
 
 import psutil
 
+from python.api.api_app import create_api
+from python.api.build_info import sample_build_info
+from python.api.stats_serializer import health_payload, serialize_stats
+from python.api.token_loader import load_token_registry
 from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
+from python.utils.instance_lock import InstanceLock
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import setup_logging, get_logger
 from python.utils.live_display import LiveDisplay
@@ -156,6 +161,8 @@ class FiniexDataCollector:
         self._writers = {}
         self._clock: Optional[CollectionClock] = None
         self._telegram: Optional[TelegramAlertProvider] = None
+        self._instance_lock: Optional[InstanceLock] = None
+        self._api_server = None
         self._scheduler: Optional[WeeklyJobScheduler] = None
 
         # Live monitoring
@@ -222,6 +229,10 @@ class FiniexDataCollector:
 
         self._is_running = True
 
+        # Status API, after the collectors so it answers about a running system
+        if self._config.api.enabled:
+            await self._start_status_api()
+
         # Start live display
         self._live_display = LiveDisplay(
             self._stats,
@@ -235,6 +246,50 @@ class FiniexDataCollector:
 
         # Cleanup
         await self._shutdown()
+
+    async def _start_status_api(self) -> None:
+        """
+        Serve the status API on the loopback interface.
+
+        Runs as a task on the collector's own event loop. A failure here must
+        never reach the collection: a status surface that takes the collector
+        down with it is worse than no status surface.
+        """
+        import uvicorn
+
+        from python.types.tick_types import DATA_FORMAT_VERSION
+
+        app = create_api(
+            build=sample_build_info(self._config.version, DATA_FORMAT_VERSION),
+            health_provider=lambda: health_payload(self._stats),
+            detail_provider=lambda: serialize_stats(self._stats),
+            registry=load_token_registry(self._config.api.tokens),
+            # The effective configuration, after the user overlay is merged.
+            # Secrets are stripped in the route, not here - the redaction rule
+            # belongs where it can be tested against a planted credential.
+            config_provider=lambda: self._config.model_dump(mode="json"),
+            raw_data_dir=Path(self._config.paths.raw_data_dir),
+            log_dir=Path(self._config.paths.logs_dir)
+        )
+
+        self._api_server = uvicorn.Server(uvicorn.Config(
+            app,
+            host=self._config.api.host,
+            port=self._config.api.port,
+            log_level="warning",
+            access_log=False
+        ))
+
+        async def serve() -> None:
+            try:
+                await self._api_server.serve()
+            except Exception as e:
+                self._logger.error(f"Status API stopped: {e}")
+
+        self._monitoring_tasks.append(asyncio.create_task(serve()))
+        self._logger.info(
+            f"Status API on http://{self._config.api.host}:"
+            f"{self._config.api.port}")
 
     async def _start_monitoring_tasks(self) -> None:
         """Start background monitoring tasks."""
@@ -447,6 +502,12 @@ class FiniexDataCollector:
 
         # Create writers for each symbol
         raw_dir = Path(self._config.paths.raw_data_dir)
+
+        # Claim the directory before touching anything in it. Recovery below
+        # cannot distinguish a crashed run's write-ahead log from a running
+        # instance's, and on Linux it would delete the live one.
+        self._instance_lock = InstanceLock(raw_dir)
+        self._instance_lock.acquire()
 
         # Before collecting: turn any write-ahead log left by a crashed run into
         # an archive file. Must happen before the writers open new ones, or the
@@ -883,6 +944,16 @@ class FiniexDataCollector:
                     filename=filepath.name,
                     tick_count=tick_count
                 )
+
+        # Ask the API to finish before the tasks are cancelled, so an in-flight
+        # request is answered rather than dropped.
+        if self._api_server:
+            self._api_server.should_exit = True
+
+        # Released after the writers, so the directory stays claimed until the
+        # last file is on disk.
+        if self._instance_lock:
+            self._instance_lock.release()
 
         # Stop scheduler
         if self._scheduler:

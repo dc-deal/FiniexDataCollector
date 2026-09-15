@@ -37,3 +37,12 @@ aiohttp>=3.9.0
 
 # Task Scheduling
 apscheduler>=3.10.0
+
+# Status API — loopback only; a reverse proxy terminates TLS in front of it.
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# Shared auth — bearer tokens with per-surface grants, one implementation with the
+# Testing IDE and the RAG engine. Pinned by tag; in development it is installed
+# editable from the sibling checkout.
+finiex-auth @ git+https://github.com/dc-deal/finiex-modules-auth.git@v0.3.0
