@@ -10,7 +10,7 @@
   },
   "logging": {
     "console_level": "INFO",
-    "file_level": "DEBUG"
+    "file_level": "INFO"
   },
   "kraken": {
     "enabled": true,
@@ -34,7 +34,7 @@
     ],
     "reconnect_max_delay_seconds": 60,
     "reconnect_initial_delay_seconds": 1,
-    "heartbeat_interval_seconds": 30,
+    "heartbeat_interval_seconds": 10,
     "max_ticks_per_file": 50000
   },
   "mt5": {

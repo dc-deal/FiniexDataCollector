@@ -111,12 +111,3 @@ class AbstractTickWriter(ABC):
         """
         pass
 
-    @abstractmethod
-    def get_lock_filepath(self) -> Optional[Path]:
-        """
-        Get path to lock file for current active file.
-
-        Returns:
-            Path to .lock file
-        """
-        pass

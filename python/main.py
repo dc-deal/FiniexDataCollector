@@ -37,6 +37,30 @@ from python.alerts.telegram_bot import TelegramAlertProvider
 from python.scheduler.weekly_jobs import WeeklyJobScheduler
 
 
+# Statuses a connection can come back FROM. "failed" belongs here: a connect
+# attempt that failed and later succeeded is a reconnect, and the production log
+# carried eight of those alongside the forced ones.
+RECONNECT_FROM = ("disconnected", "reconnecting", "failed")
+
+
+def is_reconnect(old_status: str, new_status: str) -> bool:
+    """
+    Decide whether a status change is a completed reconnect.
+
+    Named rather than inlined because it was wrong and silent: the collector
+    reported zero reconnects for 173 of them, and an inline condition offers
+    nothing to test.
+
+    Args:
+        old_status: Status before the change
+        new_status: Status after the change
+
+    Returns:
+        True when the connection has just come back
+    """
+    return new_status == "connected" and old_status in RECONNECT_FROM
+
+
 def validate_symbols(symbols: List[str]) -> None:
     """
     Validate symbols list for duplicates.
@@ -489,8 +513,8 @@ class FiniexDataCollector:
                 f"[DISCONNECT] Tracked disconnect at {self._disconnect_time} (status={status})"
             )
 
-        # Track reconnects (any transition back to 'connected' after being disconnected)
-        if status == "connected" and old_status in ["disconnected", "reconnecting"]:
+        # Track reconnects
+        if is_reconnect(old_status, status):
             if self._disconnect_time:
                 duration = (datetime.now(timezone.utc) -
                             self._disconnect_time).total_seconds()

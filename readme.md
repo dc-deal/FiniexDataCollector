@@ -39,8 +39,8 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 - **MT5-Compatible JSON** - Identical structure to TickCollector.mq5 output
 - **Configurable Rotation** - Files close at N ticks (default: 50,000)
 - **Atomic Writes** - a `*_ticks.json` never exists in a partial state: it is written to a
-  temp file and renamed into place. This is what protects a consumer, not the `.lock`
-  sidecar, which nothing reads. Do not "simplify" it into a direct write to the final path.
+  temp file and renamed into place. This is the guarantee a consumer relies on. Do not
+  "simplify" it into a direct write to the final path.
 - **Write-Ahead Log** - every tick is appended to a `.jsonl.part` sidecar before it counts as
   collected, and that log is removed only after the archive file exists. A crash costs the
   last tick rather than the whole buffer; the next start rebuilds the file from the log.
@@ -306,11 +306,11 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
 
 ```
 {SYMBOL}_{YYYYMMDD}_{HHMMSS}_ticks.json
-{SYMBOL}_{YYYYMMDD}_{HHMMSS}_ticks.json.lock  (active file)
+{SYMBOL}_{YYYYMMDD}_{HHMMSS}_ticks.jsonl.part  (write-ahead log of the open file)
 
 Example:
 BTCUSD_20250113_143052_ticks.json
-BTCUSD_20250113_143052_ticks.json.lock
+BTCUSD_20250113_143052_ticks.jsonl.part
 ```
 
 ---

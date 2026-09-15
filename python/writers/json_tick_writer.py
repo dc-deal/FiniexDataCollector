@@ -15,7 +15,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, TextIO
 
@@ -48,7 +48,7 @@ class JsonTickWriter(AbstractTickWriter):
     Writes tick data to JSON files in MT5-compatible format.
 
     File naming: {SYMBOL}_{YYYYMMDD}_{HHMMSS}_ticks.json
-    Lock files: {SYMBOL}_{YYYYMMDD}_{HHMMSS}_ticks.json.lock
+    Write-ahead log: {SYMBOL}_{YYYYMMDD}_{HHMMSS}_ticks.jsonl.part
     """
 
     def __init__(
@@ -88,12 +88,16 @@ class JsonTickWriter(AbstractTickWriter):
 
         # Current file state
         self._current_file: Optional[Path] = None
-        self._current_lock: Optional[Path] = None
         self._ticks_buffer: List[TickData] = []
         self._file_start_time: Optional[datetime] = None
         self._file_start_local_time: Optional[datetime] = None
         self._file_start_resyncs = 0
         self._file_start_max_correction_ms = 0
+        # UTC day this file covers, taken from its FIRST tick rather than from
+        # the wall clock at open: both come from the same session clock in
+        # production, but deriving it from the data keeps the file self
+        # consistent whatever the clock is doing.
+        self._file_day: Optional[str] = None
         self._errors: List[Dict[str, Any]] = []
 
         # Write-ahead log: every tick lands here the moment it arrives, so a
@@ -121,6 +125,13 @@ class JsonTickWriter(AbstractTickWriter):
         if self._current_file is None:
             self._start_new_file()
 
+        # The day boundary is checked BEFORE the tick is appended, unlike the
+        # tick-count threshold below. Checked after, the first tick of the new
+        # day would land in the previous day's file and only then trigger the
+        # rotation - which is precisely the property a daily close exists to
+        # provide.
+        self._roll_to_new_day(tick)
+
         # Write-ahead before counting it as collected
         self._append_to_wal(tick)
 
@@ -132,6 +143,43 @@ class JsonTickWriter(AbstractTickWriter):
         # Check rotation
         if self.needs_rotation():
             self.rotate_file()
+
+    def _roll_to_new_day(self, tick: TickData) -> None:
+        """
+        Close the current file when a tick belongs to a later UTC day.
+
+        A file bounded only by tick count can span several days, which makes any
+        age-based retention rule ambiguous and leaves the question open whether
+        more will arrive for a date already read. A file that covers exactly one
+        UTC day is final the moment that day ends.
+
+        The day comes from the tick's arrival (`collected_msc`) and is fixed by
+        the file's FIRST tick. Comparing against the wall clock at file open
+        would mix two sources that agree in production and nowhere else.
+
+        Args:
+            tick: The tick about to be written
+        """
+        if self._current_file is None:
+            return
+
+        tick_day = datetime.fromtimestamp(
+            tick.collected_msc / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+        if self._file_day is None:
+            self._file_day = tick_day
+            return
+
+        if tick_day == self._file_day:
+            return
+
+        if self._ticks_buffer:
+            self.rotate_file()
+        else:
+            # Nothing collected yet - reopen under the new day's name rather
+            # than logging a rotation that produced no file.
+            self._close_wal(delete=True)
+            self._start_new_file()
 
     def rotate_file(self) -> Optional[Path]:
         """
@@ -169,23 +217,27 @@ class JsonTickWriter(AbstractTickWriter):
         """Get path to current active file."""
         return self._current_file
 
-    def get_lock_filepath(self) -> Optional[Path]:
-        """Get path to lock file."""
-        return self._current_lock
-
     def _start_new_file(self) -> None:
-        """Initialize new tick file with lock."""
+        """Initialize new tick file and its write-ahead log."""
         now = datetime.now(timezone.utc)
-        timestamp = now.strftime("%Y%m%d_%H%M%S")
 
-        filename = f"{self._symbol}_{timestamp}_ticks.json"
-        lock_filename = f"{filename}.lock"
+        # The name has second resolution, so two rotations of one symbol inside
+        # the same second would collide and the second file would overwrite the
+        # first at finalize - silently. Implausible at 50,000 ticks per file and
+        # reachable the moment a day boundary cuts one, so the stamp is advanced
+        # until the name is free. It is an identifier, not data: the true open
+        # time is in `start_time`, and the consuming importer orders files by
+        # their tick bounds rather than by their names.
+        stamp = now
+        while True:
+            filename = f"{self._symbol}_{stamp.strftime('%Y%m%d_%H%M%S')}_ticks.json"
+            candidate = self._symbol_dir / filename
+            if not candidate.exists() and not candidate.with_suffix(
+                    ".jsonl.part").exists():
+                break
+            stamp += timedelta(seconds=1)
 
-        self._current_file = self._symbol_dir / filename
-        self._current_lock = self._symbol_dir / lock_filename
-
-        # Create lock file
-        self._current_lock.touch()
+        self._current_file = candidate
 
         # Reset state. The anchor counters are cumulative over the session, so
         # the opening state is captured here and the closing state is read at
@@ -194,6 +246,7 @@ class JsonTickWriter(AbstractTickWriter):
         self._file_start_local_time = datetime.now()
         self._file_start_resyncs = self._clock.resyncs
         self._file_start_max_correction_ms = self._clock.max_correction_ms
+        self._file_day = None
         self._ticks_buffer = []
         self._current_tick_count = 0
         self._errors = []
@@ -211,8 +264,6 @@ class JsonTickWriter(AbstractTickWriter):
         """
         if not self._current_file or not self._ticks_buffer:
             self._close_wal(delete=True)
-            if self._current_lock and self._current_lock.exists():
-                self._current_lock.unlink()
             return self._current_file
 
         # Build file content
@@ -233,16 +284,11 @@ class JsonTickWriter(AbstractTickWriter):
         # recoverable, a window with it in neither is not.
         self._close_wal(delete=True)
 
-        # Remove lock file
-        if self._current_lock and self._current_lock.exists():
-            self._current_lock.unlink()
-
         self._files_created += 1
         completed_file = self._current_file
 
         # Reset state
         self._current_file = None
-        self._current_lock = None
         self._ticks_buffer = []
 
         self._logger.info(
@@ -707,11 +753,6 @@ def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path
             continue
 
         wal_path.unlink()
-
-        lock_path = archive_path.with_suffix(".json.lock")
-        if lock_path.exists():
-            lock_path.unlink()
-
         recovered.append(archive_path)
         logger.info(
             f"Recovered {archive_path.name} from its write-ahead log "

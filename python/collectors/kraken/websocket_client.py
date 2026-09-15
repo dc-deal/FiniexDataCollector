@@ -361,6 +361,12 @@ class KrakenWebSocketClient(AbstractCollector):
                 if silence > self._heartbeat_interval * 3:
                     self._logger.error(
                         "Connection appears dead, forcing reconnect")
+                    # Announce it before closing. close() is a CLEAN close, so
+                    # the receive loop ends without raising and the handler that
+                    # would set this status never runs - which left the status
+                    # at "connected" across every forced reconnect. Measured on
+                    # the production log: 173 forced reconnects, 0 recorded.
+                    self._set_status("reconnecting")
                     if self._websocket:
                         await self._websocket.close()
                     break

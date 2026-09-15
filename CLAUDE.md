@@ -32,9 +32,17 @@ Every line is reviewed by the operator before it is committed. The assistant nev
   chat about a runbook still produces an English runbook.
   **Gitignored is not an exemption.** `ISSUE_*.md`, `INTERNAL_*.md` and `SESSION_*.md` are
   artifacts too — private, not exempt.
-- **Verify before reporting.** A claim about this repository is checked against this
-  repository. A claim about the consuming project is checked against its validator, not
-  against a copy of its rules kept here — a copy drifts, the original is the gate.
+- **Verify before reporting — against the repository, never against memory of it.** A claim
+  about this repository is checked by reading this repository. A claim about the consuming
+  project is checked against its validator, not against a copy of its rules kept here.
+  Measured 2026-09-15: three corrections had to be sent to another project in two days, and
+  all three were statements made from an intention rather than a check — a commit hash that
+  was never pushed, three files that had been deleted, and a README line reported as fixed
+  that had never been touched. Each cost one grep to prevent.
+- **A closing summary states what IS, not what was meant.** "Corrected:" and "Fixed:" are
+  claims about the working tree; confirm them there before writing them down. The operator
+  reviews the diff against the report, so an item listed as done and absent from the diff
+  costs more attention than it saved.
 - **Measure rather than assume.** Several decisions in this project were made from numbers
   taken off the real archive (spread distribution, arrival lag, quote staleness). When a
   number is cheap to obtain, obtain it.
@@ -147,16 +155,26 @@ the authority: before calling a format change done, run the real
 `TickImportValidator.validate_file()` from FiniexTestingIDE against files a live collector
 actually wrote.
 
-### Atomic writes are load-bearing; `.lock` files are not
+### Durability: two mechanisms, different jobs
 
-`_atomic_write()` creates the file with `tempfile.mkstemp(suffix=".tmp")` in the target
-directory and `os.replace()`s it into place at finalize. A `*_ticks.json` therefore **never
-exists in a partial state** — there is no window in which a consumer can read half a file.
+**Atomic write protects the reader.** `_atomic_write()` creates the file with
+`tempfile.mkstemp(suffix=".tmp")` in the target directory and `os.replace()`s it into place, so
+a `*_ticks.json` **never exists in a partial state**. Do not "simplify" it into a direct
+`json.dump` to the final path.
 
-The `.lock` sidecar is decoration. No consumer reads it. Do not "simplify" the atomic write
-into a direct `json.dump` to the final path: the lock file would not catch what that breaks.
+**The write-ahead log protects the data.** Every tick is appended to a `.jsonl.part` sidecar
+and flushed before it counts as collected, and that log is deleted **after** the archive file
+is written, never before. A window with the data in two places is recoverable; a window with
+it in neither is not.
 
----
+Both are explained in `docs/architecture/durability.md`, including every recovery case. Read
+it before touching `_finalize_current_file()` or `recover_orphaned_buffers()` — the ordering
+looks arbitrary and is not, and on the happy path both orderings end identically, which is
+what makes the wrong one survive a review.
+
+The `.lock` sidecar was **removed** in 1.6.0. Nothing ever read it — not here, not in the
+consuming project — while the README claimed it prevented processing of active files. The
+write-ahead log now marks an open file and carries its contents.
 
 ## The time model
 
@@ -206,6 +224,31 @@ against a cost that does not exist.
 
 ---
 
+## Documentation
+
+Docs live in `docs/`, and `docs/documentation_index.md` is the navigation point — links only,
+order within a section is reading priority. **Keeping them current is not optional**, the same
+way tests are not.
+
+- `docs/architecture/` — the output contract, the time model, durability
+- `docs/operations/` — running the collector
+- `docs/tests/` — what each suite defends and why it exists
+
+Three rules carried over from the sister projects, because they are what keeps a doc worth
+reading:
+
+- **Open with the problem, not a label**, and say what is NOT in the document. A reader who
+  landed in the wrong file should find that out in the first three lines.
+- **A document that carries a convention is named HERE in the same change.** A guide nobody is
+  pointed at is a guide nobody follows. This applies to corrections too: if a fix changes what
+  a future session should believe, it is not finished until the place that session reads has
+  been updated.
+- **No maintained counts in prose.** Not in a heading, not in a sentence. What counts at
+  runtime may count; what a human has to keep in step will go stale.
+
+New structures and features get documented; a touched flow gets its doc updated. A new test
+suite gets an entry in `docs/tests/test_overview.md` in the same change.
+
 ## Code conventions
 
 - **Double quotes**, `autopep8` + `isort`. The sister projects are on `ruff` with single
@@ -233,10 +276,14 @@ against a cost that does not exist.
 - **Time is driven, not waited for.** The `steerable_clock` fixture patches the clock's time
   source so a backwards NTP step is provoked deterministically. Waiting for a real one is
   not a test strategy.
-- **Mutation-check new tests.** After writing a test for a guard, break the guard and
-  confirm the test fails. A suite that stays green when the clamp is disabled is decoration.
-  This caught a genuinely weak test: it collected its samples only *after* the clock step,
-  so the series looked monotonic either way.
+- **Mutation-check new tests, every time.** After writing a test for a guard, break the guard
+  and confirm the test fails. This has caught four tests that were green against a broken
+  implementation, two of them written the same hour: one collected its samples only *after*
+  the clock step so the series looked monotonic either way; one exercised an overwrite guard
+  with a log that had no ticks, so a different branch spared the file; and the write-ahead
+  ordering could not fail on the happy path at all — it needed a write that throws.
+  **A guard whose failure mode only appears when something else fails needs a test that makes
+  that something else fail.**
 - **Test the contract, not the implementation.** The invariant tests assert what the
   importer enforces, so they keep meaning after a refactor.
 
@@ -247,6 +294,19 @@ against a cost that does not exist.
 `docker-compose.yml` mounts `~/.claude` into the container. Without it, a rebuild deletes
 every session transcript — silently, with no prompt. A sister project lost an entire
 project history that way.
+
+**The mount protects against a rebuild, not against switching environments.** A session's
+transcript folder is derived from the working directory, which is `/app` in the container
+and the Windows path on the host — two folders for one session id. A session continued in
+the other environment finds only the half written there; measured 2026-09-15 on one session
+split 3313 / 1748 entries, with 1565 reachable from one side only. **Pick one environment
+per project and stay in it.** The container is the one to pick: the bus tool server resolves
+`/bus`, which exists nowhere else. All containers share `/app`, so several projects' sessions
+land in one folder — an inconvenience, not a loss.
+
+Transcripts are archived daily by a scheduled task into `~/.claude/conversation_backups/`,
+verified by checksum. That archive is what survives a mistake in any of the above; the
+folder's README carries the restore command.
 
 Docker here is the **development** environment: the compose service runs
 `tail -f /dev/null` and never starts the collector. Production runs from a virtualenv on
@@ -278,6 +338,10 @@ with it, because the bus has no locking and no read receipts:
   between reading a thread and writing into it is where crossed messages are born.
 - **Name your session in the first line of every message**: `[chat: <first 8 of the session
   id> · <what this chat is working on>]`, then a blank line, then the message.
+
+**Never name a commit hash before it is on the remote.** A local hash is invisible to the
+recipient and can be rewritten under them by an amend — which is exactly what happened to the
+1.6.0 announcement. Announce the version, and send the hash when it is pushed.
 
 This peer is `datacollector`. Setup lives in `.mcp.json` (gitignored; `.mcp.json.example` is
 the tracked counterpart) and the `/bus` mount in `docker-compose.yml`, indirected through
@@ -319,11 +383,64 @@ tests/
 configs/                tracked defaults; user_configs/ overlays them and is gitignored
 ```
 
+**Archive boundaries:** a file closes at `max_ticks_per_file` or at the UTC day boundary,
+whichever comes first, and therefore covers exactly one day. `docs/architecture/output_contract.md`
+has the reasoning; the day cut is checked *before* a tick is appended, unlike the count.
+
 **Configuration overlay:** `configs/app_config.json` is the tracked baseline with every
 credential blank and disabled; `user_configs/app_config.json` overrides it by deep merge and
 is gitignored. A live credential must never appear in the tracked file.
 
 ---
+
+## The closing report
+
+**It is the only thing guaranteed to be read.** A long turn scrolls, a session is resumed, a
+compaction folds the middle away — so a finding, a measurement or a question posted along the
+way cannot be assumed to have arrived. The report is not a summary of what the operator
+already knows; it is the first and possibly only delivery. Repeat rather than reference: "as
+mentioned above" points at something that may not be visible.
+
+**Fixed structure, in this order.** The further up, the more decision it carries. A section
+with nothing in it is omitted, never printed empty.
+
+1. **Which issue** — the number, which PART of it, and explicitly what is NOT in it. Ends
+   with a **proposed commit message**, ready to paste into `git commit -m`: ONE short line,
+   roughly 50-70 characters, naming what changed rather than repeating the issue's title.
+   Where the work splits into commits a reviewer would want apart — a behaviour change sitting
+   beside a rename, say — propose one line per commit and say which goes first and why. Never
+   an attribution trailer of any kind; the assistant proposes the text and never commits.
+2. **Suite** — the pass count and how the delta accounts for itself.
+3. **What was built** — with the measurements.
+4. **What to watch in the review** — where the work is least certain, where it deviated from
+   the plan, and above all **what could not be verified here**. This project cannot exercise
+   the production platform: the dev container is Linux, the server is Windows. Signal
+   handling, console encoding and anything touching `.ps1` is unverified by construction, and
+   that line is what decides where the operator spends their attention.
+5. **Open findings** — full format.
+6. **Open minors** — one numbered line each.
+7. **Fixed directly** — one line each, with its finding number.
+8. **Open questions** — re-asked until answered, in their own section so they cannot sink
+   into prose.
+
+**Findings are numbered continuously across the session, and a number is permanent.** It
+identifies that one finding, is never reused, and never shifts when another closes — which is
+what makes "Befund 7" mean the same thing in an hour. Only OPEN findings are presented, so a
+list has gaps, and a gap is information: that number is closed, not missing.
+
+**Every presented finding carries four things:**
+
+1. a link **with a line anchor** — `path/to/file.py#L78-L88`, never a bare path. A config file
+   is no exception. A finding without a location moves the search to the operator.
+2. **(a) urgency** — `EMPFOHLEN` / `KANN WARTEN` / `NUR WENN X`, with the reason in the line.
+3. **(b) effort** — `KLEIN` / `MITTEL` / `GROSS`.
+4. **(c) confidence in %**.
+
+**Confidence in the FINDING and confidence in the FIX are two numbers.** An item can be a
+provable defect at 100 % whose repair is a design decision at 60 % — and then it is reported,
+not built. A fix is taken directly only at effort KLEIN **and** ≥ 97 % on a low-risk item, and
+**every direct fix is named in the report with its number**: a change nobody announced is
+indistinguishable from one nobody asked for.
 
 ## After each feature (five-point review)
 
@@ -331,7 +448,8 @@ is gitignored. A live credential must never appear in the tracked file.
 each needs — the operator decides and applies:
 
 1. **Tests** — new behaviour gets tests; changed behaviour updates them; mutation-check them.
-2. **Docs** — new structures get documented, touched flows get their doc updated.
+2. **Docs** — new structures get documented, touched flows get their doc updated, a new
+   test suite gets its entry in `docs/tests/test_overview.md`. See the Documentation section.
 3. **README** — check whether the change touches it (status, quickstart, output format).
 4. **Issues** — fold implementation decisions and deviations back into the issue the work
    came from.
