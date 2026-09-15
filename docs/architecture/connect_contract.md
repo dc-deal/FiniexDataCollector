@@ -119,6 +119,21 @@ indistinguishable from a deliberate decision six months later.
 peer; a credential there is a credential shared with everyone. Tokens are handed over out
 of band, and the bus carries only the fact that one exists and what it holds.
 
+## Revoking one
+
+**The registry is read once, at startup. Deleting a token from the configuration does not
+revoke it until the collector restarts.** Measured rather than assumed: a token removed
+from `user_configs/` kept answering `200` until the process was restarted, then `401`.
+
+That matters when it matters most. A credential believed to be withdrawn but still
+accepted is worse than one nobody touched, because the belief stops anyone looking. So a
+revocation is not finished when the file is edited — it is finished when the process has
+been restarted and the old token has been confirmed to answer `401`.
+
+The collector is safe to restart: ticks in flight are in the write-ahead log, the next
+start rebuilds the file from it, and a graceful stop writes the archive file first. What a
+restart costs is a gap of a few seconds in the tick series, not data.
+
 ## Alternative: the environment
 
 ```

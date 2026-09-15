@@ -72,7 +72,8 @@ def write_archive_file(
     directory: Path,
     name: str,
     resyncs_open: int = 0,
-    resyncs_close: int = 0
+    resyncs_close: int = 0,
+    tick_count: int = 2
 ) -> None:
     """
     Plant one archive file.
@@ -82,6 +83,7 @@ def write_archive_file(
         name: File name
         resyncs_open: Anchor counter in the header
         resyncs_close: Anchor counter in the summary
+        tick_count: How many ticks to write, for tests that need a realistic size
     """
     directory.mkdir(parents=True, exist_ok=True)
     (directory / name).write_text(json.dumps({
@@ -93,11 +95,15 @@ def write_archive_file(
             "anchor_resyncs": resyncs_open
         },
         "ticks": [
-            {"time_msc": 1789000000000, "collected_msc": 1789000000007},
-            {"time_msc": 1789000001000, "collected_msc": 1789000001009}
+            {"time_msc": 1789000000000 + i * 1000,
+             "collected_msc": 1789000000007 + i * 1000,
+             "bid": 45000.0 + i, "ask": 45010.0 + i, "last": 45005.0 + i,
+             "spread_points": 100, "spread_pct": 0.022,
+             "quote_age_ms": 249, "tick_flags": "BUY", "session": "24h"}
+            for i in range(tick_count)
         ],
         "summary": {
-            "total_ticks": 2,
+            "total_ticks": tick_count,
             "anchor": {"resyncs": resyncs_close, "max_correction_ms": 1}
         }
     }), encoding="utf-8")
@@ -406,6 +412,11 @@ def download_client(tmp_path: Path) -> TestClient:
     raw = tmp_path / "raw"
     kraken = raw / "kraken"
     write_archive_file(kraken, "BTCUSD_20260915_100000_ticks.json")
+    # Above the compression threshold. The two-tick file above is 371 bytes and
+    # is left uncompressed, so a compression test using it would pass for the
+    # wrong reason.
+    write_archive_file(
+        kraken, "SOLUSD_20260915_100000_ticks.json", tick_count=400)
     (kraken / "ETHUSD_20260915_110000_ticks.jsonl.part").write_text(
         '{"symbol": "ETHUSD"}\n', encoding="utf-8")
     (kraken / ".collector.lock").write_text("{}", encoding="utf-8")
@@ -547,3 +558,70 @@ def test_a_path_escaping_the_archive_is_refused_even_if_the_name_passes(
         tmp_path / "raw", "kraken", "../../secret.json")
 
     assert escaped is None, "a resolved path outside the archive was served"
+
+
+# =============================================================================
+# TRANSFER
+# =============================================================================
+
+def test_a_large_response_is_compressed_when_asked(
+    download_client: TestClient
+) -> None:
+    """
+    Tick JSON is the same keys on every line and compresses about twentyfold.
+    Over a link this is the difference between a gigabyte a week and forty
+    megabytes.
+    """
+    response = download_client.get(
+        "/v1/files/SOLUSD_20260915_100000_ticks.json",
+        headers={**dl_headers(), "Accept-Encoding": "gzip"})
+
+    assert response.status_code == 200
+    assert response.headers.get("content-encoding") == "gzip"
+
+
+def test_a_client_that_does_not_ask_gets_plain_json(
+    download_client: TestClient
+) -> None:
+    """
+    Negotiated, not imposed. A consumer written before this existed keeps
+    working unchanged, which is what makes it safe to add without a version.
+    """
+    response = download_client.get(
+        "/v1/files/SOLUSD_20260915_100000_ticks.json",
+        headers={**dl_headers(), "Accept-Encoding": "identity"})
+
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+
+
+def test_compression_does_not_change_what_arrives(
+    download_client: TestClient
+) -> None:
+    """
+    The register's SHA-256 is over the uncompressed file. A client decodes
+    before it hashes, so the digest has to survive the round trip - otherwise
+    every verified transfer would fail exactly when compression is on.
+    """
+    import hashlib
+
+    entry = download_client.get(
+        "/v1/archive?with_checksum=true", headers=dl_headers()).json()["files"][0]
+
+    body = download_client.get(
+        f"/v1/files/{entry['file']}",
+        headers={**dl_headers(), "Accept-Encoding": "gzip"}).content
+
+    assert hashlib.sha256(body).hexdigest() == entry["sha256"]
+
+
+def test_a_tiny_response_is_left_alone(download_client: TestClient) -> None:
+    """
+    Below the threshold the gzip header costs more than it saves. /v1/health is
+    about a hundred bytes and is polled on an interval.
+    """
+    response = download_client.get(
+        "/v1/health", headers={"Accept-Encoding": "gzip"})
+
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers

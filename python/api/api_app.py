@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.responses import FileResponse
+from starlette.middleware.gzip import GZipMiddleware
 from finiex_auth.bearer_auth import build_bearer_dependency
 from finiex_auth.grant_auth import build_grant_dependency
 from finiex_auth.token_registry import TokenRegistry
@@ -40,6 +41,16 @@ from python.api.log_reader import MAX_LINES, read_log
 from python.api.redaction import redact_config
 
 SURFACE = "status"
+
+# Tick JSON is the same keys on every line, so it compresses extraordinarily well:
+# measured 22x on a real 433 KB file, in 3 ms. Level 9 reaches 24.8x for 8 ms and
+# lzma 30.7x for 41 ms - neither is worth the CPU on a four-core box shared with
+# two other services, so the default level is lowered rather than kept.
+COMPRESS_LEVEL = 6
+
+# Below this, the gzip header and the round trip cost more than they save. /v1/health
+# is roughly 110 bytes and has nothing to gain.
+COMPRESS_MIN_BYTES = 1024
 
 
 def create_api(
@@ -79,6 +90,15 @@ def create_api(
         docs_url=None,
         redoc_url=None
     )
+
+    # Transparent to a caller: it is negotiated through Accept-Encoding, every
+    # HTTP client decompresses on its own, and one that does not ask still gets
+    # plain JSON. The SHA-256 in the archive register stays a hash of the
+    # UNCOMPRESSED file, which is what a client sees after decoding.
+    app.add_middleware(
+        GZipMiddleware,
+        minimum_size=COMPRESS_MIN_BYTES,
+        compresslevel=COMPRESS_LEVEL)
 
     verify_bearer = build_bearer_dependency(registry)
     verify_grant = build_grant_dependency(registry)

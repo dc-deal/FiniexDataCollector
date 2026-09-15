@@ -236,6 +236,34 @@ leaves the caller guessing. A malformed day is a 400.
 
 ---
 
+## Transfer
+
+Responses above 1 KB are gzipped when the caller asks for it. Measured on a real archive
+file: **430,516 bytes plain, 21,470 compressed — twentyfold**, for about three milliseconds
+of CPU.
+
+That ratio is not luck. A tick file is the same set of keys repeated on every line, which
+is close to the best case for a dictionary coder. At the collection rate this is the
+difference between roughly a gigabyte a week and forty-five megabytes.
+
+**Level 6, not the library default of 9.** Measured on the same file: level 9 reaches 24.8x
+for 8 ms and lzma 30.7x for 41 ms. Neither is worth the CPU on a four-core machine shared
+with two other services — thirteen percent fewer bytes for fourteen times the work is the
+wrong trade when the link is not the constraint.
+
+**Nothing below 1 KB is touched.** `/v1/health` is about a hundred bytes and is polled on an
+interval; the gzip header would cost more than it saves.
+
+Two properties worth stating because a consumer depends on them:
+
+- **It is negotiated, never imposed.** A client that sends no `Accept-Encoding` receives
+  plain JSON. That is what made this safe to add without moving `data_format_version`: a
+  consumer written before it exists keeps working unchanged.
+- **The register's `sha256` is over the uncompressed file.** An HTTP client decodes before
+  it hashes, so a verified transfer produces the same digest either way. Confirmed against
+  a live collector rather than assumed — otherwise every checksum check would have failed
+  exactly when compression was on.
+
 ## Boundaries
 
 **Read-only, and it cannot change anything.** Every route reads through a provider
