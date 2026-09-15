@@ -17,7 +17,7 @@ import tempfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, TextIO
 
 from python.writers.base import AbstractTickWriter
 from python.types.tick_types import (
@@ -96,6 +96,14 @@ class JsonTickWriter(AbstractTickWriter):
         self._file_start_max_correction_ms = 0
         self._errors: List[Dict[str, Any]] = []
 
+        # Write-ahead log: every tick lands here the moment it arrives, so a
+        # crash costs the last line rather than the whole buffer. Ticks are held
+        # in memory until rotation, which on a thin symbol can be weeks - DASHUSD
+        # needs 24 days to reach 50,000.
+        self._wal: Optional[TextIO] = None
+        self._wal_path: Optional[Path] = None
+        self._wal_resyncs = 0
+
         # Ensure output directory exists
         self._symbol_dir = self._output_dir / data_collector
         self._symbol_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +120,9 @@ class JsonTickWriter(AbstractTickWriter):
         # Initialize file if needed
         if self._current_file is None:
             self._start_new_file()
+
+        # Write-ahead before counting it as collected
+        self._append_to_wal(tick)
 
         # Add to buffer
         self._ticks_buffer.append(tick)
@@ -187,6 +198,8 @@ class JsonTickWriter(AbstractTickWriter):
         self._current_tick_count = 0
         self._errors = []
 
+        self._open_wal()
+
         self._logger.debug(f"Started new file: {filename}")
 
     def _finalize_current_file(self) -> Path:
@@ -197,6 +210,7 @@ class JsonTickWriter(AbstractTickWriter):
             Path to written file
         """
         if not self._current_file or not self._ticks_buffer:
+            self._close_wal(delete=True)
             if self._current_lock and self._current_lock.exists():
                 self._current_lock.unlink()
             return self._current_file
@@ -213,6 +227,11 @@ class JsonTickWriter(AbstractTickWriter):
                 filepath=str(self._current_file),
                 tick_count=len(self._ticks_buffer)
             )
+
+        # Only now is the data in the archive file - drop the write-ahead log
+        # after it, never before: a window with the data in two places is
+        # recoverable, a window with it in neither is not.
+        self._close_wal(delete=True)
 
         # Remove lock file
         if self._current_lock and self._current_lock.exists():
@@ -233,17 +252,95 @@ class JsonTickWriter(AbstractTickWriter):
 
         return completed_file
 
-    def _build_file_content(self) -> Dict[str, Any]:
+    def _open_wal(self) -> None:
         """
-        Build complete file content structure.
+        Open the write-ahead log for the current file and write its header.
+
+        Line 1 carries the metadata as it stands at open - `start_time`, the
+        device clock and the anchor counters. None of those can be recovered
+        afterwards, which is why they go in first rather than at finalize.
+        """
+        if not self._current_file:
+            return
+
+        self._wal_path = self._current_file.with_suffix(".jsonl.part")
+        self._wal_resyncs = self._clock.resyncs
+
+        try:
+            self._wal = self._wal_path.open("a", encoding="utf-8")
+            self._wal.write(json.dumps(
+                self._metadata_to_dict(self._build_metadata())) + "\n")
+            self._wal.flush()
+        except Exception as e:
+            # Collection continues without the safety net rather than stopping:
+            # losing a buffer on a crash is worse than never collecting at all.
+            self._logger.error(f"Could not open write-ahead log: {e}")
+            self._wal = None
+
+    def _append_to_wal(self, tick: TickData) -> None:
+        """
+        Append one tick, and a checkpoint when the clock has been corrected.
+
+        The checkpoint exists because `summary.anchor` describes the state at
+        close, which a crashed process cannot report. Without it a recovered
+        file would repeat its opening counters and thereby claim no correction
+        happened inside it.
+
+        Args:
+            tick: The tick being collected
+        """
+        if not self._wal:
+            return
+
+        try:
+            if self._clock.resyncs != self._wal_resyncs:
+                self._wal.write(json.dumps({
+                    "anchor_resyncs": self._clock.resyncs,
+                    "anchor_max_correction_ms": self._clock.max_correction_ms
+                }) + "\n")
+                self._wal_resyncs = self._clock.resyncs
+
+            self._wal.write(json.dumps(self._tick_to_dict(tick)) + "\n")
+            self._wal.flush()
+        except Exception as e:
+            self._logger.error(f"Write-ahead log write failed: {e}")
+            self._wal = None
+
+    def _close_wal(self, delete: bool) -> None:
+        """
+        Close the write-ahead log, optionally removing it.
+
+        Args:
+            delete: Remove the file - only ever true after the archive file has
+                been written successfully
+        """
+        if self._wal:
+            try:
+                self._wal.close()
+            except Exception:
+                pass
+            self._wal = None
+
+        if delete and self._wal_path and self._wal_path.exists():
+            try:
+                self._wal_path.unlink()
+            except Exception as e:
+                self._logger.warning(f"Could not remove write-ahead log: {e}")
+
+        self._wal_path = None
+
+    def _build_metadata(self) -> TickFileMetadata:
+        """
+        Build the metadata header.
+
+        Split out of _build_file_content so the write-ahead log can write the
+        same header at open - one source, so a recovered file and a rotated one
+        cannot describe themselves differently.
 
         Returns:
-            Dict matching MT5 JSON format
+            Metadata as of file open
         """
-        now = datetime.now(timezone.utc)
-
-        # Metadata
-        metadata = TickFileMetadata(
+        return TickFileMetadata(
             symbol=self._symbol,
             broker=self._broker,
             server=self._server,
@@ -272,6 +369,16 @@ class JsonTickWriter(AbstractTickWriter):
             ),
             error_tracking=ErrorTracking()
         )
+
+    def _build_file_content(self) -> Dict[str, Any]:
+        """
+        Build complete file content structure.
+
+        Returns:
+            Dict matching MT5 JSON format
+        """
+        now = datetime.now(timezone.utc)
+        metadata = self._build_metadata()
 
         # Summary
         duration_minutes = 0.0
@@ -449,3 +556,165 @@ class JsonTickWriter(AbstractTickWriter):
             "anchor": asdict(summary.anchor) if summary.anchor else {},
             "recommendations": summary.recommendations
         }
+
+
+def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path]:
+    """
+    Turn write-ahead logs left by a crashed run into archive files.
+
+    Runs once at startup, before collection begins. A `.jsonl.part` without its
+    `*_ticks.json` means the process died between the first tick and the
+    rotation; the data is in the log and nowhere else.
+
+    Cases handled, in the order they matter:
+      - archive file already exists: the crash fell between writing it and
+        removing the log. Keep the file, drop the log. Never overwrite - the
+        existing file is the one a consumer may already have read.
+      - last line truncated: a crash mid-write. Skip it, keep the rest.
+      - header unreadable: rename to `.corrupt` and leave it. Inventing metadata
+        would produce a file that states things nobody measured.
+      - no ticks, only a header: remove the log, write nothing. A file with zero
+        ticks is noise, not an artifact.
+
+    Args:
+        output_dir: Base output directory
+        data_collector: Collector name, the subdirectory files live in
+
+    Returns:
+        Paths of the archive files written
+    """
+    logger = get_collector_logger("recovery")
+    target_dir = output_dir / data_collector
+
+    if not target_dir.exists():
+        return []
+
+    recovered: List[Path] = []
+
+    for wal_path in sorted(target_dir.glob("*_ticks.jsonl.part")):
+        archive_path = wal_path.with_suffix("").with_suffix(".json")
+
+        if archive_path.exists():
+            logger.info(
+                f"{archive_path.name} already written, dropping its log")
+            wal_path.unlink()
+            continue
+
+        try:
+            lines = wal_path.read_text(encoding="utf-8").splitlines()
+        except Exception as e:
+            logger.error(f"Cannot read {wal_path.name}: {e}")
+            continue
+
+        if not lines:
+            wal_path.unlink()
+            continue
+
+        try:
+            metadata = json.loads(lines[0])
+        except json.JSONDecodeError:
+            corrupt = wal_path.with_suffix(".corrupt")
+            wal_path.rename(corrupt)
+            logger.error(
+                f"{wal_path.name} has an unreadable header, kept as "
+                f"{corrupt.name} - not recovered")
+            continue
+
+        ticks: List[Dict[str, Any]] = []
+        anchor = {
+            "resyncs": metadata.get("anchor_resyncs", 0),
+            "max_correction_ms": metadata.get("anchor_max_correction_ms", 0)
+        }
+
+        for line in lines[1:]:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # Only the final line can be torn; anything earlier would mean
+                # the file is damaged in a way this routine should not paper over.
+                if line is not lines[-1]:
+                    logger.warning(
+                        f"{wal_path.name}: unreadable line inside the log, skipped")
+                continue
+
+            if "time_msc" in record:
+                ticks.append(record)
+            elif "anchor_resyncs" in record:
+                anchor = {
+                    "resyncs": record["anchor_resyncs"],
+                    "max_correction_ms": record["anchor_max_correction_ms"]
+                }
+
+        if not ticks:
+            wal_path.unlink()
+            logger.info(f"{wal_path.name} held no ticks, removed")
+            continue
+
+        last_event = ticks[-1]["time_msc"]
+        start_unix = metadata.get("start_time_unix", 0)
+        duration_minutes = round(
+            (last_event / 1000 - start_unix) / 60, 1) if start_unix else 0.0
+
+        content = {
+            "metadata": metadata,
+            "ticks": ticks,
+            "errors": {
+                "by_severity": {"negligible": 0, "serious": 0, "fatal": 0},
+                "details": []
+            },
+            "summary": {
+                "total_ticks": len(ticks),
+                "total_errors": 0,
+                "data_stream_status": "HEALTHY",
+                "quality_metrics": {
+                    "overall_quality_score": 1.0,
+                    "data_integrity_score": 1.0,
+                    "data_reliability_score": 1.0,
+                    "negligible_error_rate": 0.0,
+                    "serious_error_rate": 0.0,
+                    "fatal_error_rate": 0.0
+                },
+                "timing": {
+                    "end_time": datetime.fromtimestamp(
+                        last_event / 1000, tz=timezone.utc
+                    ).strftime("%Y.%m.%d %H:%M:%S"),
+                    "duration_minutes": duration_minutes,
+                    "avg_ticks_per_minute": round(
+                        len(ticks) / duration_minutes, 1
+                    ) if duration_minutes > 0 else 0.0
+                },
+                "anchor": anchor,
+                "recommendations": (
+                    "Recovered from a write-ahead log after an unclean stop. "
+                    "The file is shorter than a rotation would have made it; "
+                    "that is where the previous run ended."
+                )
+            }
+        }
+
+        # Same atomic path as a normal rotation: a consumer never sees a partial
+        # file, recovered or not.
+        fd, temp_path = tempfile.mkstemp(
+            dir=str(target_dir), suffix=".tmp", text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(content, handle, indent=2, ensure_ascii=False)
+            os.replace(temp_path, archive_path)
+        except Exception as e:
+            logger.error(f"Could not write {archive_path.name}: {e}")
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            continue
+
+        wal_path.unlink()
+
+        lock_path = archive_path.with_suffix(".json.lock")
+        if lock_path.exists():
+            lock_path.unlink()
+
+        recovered.append(archive_path)
+        logger.info(
+            f"Recovered {archive_path.name} from its write-ahead log "
+            f"({len(ticks):,} ticks)")
+
+    return recovered

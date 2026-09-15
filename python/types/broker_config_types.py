@@ -6,11 +6,13 @@ Location: python/types/broker_config_types.py
 """
 
 import json
+import ssl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
 import aiohttp
+import certifi
 
 from python.exceptions.collector_exceptions import ConfigurationError
 
@@ -142,7 +144,15 @@ class BrokerConfig:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, ssl=False, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                # certifi's bundle, not the Windows store: the same context the
+                # WebSocket client and the Telegram bot already build. This call
+                # previously passed ssl=False to get past a Windows certificate
+                # error - which fetched tick_size and digits over a connection
+                # nobody verified, and those two decide spread_points and the
+                # rounding of every price we write.
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+                async with session.get(url, params=params, ssl=ssl_context,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
         except (aiohttp.ClientError, TimeoutError) as e:

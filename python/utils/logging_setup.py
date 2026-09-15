@@ -66,6 +66,12 @@ class FiniexLogger:
         self._file_level = file_level
         self._log_file = log_file
         self._file_handle: Optional[TextIO] = None
+        # Date the open handle belongs to. _get_log_file() names the file after
+        # "today", but it was only ever evaluated here - so a process running
+        # past midnight kept writing into the file named after its start day.
+        # Observed on the production server: 294 MB in one file spanning three
+        # days, under a name claiming one.
+        self._file_date: Optional[str] = None
 
         # Open file if configured
         if self._file_level and self._log_file:
@@ -75,6 +81,7 @@ class FiniexLogger:
 
                 # Path.open() ist robuster als open()
                 self._file_handle = log_path.open("a", encoding="utf-8")
+                self._file_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             except Exception as e:
                 _print_error(f"Failed to open log file {log_path}: {e}")
 
@@ -100,12 +107,46 @@ class FiniexLogger:
 
         # File output (plain text)
         if self._file_handle and self._file_level and level >= self._file_level:
+            # timestamp already starts with the UTC date, so the rollover check
+            # costs a string comparison rather than another clock read.
+            self._roll_over_if_needed(timestamp[:10])
             plain_line = f"{timestamp} | {level.name:<8} | {self._name} | {message}\n"
             try:
                 self._file_handle.write(plain_line)
                 self._file_handle.flush()
             except Exception as e:
                 _print_error(f"Failed to write to log file: {e}")
+
+    def _roll_over_if_needed(self, today: str) -> None:
+        """
+        Reopen the log under today's name when the date has moved on.
+
+        Args:
+            today: Current UTC date as YYYY-MM-DD
+        """
+        if today == self._file_date:
+            return
+
+        try:
+            new_path = _get_log_file()
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = new_path.open("a", encoding="utf-8")
+        except Exception as e:
+            # Keep writing into the old file rather than losing the line: a
+            # misnamed log is recoverable, a dropped one is not.
+            _print_error(f"Failed to roll over log file: {e}")
+            self._file_date = today
+            return
+
+        if self._file_handle:
+            try:
+                self._file_handle.close()
+            except Exception:
+                pass
+
+        self._file_handle = handle
+        self._log_file = str(new_path)
+        self._file_date = today
 
     def debug(self, message: str) -> None:
         """Log debug message."""

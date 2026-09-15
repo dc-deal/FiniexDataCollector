@@ -29,7 +29,10 @@ from python.types.collector_stats import CollectorStats
 from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import ConfigurationError
 from python.collectors.kraken.websocket_client import KrakenWebSocketClient
-from python.writers.json_tick_writer import JsonTickWriter
+from python.writers.json_tick_writer import (
+    JsonTickWriter,
+    recover_orphaned_buffers
+)
 from python.alerts.telegram_bot import TelegramAlertProvider
 from python.scheduler.weekly_jobs import WeeklyJobScheduler
 
@@ -420,6 +423,12 @@ class FiniexDataCollector:
 
         # Create writers for each symbol
         raw_dir = Path(self._config.paths.raw_data_dir)
+
+        # Before collecting: turn any write-ahead log left by a crashed run into
+        # an archive file. Must happen before the writers open new ones, or the
+        # recovery would race the files it is meant to rescue.
+        for path in recover_orphaned_buffers(raw_dir, "kraken"):
+            self._logger.info(f"Recovered from previous run: {path.name}")
 
         for symbol in self._config.kraken.symbols:
             normalized = normalize_symbol(symbol)
