@@ -69,7 +69,7 @@ Thumbs.db
 # Internal working docs (private — may reference user_algos / private bots)
 INTERNAL_*.md
 ISSUE_*.md
-SESSION_*.md
+HANDOFF_*.md
 
 
 # GitHub issues export (local reference only)

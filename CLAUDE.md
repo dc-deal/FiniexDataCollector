@@ -30,7 +30,7 @@ Every line is reviewed by the operator before it is committed. The assistant nev
   **All artifacts stay English** — code, comments, docs, issues, commit messages, handover
   documents. The language of the conversation never sets the language of a file. A German
   chat about a runbook still produces an English runbook.
-  **Gitignored is not an exemption.** `ISSUE_*.md`, `INTERNAL_*.md` and `SESSION_*.md` are
+  **Gitignored is not an exemption.** `ISSUE_*.md`, `INTERNAL_*.md` and `HANDOFF_*.md` are
   artifacts too — private, not exempt.
 - **Verify before reporting — against the repository, never against memory of it.** A claim
   about this repository is checked by reading this repository. A claim about the consuming
@@ -89,8 +89,16 @@ Read first, in order:
 - **GitHub issue #8** — *FiniexDataCollector Vision & Roadmap*.
 - **GitHub issue #11** — the tick data contract: what the output states about itself and
   why. Anything touching the file format starts here.
-- The latest `SESSION_*.md` in the project root, if one exists — build state and next
-  steps from the previous session.
+- The latest `HANDOFF_*.md` in the project root, if one exists — build state and next
+  steps from the previous session. **A handoff is a snapshot, not a document.** It opens
+  with the UTC timestamp it was written at and the commit it describes, so staleness is
+  visible in one line — check that stamp against `git log -1`, or against `/v1/build` where
+  a collector is running, before trusting a number in it. **The operator deletes it once the
+  new chat has taken it in; the assistant never does**, the same way it never commits and
+  never closes issues. The deletion is the point: a handoff left lying around is read weeks
+  later as if it were current. Anything worth keeping for the record moves to
+  `github_issues/root_internal_archive/` — the project root holds only what is currently in
+  play.
 - `github_issues/` — a local snapshot of the tracker, refreshed with
   `export_github_issues.sh` (gitignored, run from the host). The dev container has no
   GitHub API access of its own, so the snapshot is how a session gets issue context.
