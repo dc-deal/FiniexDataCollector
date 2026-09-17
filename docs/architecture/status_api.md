@@ -99,7 +99,16 @@ reasons: the first is what this program is, the second is what its output files 
 
 The schema: every route, every parameter, every response shape. FastAPI generates it, so
 it exists whether or not anyone decided on it — which is the reason it is named here.
-A consumer integrates against this rather than against a hand-kept list that drifts.
+
+**It is not reachable from outside, and this paragraph used to imply it was.** FastAPI mounts
+the schema at the application root, and the TLS edge forwards `/v1/*` only — so a consumer
+sees a 404 and cannot tell that apart from the schema being switched off. FiniexTestingIDE
+hit exactly that on 2026-09-17 and had recorded it as a gap on our side.
+
+The practical consequence: **the register and the architecture documents are the interface
+description** for anyone off the machine. Whether the schema should move under `/v1/` to
+become discoverable is an open decision, not an oversight — it lists route names, which tells
+a reader that an archive and a log exist.
 
 `/docs` and `/redoc`, the rendered consoles, are **off**. The schema is what a consumer
 needs; a try-it-out console on a diagnostic surface is a different thing and was never
@@ -195,7 +204,20 @@ in, in the body.
 ## `GET /v1/archive` — `archive:index`
 
 What the collector has written. Per file: symbol, tick count, the declared count from the
-summary, event and arrival bounds, format version, and the anchor counters.
+summary, event and arrival bounds, format version, the anchor counters — and **`instance_id`**,
+the identity that wrote it.
+
+The identity is in the register for the same reason `data_format_version` is: **a consumer has
+to be able to decide before transferring.** It costs nothing while one instance writes into a
+directory, and from the moment two have — which is what pointing a new deployment at an
+existing archive root does — "which files here did an identity I do not know write" would
+otherwise mean downloading the archive to read twelve characters out of each file. At 50,000
+ticks that is roughly 22 MB per answer. Requested by FiniexTestingIDE on 2026-09-17, with our
+own argument.
+
+It is **`null`** for anything below 1.7.0, and that is the honest answer rather than a gap:
+those files were written before provenance existed, and nothing can infer afterwards which
+instance wrote them.
 
 ```
 ?symbol=BTCUSD          one symbol
