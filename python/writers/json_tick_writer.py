@@ -28,6 +28,7 @@ from python.types.tick_types import (
     TickFileContent,
     TickFileSummary,
     AnchorSummary,
+    OriginBlock,
     QualityMetrics,
     TimingSummary,
     SymbolInfo,
@@ -60,7 +61,8 @@ class JsonTickWriter(AbstractTickWriter):
         server: str = "kraken_spot",
         broker_type: str = "",
         max_ticks_per_file: int = 50000,
-        data_collector: str = "kraken"
+        data_collector: str = "kraken",
+        origin: Optional[OriginBlock] = None
     ):
         """
         Initialize JSON tick writer.
@@ -76,6 +78,9 @@ class JsonTickWriter(AbstractTickWriter):
             broker_type: Broker type identifier (e.g., "kraken_spot")
             max_ticks_per_file: Maximum ticks before rotation
             data_collector: Data collector identifier
+            origin: Which instance produced these files. Absent only in tests;
+                main.py always supplies it, and a collector that cannot
+                establish its identity refuses to start.
         """
         super().__init__(output_dir, symbol, max_ticks_per_file)
 
@@ -84,6 +89,7 @@ class JsonTickWriter(AbstractTickWriter):
         self._server = server
         self._broker_type = broker_type
         self._data_collector = data_collector
+        self._origin = origin
         self._logger = get_collector_logger(f"writer.{symbol}")
 
         # Current file state
@@ -407,6 +413,7 @@ class JsonTickWriter(AbstractTickWriter):
             collected_msc_timebase=COLLECTED_MSC_TIMEBASE,
             anchor_resyncs=self._file_start_resyncs,
             anchor_max_correction_ms=self._file_start_max_correction_ms,
+            origin=self._origin,
             collection_purpose="backtesting",
             operator="automated",
             symbol_info=self._get_symbol_info(),
@@ -565,6 +572,7 @@ class JsonTickWriter(AbstractTickWriter):
             "collected_msc_timebase": metadata.collected_msc_timebase,
             "anchor_resyncs": metadata.anchor_resyncs,
             "anchor_max_correction_ms": metadata.anchor_max_correction_ms,
+            "origin": asdict(metadata.origin) if metadata.origin else None,
             "collection_purpose": metadata.collection_purpose,
             "operator": metadata.operator,
             "symbol_info": asdict(metadata.symbol_info) if metadata.symbol_info else {},
@@ -587,6 +595,7 @@ class JsonTickWriter(AbstractTickWriter):
             "spread_points": tick.spread_points,
             "spread_pct": tick.spread_pct,
             "quote_age_ms": tick.quote_age_ms,
+            "trade_id": tick.trade_id,
             "tick_flags": tick.tick_flags,
             "session": tick.session
         }

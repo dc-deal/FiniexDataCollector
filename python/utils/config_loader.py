@@ -220,7 +220,7 @@ class AppConfig(BaseModel):
         api: Status API configuration
     """
     app_name: str = "FiniexDataCollector"
-    version: str = "1.1.0"
+    version: str
     environment: str = "production"
 
     logging: LoggingConfig

@@ -23,6 +23,7 @@ Which routes are open, and why each one is:
 Location: python/api/api_app.py
 """
 
+from dataclasses import asdict
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -39,6 +40,7 @@ from python.api.build_info import BuildInfo
 from python.api.file_server import resolve_archive_file
 from python.api.log_reader import MAX_LINES, read_log
 from python.api.redaction import redact_config
+from python.types.tick_types import OriginBlock
 
 SURFACE = "status"
 
@@ -58,6 +60,7 @@ def create_api(
     health_provider: Callable[[], Dict[str, Any]],
     detail_provider: Callable[[], Dict[str, Any]],
     registry: TokenRegistry,
+    origin: OriginBlock,
     config_provider: Optional[Callable[[], Dict[str, Any]]] = None,
     raw_data_dir: Optional[Path] = None,
     log_dir: Optional[Path] = None,
@@ -75,6 +78,10 @@ def create_api(
         health_provider: Returns liveness and uptime
         detail_provider: Returns per-symbol collection state
         registry: Consumer tokens; an empty one refuses every gated route
+        origin: The identity every file this process writes will carry. Required,
+            not optional: a collector without one refuses to start, so a running
+            API always has it, and an optional parameter would only create a way
+            to serve a status nobody can attribute
         config_provider: Returns the effective configuration; the route is not
             mounted without it
         raw_data_dir: Archive root, for the inventory route
@@ -127,8 +134,21 @@ def create_api(
         ]
     )
     def status_detail() -> Dict[str, Any]:
-        """Per-symbol collection state. Requires a token granting `status:detail`."""
-        return detail_provider()
+        """
+        Per-symbol collection state. Requires a token granting `status:detail`.
+
+        Carries `origin` in the same shape a tick file carries it, so a consumer
+        parses one structure rather than two. Without it an identity can only be
+        learned by receiving a file - and the consumer needs it BEFORE the first
+        file, because an unregistered identity refuses a measurement run at
+        admission. A freshly deployed collector would otherwise have to be read
+        off its own disk over a shell.
+
+        It sits here and not on `/v1/build`, which is open: the build route
+        discloses only what the public repository already shows, while an
+        identity is a name for one machine's data directory.
+        """
+        return {"origin": asdict(origin), **detail_provider()}
 
     if config_provider is not None:
         @app.get(

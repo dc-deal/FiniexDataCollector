@@ -132,7 +132,7 @@ def test_the_header_carries_what_a_crash_would_destroy(
     assert header["symbol"] == SYMBOL
     assert header["start_time"]
     assert header["start_time_unix"] > 0
-    assert header["data_format_version"] == "1.6.0"
+    assert header["data_format_version"] == "1.7.0"
     assert "anchor_resyncs" in header
 
 
@@ -206,7 +206,7 @@ def test_a_crashed_buffer_is_recovered_into_an_archive_file(
     document = read_document(recovered[0])
     assert len(document["ticks"]) == len(tick_series)
     assert document["summary"]["total_ticks"] == len(tick_series)
-    assert document["metadata"]["data_format_version"] == "1.6.0"
+    assert document["metadata"]["data_format_version"] == "1.7.0"
 
 
 def test_recovered_ticks_are_identical_to_what_was_written(

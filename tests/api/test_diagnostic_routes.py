@@ -28,6 +28,14 @@ from python.api.build_info import BuildInfo
 from python.api.redaction import redact_config
 from python.api.token_loader import load_token_registry
 from python.types.collector_stats import CollectorStats
+from python.types.tick_types import OriginBlock
+
+ORIGIN = OriginBlock(
+    instance_id="a3f8c21d9b04",
+    collected_on="collector-prod",
+    producer="finiex-data-collector",
+    producer_version="1.2.0"
+)
 
 BUILD = BuildInfo("1.1.0", "1.6.0", "abc1234", False, "2026-09-15T10:00:00+00:00")
 
@@ -141,6 +149,7 @@ def client(tmp_path: Path) -> TestClient:
         build=BUILD,
         health_provider=lambda: {"status": "ok"},
         detail_provider=lambda: {"symbols": {}},
+        origin=ORIGIN,
         registry=load_token_registry(
             {"full": FULL, "narrow": NARROW, "nobody": NOBODY}),
         config_provider=config_with_secrets,
@@ -425,6 +434,7 @@ def download_client(tmp_path: Path) -> TestClient:
         build=BUILD,
         health_provider=lambda: {"status": "ok"},
         detail_provider=lambda: {"symbols": {}},
+        origin=ORIGIN,
         registry=load_token_registry(
             {"dl": DOWNLOADER, "narrow": NARROW, "nobody": NOBODY}),
         raw_data_dir=raw

@@ -99,6 +99,13 @@ Read first, in order:
   later as if it were current. Anything worth keeping for the record moves to
   `github_issues/root_internal_archive/` — the project root holds only what is currently in
   play.
+- `github_issues/root_internal_archive/production_server.md` — what runs on the
+  production box, which ports are taken, where TLS terminates, and what must not be
+  restarted. Read it before touching the server or choosing a port: three Finiex
+  services share that machine, and the two things a session has got wrong there so far
+  were both assumptions this file now answers. It is a reference rather than a
+  snapshot, but it carries the date it was read off the machine — check a version
+  number against `git log -1` or `/v1/build` on the box before trusting it.
 - `github_issues/` — a local snapshot of the tracker, refreshed with
   `export_github_issues.sh` (gitignored, run from the host). The dev container has no
   GitHub API access of its own, so the snapshot is how a session gets issue context.

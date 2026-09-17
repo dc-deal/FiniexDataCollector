@@ -24,6 +24,7 @@ from tests.conftest import FIRST_EVENT_MSC
 from python.types.tick_types import (
     COLLECTED_MSC_TIMEBASE,
     DATA_FORMAT_VERSION,
+    OriginBlock,
     TickData
 )
 from python.utils.collection_clock import CollectionClock
@@ -92,9 +93,9 @@ def test_declares_collected_msc_timebase_as_utc(written_file: Dict[str, Any]) ->
     assert written_file["metadata"]["collected_msc_timebase"] == "utc"
 
 
-def test_declares_data_format_version_1_6_0(written_file: Dict[str, Any]) -> None:
-    """1.6.0 is the version at which a trade tick carries a real spread."""
-    assert written_file["metadata"]["data_format_version"] == "1.6.0"
+def test_declares_data_format_version_1_7_0(written_file: Dict[str, Any]) -> None:
+    """1.7.0 is the version at which a file names the instance that wrote it."""
+    assert written_file["metadata"]["data_format_version"] == "1.7.0"
 
 
 def test_declared_values_come_from_the_module_constants(
@@ -287,3 +288,89 @@ def test_every_symbol_of_the_session_declares_the_same_correction(
     # The file after it: carries the count, but its own two states agree.
     assert second["metadata"]["anchor_resyncs"] == 1
     assert second["summary"]["anchor"]["resyncs"] == 1
+
+
+# =============================================================================
+# WHERE THE FILE CAME FROM
+# =============================================================================
+
+ORIGIN = OriginBlock(
+    instance_id="a7f21c0b4e88",
+    collected_on="collector-test",
+    producer="finiex-data-collector",
+    producer_version="1.2.0"
+)
+
+
+def test_the_file_names_the_instance_that_wrote_it(
+    tmp_path: Path,
+    tick_series: List[TickData]
+) -> None:
+    """
+    An identity, not a declaration. The collector says who it is and nothing
+    about what that means; the consumer resolves identity to meaning in a
+    registry it owns, and one it has never seen resolves to `unknown`.
+
+    A configured `environment` field was the obvious repair and the wrong one:
+    a configuration copied from the server to a laptop still says `production`.
+    """
+    writer = JsonTickWriter(
+        output_dir=tmp_path, symbol="BTCUSD", clock=CollectionClock(),
+        broker="Kraken", server="kraken_websocket", broker_type="kraken_spot",
+        max_ticks_per_file=50000, data_collector="kraken", origin=ORIGIN)
+
+    for tick in tick_series:
+        writer.write_tick(tick)
+
+    document = json.loads(
+        Path(writer.finalize()).read_text(encoding="utf-8"))
+
+    assert document["metadata"]["origin"] == {
+        "instance_id": "a7f21c0b4e88",
+        "collected_on": "collector-test",
+        "producer": "finiex-data-collector",
+        "producer_version": "1.2.0"
+    }
+
+
+def test_the_file_states_no_environment(written_file: Dict[str, Any]) -> None:
+    """
+    Deliberately absent, and agreed with the consumer as absent.
+
+    Classification is theirs and can grow — `staging`, `backfill` — without
+    asking anything of this collector. A vocabulary emitted here would have to
+    be mapped there, and a producer that declares its own meaning is a producer
+    that can declare it wrongly.
+    """
+    metadata = written_file["metadata"]
+
+    assert "environment" not in metadata
+    assert "is_production" not in metadata
+
+
+def test_a_tick_carries_the_exchange_trade_id(
+    tmp_path: Path,
+    tick_series: List[TickData]
+) -> None:
+    """
+    Kraken sends it on every trade and this collector discarded it until 1.7.0.
+    It is the deduplication key anyone would otherwise have to invent the day
+    two collectors capture one symbol.
+    """
+    writer = build_writer(tmp_path, CollectionClock())
+    tick = tick_series[0]
+    tick.trade_id = 987654321
+    writer.write_tick(tick)
+
+    document = json.loads(
+        Path(writer.finalize()).read_text(encoding="utf-8"))
+
+    assert document["ticks"][0]["trade_id"] == 987654321
+
+
+def test_a_missing_trade_id_is_null_not_zero(written_file: Dict[str, Any]) -> None:
+    """
+    Zero is a valid id somewhere. `null` says the message carried none, which is
+    the honest reading and the same rule quote_age_ms follows.
+    """
+    assert written_file["ticks"][0]["trade_id"] is None

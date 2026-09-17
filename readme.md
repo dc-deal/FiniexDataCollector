@@ -4,7 +4,7 @@
 
 > ⚠️ **No financial advice.** This software is for educational and research purposes only.
 
-> **Version:** 1.1.0  
+> **Version:** 1.2.0  
 > **Status:** Production Ready  
 > **Target:** Developers who need reliable tick data for backtesting systems
 
@@ -47,8 +47,9 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 - **Quality Metrics** - Spread calculation, tick frequency, error tracking
 
 ### Status API
-- **Six HTTP routes** - liveness, build identity, live metrics, effective configuration,
-  archive inventory and log excerpts. Two are open, four need a token with a named grant
+- **HTTP routes** - liveness, build identity, live metrics, effective configuration,
+  archive inventory, finished files and log excerpts. Liveness and build identity are
+  open; every other route needs a token carrying that surface as a named grant
 - **Off by default** - `api.enabled` in the configuration; it binds loopback and the port
   never reaches the internet directly
 - See [docs/architecture/status_api.md](docs/architecture/status_api.md)
@@ -230,9 +231,15 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
     "broker_type": "kraken_spot",
     "local_device_time": "2026.03.29 11:34:47",
     "broker_server_time": "2026.03.29 09:34:47",
-    "data_format_version": "1.6.0",
+    "data_format_version": "1.7.0",
     "data_collector": "kraken",
     "collected_msc_timebase": "utc",
+    "origin": {
+      "instance_id": "a3f8c21d9b04",
+      "collected_on": "kraken-prod-01",
+      "producer": "finiex-data-collector",
+      "producer_version": "1.2.0"
+    },
     "anchor_resyncs": 0,
     "anchor_max_correction_ms": 0,
     "symbol_info": {
@@ -255,6 +262,7 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
       "spread_points": 100,
       "spread_pct": 0.022,
       "quote_age_ms": 84,
+      "trade_id": 107991033,
       "session": "24h",
       "tick_flags": "BUY"
     }
@@ -284,6 +292,10 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
   price fills both sides, as it did before 1.6.0. Never `0` in that case: zero would
   claim a quote seen in the same millisecond. This field is what separates a measured
   spread from a stale one.
+- `trade_id`: Kraken's own identifier for the execution, carried through from 1.7.0.
+  It makes a tick addressable in the exchange's terms, so a duplicate delivered across
+  a reconnect is recognisable as the same execution rather than inferred from matching
+  prices and timestamps.
 - `tick_flags`: The taker side, `BUY` or `SELL`. A buy lifted the ask, a sell hit the
   bid, which is what makes a later spread reconstruction of older files tractable -
   only the width stays unknown, not the direction.
@@ -303,6 +315,15 @@ FiniexDataCollector includes a rich terminal UI showing real-time status:
   Cumulative over the collection session. They appear again in `summary.anchor` with
   the state at file close, so a file whose closing count exceeds its opening count is
   one that absorbed a correction. Both zero is the normal case.
+- `origin`: Which instance produced the file - `instance_id`, `collected_on`,
+  `producer` and `producer_version`, from 1.7.0. An identity, not a declaration: the
+  collector says who it is and nothing about what that means, and FiniexTestingIDE
+  resolves identity to trust in a registry it owns. An `environment: production` field
+  would have been the obvious choice and the wrong one - a configuration copied from
+  the server to a laptop still says whatever the server said. The id is minted once
+  into `instance.json` at the data root; back that file up and never copy it into a
+  second data directory. See
+  [docs/architecture/output_contract.md](docs/architecture/output_contract.md).
 - `local_device_time` / `broker_server_time`: Wall clock of the collecting machine and
   of the exchange at file creation. Informational - nothing downstream derives a UTC
   offset from them.

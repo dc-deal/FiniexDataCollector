@@ -62,8 +62,8 @@ asserts the absence rather than trusting the intent.
 
 ```json
 {
-  "version": "1.1.0",
-  "data_format_version": "1.6.0",
+  "version": "<app version, from configs/app_config.json>",
+  "data_format_version": "<format version, from python/types/tick_types.py>",
   "commit": "0c2f88e",
   "dirty": false,
   "started_at": "2026-09-15T10:00:00+00:00"
@@ -121,6 +121,29 @@ Two deliberate exceptions:
 - `disk_space` is **extended** with `free_gb`, `total_gb`, `percent_free` and `status`.
   Those are computed properties, so a plain dataclass conversion drops them — and they are
   the part a monitor acts on.
+
+Alongside the stats, the payload carries **`origin`** — the same block a tick file
+carries, field for field, so a consumer parses one structure and not two:
+
+```json
+"origin": {
+  "instance_id": "a3f8c21d9b04",
+  "collected_on": "collector-prod",
+  "producer": "finiex-data-collector",
+  "producer_version": "<app version>"
+}
+```
+
+**This route exists so an identity can be learned before the first file.** FiniexTestingIDE
+resolves an identity it has never seen to `unknown`, and `unknown` refuses a measurement run
+at admission — so a freshly deployed collector delivers files nothing may be measured
+against until somebody registers it. Without this field the only ways to learn the new id
+are a shell on the machine or the first file that arrives, which is the wrong order.
+
+**Here and not on `/v1/build`, which is open.** The build route discloses a commit hash,
+which the public repository already shows. An identity is the key a consumer's trust
+registry is keyed on and names one machine's data directory; it belongs behind the same
+grant as the symbol names.
 
 ## `GET /v1/configs` — `config:effective`
 

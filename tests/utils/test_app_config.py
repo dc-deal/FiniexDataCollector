@@ -1,9 +1,10 @@
 """
 FiniexDataCollector - Application Config Tests
 
-The version exists three times: in configs/app_config.json, as the AppConfig default,
-and in the README status line. Two of those are machine-readable and guarded here.
-The README is not, and is bumped by hand in the same change.
+The version lives in configs/app_config.json and is repeated in the README status
+line, and nowhere else. It used to have a third home as the AppConfig default, which
+is the copy that would have been forgotten; the field is required now, and one test
+below keeps that default from coming back.
 
 Location: tests/utils/test_app_config.py
 """
@@ -33,15 +34,17 @@ def tracked_config() -> dict:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
-def test_config_version_and_pydantic_default_agree() -> None:
+def test_the_version_has_no_second_home_in_the_code() -> None:
     """
-    Two copies of one fact, so they can drift.
+    One fact, one place.
 
-    The same shape cost us a release once already: data_format_version sat as a
-    literal in the dataclass and again in the writer, and bumping it meant
-    remembering both.
+    `version` carried a Pydantic default that repeated what the tracked config
+    already said, and a default exists precisely to be forgotten on the day the
+    other copy moves. Required instead - the tracked config always carries it,
+    and a config that does not is a defect worth a refusal rather than a silent
+    fallback to whatever the last release happened to be.
     """
-    assert tracked_config()["version"] == AppConfig.model_fields["version"].default
+    assert AppConfig.model_fields["version"].is_required()
 
 
 def test_version_is_semver() -> None:

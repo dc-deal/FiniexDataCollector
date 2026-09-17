@@ -245,7 +245,11 @@ class KrakenMessageParser:
                 collected_msc=collected_msc,
                 tick_flags=side if side else "TRADE",
                 session="24h",
-                quote_age_ms=quote_age_ms
+                quote_age_ms=quote_age_ms,
+                # Kraken's own id for the execution. Kept from 1.7.0 as the
+                # deduplication key for the day two collectors capture one
+                # symbol; None rather than invented when a message omits it.
+                trade_id=trade.get("trade_id")
             )
 
         except (KeyError, ValueError, TypeError) as e:

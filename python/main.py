@@ -16,7 +16,7 @@ import sys
 import os
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Any, List, Optional
 
 import psutil
 
@@ -26,11 +26,17 @@ from python.api.stats_serializer import health_payload, serialize_stats
 from python.api.token_loader import load_token_registry
 from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
+from python.utils.instance_identity import (
+    PRODUCER,
+    collected_on,
+    mint_or_read
+)
 from python.utils.instance_lock import InstanceLock
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import setup_logging, get_logger
 from python.utils.live_display import LiveDisplay
 from python.types.collector_stats import CollectorStats
+from python.types.tick_types import OriginBlock
 from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import ConfigurationError
 from python.collectors.kraken.websocket_client import KrakenWebSocketClient
@@ -139,6 +145,34 @@ def get_folder_size(folder_path: Path) -> int:
     return total
 
 
+async def serve_status_api(server: Any, logger: Any) -> None:
+    """
+    Run the status API, and never let its failure reach the collection.
+
+    uvicorn calls `sys.exit()` when it cannot bind - measured 2026-09-17 as
+    `SystemExit(3)` against a port already in use. `SystemExit` derives from
+    `BaseException`, so the `except Exception` that used to guard this escaped
+    it: the exception left the task, asyncio cancelled everything else, and the
+    collector died at startup over its own diagnostic surface. It happened here
+    when a development container held port 8110.
+
+    A collector that collects without reporting is worth more than one that
+    reports nothing because it is not running.
+
+    Args:
+        server: The configured `uvicorn.Server`
+        logger: Where the failure is recorded
+    """
+    try:
+        await server.serve()
+    except SystemExit as e:
+        logger.error(
+            f"Status API could not start (exit {e.code}) - the port is most "
+            f"likely already in use. Collection continues without it.")
+    except Exception as e:
+        logger.error(f"Status API stopped: {e}")
+
+
 class FiniexDataCollector:
     """
     Main application class.
@@ -162,6 +196,7 @@ class FiniexDataCollector:
         self._clock: Optional[CollectionClock] = None
         self._telegram: Optional[TelegramAlertProvider] = None
         self._instance_lock: Optional[InstanceLock] = None
+        self._origin: Optional[OriginBlock] = None
         self._api_server = None
         self._scheduler: Optional[WeeklyJobScheduler] = None
 
@@ -247,6 +282,35 @@ class FiniexDataCollector:
         # Cleanup
         await self._shutdown()
 
+    def _establish_identity(self) -> OriginBlock:
+        """
+        The identity every file this process writes will carry.
+
+        Minted once at the data root and read on every later start; a process
+        that can establish neither refuses to run rather than write files nobody
+        can attribute.
+
+        Cached rather than rebuilt, because the writers and the status API state
+        the same identity to two different audiences - and two construction
+        sites are two things that can come to disagree.
+
+        Returns:
+            This process's origin block
+        """
+        if self._origin is None:
+            self._origin = OriginBlock(
+                instance_id=mint_or_read(
+                    Path(self._config.paths.raw_data_dir)),
+                collected_on=collected_on(),
+                producer=PRODUCER,
+                producer_version=self._config.version
+            )
+            self._logger.info(
+                f"Instance {self._origin.instance_id} "
+                f"on {self._origin.collected_on}")
+
+        return self._origin
+
     async def _start_status_api(self) -> None:
         """
         Serve the status API on the loopback interface.
@@ -264,6 +328,10 @@ class FiniexDataCollector:
             health_provider=lambda: health_payload(self._stats),
             detail_provider=lambda: serialize_stats(self._stats),
             registry=load_token_registry(self._config.api.tokens),
+            # Established here as well as in the collector path, because the API
+            # can be enabled without the Kraken collector. The call is idempotent
+            # and returns what the collector already established.
+            origin=self._establish_identity(),
             # The effective configuration, after the user overlay is merged.
             # Secrets are stripped in the route, not here - the redaction rule
             # belongs where it can be tested against a planted credential.
@@ -280,13 +348,8 @@ class FiniexDataCollector:
             access_log=False
         ))
 
-        async def serve() -> None:
-            try:
-                await self._api_server.serve()
-            except Exception as e:
-                self._logger.error(f"Status API stopped: {e}")
-
-        self._monitoring_tasks.append(asyncio.create_task(serve()))
+        self._monitoring_tasks.append(asyncio.create_task(
+            serve_status_api(self._api_server, self._logger)))
         self._logger.info(
             f"Status API on http://{self._config.api.host}:"
             f"{self._config.api.port}")
@@ -509,6 +572,9 @@ class FiniexDataCollector:
         self._instance_lock = InstanceLock(raw_dir)
         self._instance_lock.acquire()
 
+        # Before recovery, because a recovered file carries the identity too.
+        origin = self._establish_identity()
+
         # Before collecting: turn any write-ahead log left by a crashed run into
         # an archive file. Must happen before the writers open new ones, or the
         # recovery would race the files it is meant to rescue.
@@ -526,6 +592,7 @@ class FiniexDataCollector:
                 server=self._config.kraken.server_name,
                 broker_type=self._config.kraken.broker_type,
                 max_ticks_per_file=self._config.kraken.max_ticks_per_file,
+                origin=origin,
                 data_collector="kraken"
             )
 

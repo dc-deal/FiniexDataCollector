@@ -20,13 +20,27 @@ import pytest
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+import asyncio
+import sys
+from dataclasses import asdict
+from typing import List
+
 from fastapi.testclient import TestClient
 
 from python.api.api_app import create_api
 from python.api.build_info import BuildInfo
 from python.api.stats_serializer import health_payload, serialize_stats
+from python.main import serve_status_api
 from python.api.token_loader import ConsumerToken, load_token_registry
 from python.types.collector_stats import CollectorStats
+from python.types.tick_types import OriginBlock
+
+ORIGIN = OriginBlock(
+    instance_id="a3f8c21d9b04",
+    collected_on="collector-prod",
+    producer="finiex-data-collector",
+    producer_version="1.2.0"
+)
 
 BUILD = BuildInfo(
     version="1.1.0",
@@ -79,6 +93,7 @@ def client(stats: CollectorStats) -> TestClient:
         build=BUILD,
         health_provider=lambda: health_payload(stats),
         detail_provider=lambda: serialize_stats(stats),
+        origin=ORIGIN,
         registry=load_token_registry(
             {"reader": READER, "stranger": STRANGER})
     ))
@@ -215,3 +230,102 @@ def test_a_grant_naming_an_unknown_surface_fails_at_parse_time() -> None:
     """
     with pytest.raises(Exception):
         ConsumerToken(token="x", grants=["statsu:detail"])
+
+
+def test_the_status_carries_the_producing_identity(client: TestClient) -> None:
+    """
+    The consumer must be able to learn an identity BEFORE the first file.
+
+    An identity it has never seen resolves to `unknown`, and `unknown` refuses a
+    measurement run at admission - so a freshly deployed collector would deliver
+    files nothing may be measured against until someone read its identity off the
+    machine's disk over a shell. The route is what makes that a request instead.
+    """
+    payload = client.get("/v1/status", headers=as_reader()).json()
+
+    assert payload["origin"] == {
+        "instance_id": "a3f8c21d9b04",
+        "collected_on": "collector-prod",
+        "producer": "finiex-data-collector",
+        "producer_version": "1.2.0"
+    }
+
+
+def test_the_identity_has_the_same_shape_a_file_carries(
+    client: TestClient
+) -> None:
+    """
+    One structure, not two.
+
+    A consumer that parses the block out of a tick file must be able to parse the
+    one from this route with the same code; a route-only spelling would be a
+    second contract to keep in step with the first.
+    """
+    served = client.get("/v1/status", headers=as_reader()).json()["origin"]
+
+    assert set(served) == set(asdict(ORIGIN))
+
+
+def test_the_identity_stays_off_the_open_routes(client: TestClient) -> None:
+    """
+    `/v1/build` is open because a commit hash discloses nothing the public
+    repository does not. An identity is not that: it names one machine's data
+    directory, and it is the key a consumer's trust registry is built on. It
+    belongs behind the same grant as the symbol names.
+    """
+    for route in ("/v1/health", "/v1/build"):
+        body = client.get(route).text
+        assert "a3f8c21d9b04" not in body, f"{route} discloses the identity"
+        assert "origin" not in client.get(route).json()
+
+
+# =============================================================================
+# THE SURFACE MUST NOT COST THE COLLECTION
+# =============================================================================
+
+def test_a_status_api_that_cannot_bind_does_not_kill_the_collector() -> None:
+    """
+    The diagnostic surface is worth less than the data it describes.
+
+    uvicorn calls `sys.exit()` when the port is taken, and `SystemExit` is a
+    `BaseException` - so the `except Exception` that used to guard this never
+    saw it. The exception left the task, asyncio cancelled the rest, and the
+    collector died at startup. Measured on 2026-09-17: a development container
+    held port 8110 and a live collector refused to run because of it.
+
+    The failure only appears when something else fails, so the test makes that
+    something else fail.
+    """
+    class RefusingServer:
+        """A uvicorn.Server that cannot bind, behaving exactly as uvicorn does."""
+
+        async def serve(self) -> None:
+            sys.exit(3)
+
+    recorded: List[str] = []
+
+    class RecordingLogger:
+        def error(self, message: str) -> None:
+            recorded.append(message)
+
+    asyncio.run(serve_status_api(RefusingServer(), RecordingLogger()))
+
+    assert recorded, "the failure was swallowed without a trace"
+    assert "port" in recorded[0].lower()
+
+
+def test_a_status_api_that_stops_later_does_not_kill_the_collector() -> None:
+    """The ordinary exception path still holds; the new clause did not replace it."""
+    class FailingServer:
+        async def serve(self) -> None:
+            raise RuntimeError("socket went away")
+
+    recorded: List[str] = []
+
+    class RecordingLogger:
+        def error(self, message: str) -> None:
+            recorded.append(message)
+
+    asyncio.run(serve_status_api(FailingServer(), RecordingLogger()))
+
+    assert "socket went away" in recorded[0]

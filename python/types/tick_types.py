@@ -16,7 +16,11 @@ from typing import Dict, List, Optional, Any
 # 1.6.0: bid/ask on a trade tick are the quote it executed against, taken from
 #        the ticker channel, with quote_age_ms stating how old that quote was.
 #        Below 1.6.0 a Kraken trade tick has bid == ask and a spread of zero.
-DATA_FORMAT_VERSION = "1.6.0"
+# 1.7.0: an `origin` block names the instance that produced the file, and each
+#        tick carries the exchange's own trade_id. Files below 1.7.0 carry no
+#        provenance, and the consumer labels them from a dated attestation
+#        rather than from anything written into them.
+DATA_FORMAT_VERSION = "1.7.0"
 
 # Time base of collected_msc. Every tick is stamped from time.time(), which is
 # Unix epoch milliseconds in UTC, so this holds for every file written by this
@@ -49,6 +53,12 @@ class TickData:
     # None means no quote had been observed yet - distinct from 0, which would
     # claim the quote was taken in the same millisecond.
     quote_age_ms: Optional[int] = None
+    # The exchange's own id for this execution. Kraken sends one on every trade;
+    # it was discarded until 1.7.0. It is the deduplication key anyone would
+    # otherwise have to invent the day two collectors capture one symbol - which
+    # the consumer's instance registry now makes possible. None when the message
+    # carried none, never a fabricated value.
+    trade_id: Optional[int] = None
 
 
 @dataclass
@@ -83,6 +93,29 @@ class ErrorTracking:
 
 
 @dataclass
+class OriginBlock:
+    """
+    Which instance produced this file.
+
+    An identity, not a declaration. The collector says who it is and nothing
+    about what that means; FiniexTestingIDE resolves identity to meaning in a
+    registry it owns, and an identity it has never seen resolves to `unknown`,
+    which its measurement runs refuse. So an unregistered machine is quarantined
+    without anyone having to remember to configure anything.
+
+    Attributes:
+        instance_id: Minted once at the data root, twelve lowercase hex
+        collected_on: Hostname, forensic only - nothing ever branches on it
+        producer: Which program wrote the file
+        producer_version: That program's version, not the format version
+    """
+    instance_id: str
+    collected_on: str
+    producer: str
+    producer_version: str
+
+
+@dataclass
 class TickFileMetadata:
     """
     Metadata header for tick JSON files.
@@ -107,6 +140,7 @@ class TickFileMetadata:
     anchor_max_correction_ms: int = 0
     collection_purpose: str = "backtesting"
     operator: str = "automated"
+    origin: Optional[OriginBlock] = None
     symbol_info: Optional[SymbolInfo] = None
     collection_settings: Optional[CollectionSettings] = None
     error_tracking: Optional[ErrorTracking] = None
