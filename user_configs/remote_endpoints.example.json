@@ -1,0 +1,24 @@
+{
+  "_comment": "Remote collector instances this machine may query, and the credential for each. Copy to remote_endpoints.json and fill in. Nothing reads this file at runtime - the collector does not know it exists. It is a note to whoever is working here, machine-readable so a session does not have to be told the URL again.",
+  "_rules": [
+    "The real file is gitignored. It never becomes tracked, never reaches the bus, never gets pasted into an issue.",
+    "One token per consumer, so revoking one does not disturb the others. This one is the operator's; the consuming project has its own.",
+    "The token authorises exactly the grants listed beside it. If a route answers 403, the grant is missing - it is not a bug in the route.",
+    "Print the URL freely, never the token. A command that needs it reads it from here."
+  ],
+  "endpoints": {
+    "live": {
+      "base_url": "https://<hostname>",
+      "token": "<40 characters, generated on the box>",
+      "grants": [
+        "status:detail",
+        "archive:index",
+        "files:*",
+        "config:effective",
+        "logs:collector"
+      ],
+      "instance_id": "<minted at the data root on first start; /v1/status states it>",
+      "note": "Which machine this reaches, and who maintains it"
+    }
+  }
+}

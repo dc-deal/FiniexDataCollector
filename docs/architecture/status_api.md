@@ -65,6 +65,7 @@ asserts the absence rather than trusting the intent.
   "version": "<app version, from configs/app_config.json>",
   "data_format_version": "<format version, from python/types/tick_types.py>",
   "commit": "0c2f88e",
+  "python_version": "3.12.4",
   "dirty": false,
   "started_at": "2026-09-15T10:00:00+00:00"
 }
@@ -85,6 +86,11 @@ leaves the health payload, which a consumer reads on a schedule, unchanged.
 already readable on GitHub. Behind a private repository the same field would fingerprint
 the exact version and therefore its known defects. If this repository ever goes private,
 this route is the first thing to gate.
+
+`python_version` says which interpreter is answering. Four were in play on 2026-09-17 — the
+Dockerfile pinned 3.12, CI ran 3.13, the development laptop had 3.13.7, and the server's was
+unknowable from anywhere, because no surface reported it. A suite green on a version
+production does not run proves less than it looks like.
 
 Note `version` and `data_format_version` are different numbers and move for different
 reasons: the first is what this program is, the second is what its output files promise.
@@ -144,6 +150,23 @@ are a shell on the machine or the first file that arrives, which is the wrong or
 which the public repository already shows. An identity is the key a consumer's trust
 registry is keyed on and names one machine's data directory; it belongs behind the same
 grant as the symbol names.
+
+The payload also carries **`process`** — resident memory, thread and socket counts and
+consumed CPU time, sampled per request:
+
+```json
+"process": {"available": true, "rss_mb": 118.4, "threads": 12, "open_sockets": 9, "cpu_seconds": 431.2}
+```
+
+It is a reading rather than a record, which is why it is computed here and not stored in
+`CollectorStats`. It exists because the box is shared: three services on 8 GB with roughly 2.4 GB
+of headroom, and a collector that runs for weeks is where a slow leak hides. The sister project
+found its own documented memory figure stale by 380 MB the day it measured instead of remembering.
+
+`open_sockets` is **`null`, never `0`**, where the platform refuses the question — Windows does
+for a process without the rights to ask. Zero would read as "none open", which is a measurement
+nobody made. And the whole block answers `available: false` rather than raising: a diagnostic that
+can fail the route carrying it costs more than it reports.
 
 ## `GET /v1/configs` — `config:effective`
 
@@ -223,6 +246,14 @@ archive holds `files:*`. A per-file grant is possible; it is what the model allo
 what it expects.
 
 ## `GET /v1/logs` — `logs:collector`
+
+**`day` is optional, and omitting it means the newest day present — deliberately not today.**
+From a remote session the box's own date boundary is unknown: a few minutes after midnight UTC
+"today" is an almost empty file while yesterday is the finished one, and in both cases what
+somebody means by "the log" is the newest one there is. An empty log directory answers with
+`day: null` and an empty `available_days` rather than reporting a missing file for a date that was
+never going to exist.
+
 
 One UTC day of the log.
 

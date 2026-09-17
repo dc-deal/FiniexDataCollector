@@ -38,7 +38,7 @@ from finiex_auth.token_registry import TokenRegistry
 from python.api.archive_reader import read_archive
 from python.api.build_info import BuildInfo
 from python.api.file_server import resolve_archive_file
-from python.api.log_reader import MAX_LINES, read_log
+from python.api.log_reader import MAX_LINES, available_days, read_log
 from python.api.redaction import redact_config
 from python.types.tick_types import OriginBlock
 
@@ -123,6 +123,7 @@ def create_api(
             "data_format_version": build.data_format_version,
             "commit": build.commit,
             "dirty": build.dirty,
+            "python_version": build.python_version,
             "started_at": build.started_at
         }
 
@@ -238,7 +239,9 @@ def create_api(
             ]
         )
         def log_excerpt(
-            day: str = Query(..., description="UTC date, YYYY-MM-DD"),
+            day: Optional[str] = Query(
+                None,
+                description="UTC date, YYYY-MM-DD. Omitted: the newest day present"),
             min_level: str = Query("INFO"),
             since: Optional[datetime] = Query(None),
             until: Optional[datetime] = Query(None),
@@ -254,13 +257,26 @@ def create_api(
             The day is a QUERY parameter on purpose. A path parameter becomes the
             grant name (`logs:<value>`), so a date there would demand a grant per
             calendar day. Without one, the surface itself is the permission.
+
+            **Omitting it means the newest day present**, not today. From a remote
+            session the box's own date boundary is not known - asking for "today"
+            a few minutes after midnight UTC returns an almost empty file, and
+            asking for yesterday returns a finished one. The newest file is what
+            somebody means by "the log" in both cases.
             """
-            try:
-                parsed = date.fromisoformat(day)
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"day must be YYYY-MM-DD, got {day!r}")
+            if day is None:
+                days = available_days(log_dir)
+                if not days:
+                    return {"day": None, "exists": False, "line_count": 0,
+                            "available_days": []}
+                parsed = date.fromisoformat(days[-1])
+            else:
+                try:
+                    parsed = date.fromisoformat(day)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"day must be YYYY-MM-DD, got {day!r}")
 
             return read_log(
                 log_dir, parsed, min_level=min_level,

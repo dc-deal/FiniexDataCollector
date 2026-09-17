@@ -29,7 +29,11 @@ from fastapi.testclient import TestClient
 
 from python.api.api_app import create_api
 from python.api.build_info import BuildInfo
-from python.api.stats_serializer import health_payload, serialize_stats
+from python.api.stats_serializer import (
+    _socket_count,
+    health_payload,
+    serialize_stats
+)
 from python.main import serve_status_api
 from python.api.token_loader import ConsumerToken, load_token_registry
 from python.types.collector_stats import CollectorStats
@@ -47,6 +51,7 @@ BUILD = BuildInfo(
     data_format_version="1.6.0",
     commit="abc1234",
     dirty=False,
+    python_version="3.13.7",
     started_at="2026-09-15T10:00:00+00:00"
 )
 
@@ -329,3 +334,100 @@ def test_a_status_api_that_stops_later_does_not_kill_the_collector() -> None:
     asyncio.run(serve_status_api(FailingServer(), RecordingLogger()))
 
     assert "socket went away" in recorded[0]
+
+
+# =============================================================================
+# DIAGNOSIS FROM A DISTANCE
+# =============================================================================
+
+def test_the_status_reports_what_the_process_costs(client: TestClient) -> None:
+    """
+    Three services share 8 GB on that box, with roughly 2.4 GB of headroom.
+
+    A collector runs for weeks, which is exactly where a slow leak hides, and
+    from a remote session there is no shell to ask. The sister project found its
+    own documented memory figure stale by 380 MB the day it measured instead of
+    remembering.
+    """
+    payload = client.get("/v1/status", headers=as_reader()).json()
+
+    process = payload["process"]
+    assert process["available"] is True
+    assert process["rss_mb"] > 0
+    assert process["threads"] >= 1
+    assert process["cpu_seconds"] >= 0
+
+
+def test_a_refused_socket_count_is_unknown_and_not_zero(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Windows refuses the connection list to a process without the rights to ask.
+
+    Reported as `0` that reads as "none open", which is a measurement nobody
+    made. `None` says the opposite, and the difference is the whole reason this
+    project exists in the shape it does.
+
+    Args:
+        monkeypatch: pytest patching helper
+    """
+    class RefusingProcess:
+        def net_connections(self) -> None:
+            raise PermissionError("access denied")
+
+    assert _socket_count(RefusingProcess()) is None
+
+
+def test_the_process_block_never_fails_the_route(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A diagnostic that can take down the route carrying it costs more than it
+    reports. So psutil failing outright is an answer, not an exception.
+
+    Args:
+        monkeypatch: pytest patching helper
+    """
+    import python.api.stats_serializer as serializer
+
+    def unavailable() -> None:
+        raise RuntimeError("no such process")
+
+    monkeypatch.setattr(serializer.psutil, "Process", unavailable)
+
+    assert serializer.process_resources() == {"available": False}
+
+
+def test_build_states_which_interpreter_is_running(client: TestClient) -> None:
+    """
+    Four Python versions were in play on 2026-09-17 and nobody could say which
+    one production had.
+
+    The Dockerfile pinned 3.12, CI ran 3.13, the development laptop had 3.13.7,
+    and the server was unknowable from anywhere - no surface reported it. A suite
+    green on a version production does not run proves less than it looks like,
+    and this is the field that turns that from an assumption into a question with
+    an answer.
+    """
+    payload = client.get("/v1/build").json()
+
+    assert payload["python_version"] == BUILD.python_version
+    assert payload["python_version"].count(".") == 2, "want major.minor.patch"
+
+
+def test_the_interpreter_version_is_sampled_not_invented() -> None:
+    """
+    It describes the process that is answering, so it comes from the process.
+
+    Read per request it would still be right - the interpreter cannot change
+    under a running process - but it is sampled with the rest of the build
+    identity for one reason: every field on this route describes the same
+    instant, and a mixture is harder to reason about than a snapshot.
+    """
+    import platform
+
+    from python.api.build_info import sample_build_info
+
+    sampled = sample_build_info("9.9.9", "9.9.9")
+
+    assert sampled.python_version == platform.python_version()

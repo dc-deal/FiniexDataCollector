@@ -209,7 +209,6 @@ class AppConfig(BaseModel):
     Args:
         app_name: Application name
         version: Application version
-        environment: Environment (development, production)
         logging: Logging configuration
         paths: Path configuration
         kraken: Kraken collector configuration
@@ -221,7 +220,6 @@ class AppConfig(BaseModel):
     """
     app_name: str = "FiniexDataCollector"
     version: str
-    environment: str = "production"
 
     logging: LoggingConfig
     paths: PathsConfig = Field(default_factory=PathsConfig)

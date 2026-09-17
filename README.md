@@ -4,7 +4,7 @@
 
 > ⚠️ **No financial advice.** This software is for educational and research purposes only.
 
-> **Version:** 1.2.0  
+> **Version:** 1.2.1  
 > **Status:** Production Ready  
 > **Target:** Developers who need reliable tick data for backtesting systems
 

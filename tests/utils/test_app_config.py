@@ -17,6 +17,10 @@ from python.main import is_reconnect
 from python.utils.config_loader import AppConfig
 
 CONFIG_PATH = Path("configs/app_config.json")
+# The file is tracked as README.md. It was tracked as `readme.md` while the disk
+# said `README.md` until 2026-09-17 - git's core.ignorecase on Windows lets the
+# index and the working tree disagree silently, and CI, which checks out from the
+# index, was the first thing to notice.
 README_PATH = Path("README.md")
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 

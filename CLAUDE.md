@@ -286,6 +286,11 @@ suite gets an entry in `docs/tests/test_overview.md` in the same change.
 
 - `pytest` from the project root; `pytest.ini` sets `pythonpath = .` so the suite runs
   regardless of how it is invoked.
+- **GitHub Actions runs it on every push, on Linux AND Windows**
+  (`.github/workflows/tests.yml`). The matrix is the point: development happens in a Linux
+  container and production is Windows Server, and a suite green on one of the two says
+  less than it looks like. The install step doubles as the check that `finiex-auth` still
+  resolves over `git+https` — the dependency that cannot be repaired on a deployment day.
 - **Fixtures are synthetic.** No test depends on a live WebSocket or on collected data.
   `tests/conftest.py` builds tick series and a broker config through the real loading path.
 - **Time is driven, not waited for.** The `steerable_clock` fixture patches the clock's time
@@ -336,9 +341,20 @@ the server, the same pattern the sister projects use — the box is Windows, the
 has to read a local broker terminal's output directory, and a container buys isolation
 nobody needs at the cost of a Linux VM.
 
-**A hard kill costs the in-memory buffer.** Ticks buffer until rotation or `finalize()`, so
-a service stop path that does not deliver a graceful signal loses up to a full file per
-symbol. Any service wrapper must be configured to send an interrupt, not to terminate.
+**A hard kill costs one tick, not a buffer — since the write-ahead log.** Every tick is
+appended to the `.jsonl.part` sidecar and **flushed** before it counts as collected
+(`_append_to_wal`), so a process killed outright loses at most the tick in flight and the
+next start rebuilds the file from the log. This paragraph said the opposite until
+2026-09-17, and the difference matters: the old wording argued against any service wrapper
+that cannot guarantee a graceful signal, and that argument is now obsolete.
+
+**It still holds for a build older than the write-ahead log**, which is what production ran
+until the 1.7.0 rollout: there the buffer lives in RAM and nowhere else, up to
+`max_ticks_per_file` per symbol. Check which build a process is before deciding how
+carefully it has to be stopped.
+
+A graceful stop is still preferable — it closes files instead of leaving logs to recover
+from — but it is no longer the difference between keeping and losing the data.
 
 ---
 
@@ -412,6 +428,18 @@ has the reasoning; the day cut is checked *before* a tick is appended, unlike th
 **Configuration overlay:** `configs/app_config.json` is the tracked baseline with every
 credential blank and disabled; `user_configs/app_config.json` overrides it by deep merge and
 is gitignored. A live credential must never appear in the tracked file.
+
+**Reaching the live instance from here:** `user_configs/remote_endpoints.json` holds the
+base URL and the operator's token for the collector running on the production server, with
+`remote_endpoints.example.json` as the tracked counterpart carrying the shape and the rules
+but no values. Nothing reads it at runtime — the collector does not know it exists. It is
+there so a session can query production without the operator looking the URL up again.
+
+Three rules come with it. **One token per consumer**, so revoking the operator's does not
+take the consuming project's surface away with it. **Print the URL, never the token** — a
+command that needs it reads it from the file. And a 403 from a route means the grant is
+missing, not that the route is broken: the token authorises exactly the grants listed
+beside it.
 
 ---
 

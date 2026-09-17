@@ -37,7 +37,7 @@ ORIGIN = OriginBlock(
     producer_version="1.2.0"
 )
 
-BUILD = BuildInfo("1.1.0", "1.6.0", "abc1234", False, "2026-09-15T10:00:00+00:00")
+BUILD = BuildInfo("1.1.0", "1.6.0", "abc1234", False, "3.13.7", "2026-09-15T10:00:00+00:00")
 
 BOT_TOKEN = "8256155493:AAplanted-secret-value"
 API_TOKEN = "planted-consumer-secret"
@@ -635,3 +635,54 @@ def test_a_tiny_response_is_left_alone(download_client: TestClient) -> None:
 
     assert response.status_code == 200
     assert "content-encoding" not in response.headers
+
+
+def test_the_log_route_defaults_to_the_newest_day(client: TestClient) -> None:
+    """
+    Omitting the day means the newest file present, deliberately not "today".
+
+    From a remote session the box's own date boundary is unknown. A few minutes
+    after midnight UTC, "today" is an almost empty file and yesterday is the
+    finished one - and in both cases what somebody means by "the log" is the
+    newest one there is.
+
+    Args:
+        client: TestClient over the diagnostic routes
+    """
+    with_day = client.get("/v1/logs?day=2026-09-15", headers=HEADERS).json()
+    without = client.get("/v1/logs", headers=HEADERS).json()
+
+    assert without["day"] == with_day["day"], "did not pick the only day present"
+    assert without["line_count"] == with_day["line_count"]
+
+
+def test_an_empty_log_directory_answers_rather_than_guesses(
+    tmp_path: Path
+) -> None:
+    """
+    No log files at all is a state, not an error.
+
+    Defaulting to today's date there would report a missing file for a day that
+    was never going to exist, which reads like a fault. Saying so plainly, with
+    an empty list of days, is the honest answer.
+
+    Args:
+        tmp_path: pytest temp directory
+    """
+    empty = tmp_path / "logs"
+    empty.mkdir()
+
+    probe = TestClient(create_api(
+        build=BUILD,
+        health_provider=lambda: {"status": "ok"},
+        detail_provider=lambda: {"symbols": {}},
+        origin=ORIGIN,
+        registry=load_token_registry({"full": FULL}),
+        log_dir=empty
+    ))
+
+    payload = probe.get("/v1/logs", headers=HEADERS).json()
+
+    assert payload["exists"] is False
+    assert payload["day"] is None
+    assert payload["available_days"] == []

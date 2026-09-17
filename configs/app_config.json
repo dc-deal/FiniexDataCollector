@@ -1,8 +1,7 @@
 {
   "_comment": "FiniexDataCollector Configuration",
   "app_name": "FiniexDataCollector",
-  "version": "1.2.0",
-  "environment": "production",
+  "version": "1.2.1",
   "paths": {
     "raw_data_dir": "./data/raw",
     "broker_configs_dir": "./configs/brokers",

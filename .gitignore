@@ -24,8 +24,15 @@ wheels/
 *.egg
 MANIFEST
 
+# Start scripts live on the machine they start, never here. They are the kind of
+# file that grows a credential - the RAG engine's carries four - and a tracked
+# copy both invites that and drifts from the one actually in use.
+start_*.ps1
+*_env.ps1
+
 # Virtual Environment
 venv/
+.venv/
 ENV/
 env/
 
