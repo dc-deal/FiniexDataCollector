@@ -51,6 +51,7 @@ BUILD = BuildInfo(
     data_format_version="1.6.0",
     commit="abc1234",
     dirty=False,
+    python_version="3.13.7",
     started_at="2026-09-15T10:00:00+00:00"
 )
 
@@ -395,3 +396,38 @@ def test_the_process_block_never_fails_the_route(
     monkeypatch.setattr(serializer.psutil, "Process", unavailable)
 
     assert serializer.process_resources() == {"available": False}
+
+
+def test_build_states_which_interpreter_is_running(client: TestClient) -> None:
+    """
+    Four Python versions were in play on 2026-09-17 and nobody could say which
+    one production had.
+
+    The Dockerfile pinned 3.12, CI ran 3.13, the development laptop had 3.13.7,
+    and the server was unknowable from anywhere - no surface reported it. A suite
+    green on a version production does not run proves less than it looks like,
+    and this is the field that turns that from an assumption into a question with
+    an answer.
+    """
+    payload = client.get("/v1/build").json()
+
+    assert payload["python_version"] == BUILD.python_version
+    assert payload["python_version"].count(".") == 2, "want major.minor.patch"
+
+
+def test_the_interpreter_version_is_sampled_not_invented() -> None:
+    """
+    It describes the process that is answering, so it comes from the process.
+
+    Read per request it would still be right - the interpreter cannot change
+    under a running process - but it is sampled with the rest of the build
+    identity for one reason: every field on this route describes the same
+    instant, and a mixture is harder to reason about than a snapshot.
+    """
+    import platform
+
+    from python.api.build_info import sample_build_info
+
+    sampled = sample_build_info("9.9.9", "9.9.9")
+
+    assert sampled.python_version == platform.python_version()

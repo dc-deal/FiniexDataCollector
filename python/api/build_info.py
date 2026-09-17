@@ -16,6 +16,7 @@ the field exists for.
 Location: python/api/build_info.py
 """
 
+import platform
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,12 +36,14 @@ class BuildInfo:
         data_format_version: Schema version of the files this code writes
         commit: Short commit hash, or None outside a git checkout
         dirty: Whether the working tree carried uncommitted changes at startup
+        python_version: The interpreter actually running, e.g. `3.12.4`
         started_at: Process start, UTC ISO 8601
     """
     version: str
     data_format_version: str
     commit: Optional[str]
     dirty: Optional[bool]
+    python_version: str
     started_at: str
 
 
@@ -90,5 +93,11 @@ def sample_build_info(version: str, data_format_version: str) -> BuildInfo:
         data_format_version=data_format_version,
         commit=commit,
         dirty=None if status is None else bool(status),
+        # Which interpreter, not which one anybody assumed. Four different
+        # versions were in play on 2026-09-17 - the Dockerfile pinned 3.12, CI
+        # ran 3.13, the laptop had 3.13.7, and nobody could say what the server
+        # had, because no surface reported it. A suite green on a version
+        # production does not run proves less than it looks like.
+        python_version=platform.python_version(),
         started_at=datetime.now(timezone.utc).isoformat(timespec="seconds")
     )

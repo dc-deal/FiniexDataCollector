@@ -123,6 +123,7 @@ def create_api(
             "data_format_version": build.data_format_version,
             "commit": build.commit,
             "dirty": build.dirty,
+            "python_version": build.python_version,
             "started_at": build.started_at
         }
 

@@ -148,6 +148,22 @@ The failing-console test exists because the mutation check found the hole: every
 returns before the Windows branch, so the `except` that keeps a console problem away from the
 collection was carrying no test at all.
 
+### `tests/utils/test_doc_links.py`
+
+A link is a claim that a file is there under that name, and on Windows and macOS the filesystem
+answers to any spelling. So a wrong one survives every local check and breaks in the two places
+that are case-sensitive and that nobody watches: GitHub's link resolution, and CI on a real Linux
+filesystem.
+
+It compares against the directory listing rather than calling `Path.exists()` — and deliberately
+avoids `Path.resolve()`, which on Windows silently returns the real on-disk spelling and thereby
+repairs the exact mistake the test exists to find. It did that on the first run, which is how the
+limitation was discovered.
+
+The defect behind it was not a spelling at all: git tracked `readme.md` while the disk said
+`README.md`, because `core.ignorecase` lets the index and the working tree disagree without ever
+saying so. CI checks out from the index, so CI was the first thing to notice.
+
 ### `tests/utils/test_devcontainer.py`
 
 Two lists of editor extensions and a set of mounts maintained by hand across three files, with

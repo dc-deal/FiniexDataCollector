@@ -37,7 +37,7 @@ ORIGIN = OriginBlock(
     producer_version="1.2.0"
 )
 
-BUILD = BuildInfo("1.1.0", "1.6.0", "abc1234", False, "2026-09-15T10:00:00+00:00")
+BUILD = BuildInfo("1.1.0", "1.6.0", "abc1234", False, "3.13.7", "2026-09-15T10:00:00+00:00")
 
 BOT_TOKEN = "8256155493:AAplanted-secret-value"
 API_TOKEN = "planted-consumer-secret"

@@ -286,6 +286,11 @@ suite gets an entry in `docs/tests/test_overview.md` in the same change.
 
 - `pytest` from the project root; `pytest.ini` sets `pythonpath = .` so the suite runs
   regardless of how it is invoked.
+- **GitHub Actions runs it on every push, on Linux AND Windows**
+  (`.github/workflows/tests.yml`). The matrix is the point: development happens in a Linux
+  container and production is Windows Server, and a suite green on one of the two says
+  less than it looks like. The install step doubles as the check that `finiex-auth` still
+  resolves over `git+https` — the dependency that cannot be repaired on a deployment day.
 - **Fixtures are synthetic.** No test depends on a live WebSocket or on collected data.
   `tests/conftest.py` builds tick series and a broker config through the real loading path.
 - **Time is driven, not waited for.** The `steerable_clock` fixture patches the clock's time

@@ -65,6 +65,7 @@ asserts the absence rather than trusting the intent.
   "version": "<app version, from configs/app_config.json>",
   "data_format_version": "<format version, from python/types/tick_types.py>",
   "commit": "0c2f88e",
+  "python_version": "3.12.4",
   "dirty": false,
   "started_at": "2026-09-15T10:00:00+00:00"
 }
@@ -85,6 +86,11 @@ leaves the health payload, which a consumer reads on a schedule, unchanged.
 already readable on GitHub. Behind a private repository the same field would fingerprint
 the exact version and therefore its known defects. If this repository ever goes private,
 this route is the first thing to gate.
+
+`python_version` says which interpreter is answering. Four were in play on 2026-09-17 — the
+Dockerfile pinned 3.12, CI ran 3.13, the development laptop had 3.13.7, and the server's was
+unknowable from anywhere, because no surface reported it. A suite green on a version
+production does not run proves less than it looks like.
 
 Note `version` and `data_format_version` are different numbers and move for different
 reasons: the first is what this program is, the second is what its output files promise.
