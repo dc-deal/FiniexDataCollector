@@ -34,6 +34,7 @@ from python.utils.instance_identity import (
 from python.utils.instance_lock import InstanceLock
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import setup_logging, get_logger
+from python.utils.console_mode import disable_quick_edit
 from python.utils.live_display import LiveDisplay
 from python.types.collector_stats import CollectorStats
 from python.types.tick_types import OriginBlock
@@ -102,19 +103,25 @@ def validate_symbols(symbols: List[str]) -> None:
 
 def count_files_in_folder(folder_path: Path) -> int:
     """
-    Count files in a folder (non-recursive).
+    Count finished archive files in a folder (non-recursive).
+
+    Only `*_ticks.json`. Counting every file made the number include the open
+    write-ahead logs, so a fresh start reported one "file" per symbol before a
+    single archive file existed, and a crashed run left its orphans inflating it.
+    The display calls this "files", and a reader takes that to mean the archive.
 
     Args:
         folder_path: Path to folder
 
     Returns:
-        Number of files
+        Number of finished archive files
     """
     if not folder_path.exists():
         return 0
 
     try:
-        return sum(1 for item in folder_path.iterdir() if item.is_file())
+        return sum(1 for item in folder_path.glob("*_ticks.json")
+                   if item.is_file())
     except Exception:
         return 0
 
@@ -180,7 +187,7 @@ class FiniexDataCollector:
     Orchestrates collectors, writers, alerts, scheduler, and monitoring.
     """
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, show_display: bool = True):
         """
         Initialize application.
 
@@ -197,6 +204,7 @@ class FiniexDataCollector:
         self._telegram: Optional[TelegramAlertProvider] = None
         self._instance_lock: Optional[InstanceLock] = None
         self._origin: Optional[OriginBlock] = None
+        self._show_display = show_display
         self._api_server = None
         self._scheduler: Optional[WeeklyJobScheduler] = None
 
@@ -268,13 +276,27 @@ class FiniexDataCollector:
         if self._config.api.enabled:
             await self._start_status_api()
 
-        # Start live display
-        self._live_display = LiveDisplay(
-            self._stats,
-            streams=self._config.kraken.streams,
-            clock=self._clock
-        )
-        await self._live_display.start()
+        # A console is a convenience, and a convenience must not be able to stop
+        # the measurement: QuickEdit suspends the next write while text is
+        # selected, and this display writes from the collector's only event loop.
+        quick_edit = disable_quick_edit()
+        if quick_edit is False:
+            self._logger.warning(
+                "Could not turn QuickEdit off on this console. A click in the "
+                "window can suspend collection - use --no-display, or uncheck "
+                "QuickEdit in the window's properties.")
+
+        # Start live display. Off is a supported way to run: the file log is the
+        # record, and that is what a service-wrapped instance uses.
+        if self._show_display:
+            self._live_display = LiveDisplay(
+                self._stats,
+                streams=self._config.kraken.streams,
+                clock=self._clock
+            )
+            await self._live_display.start()
+        else:
+            self._logger.info("Live display off - the file log keeps the record")
 
         # Wait for shutdown
         await self._shutdown_event.wait()
@@ -345,7 +367,12 @@ class FiniexDataCollector:
             host=self._config.api.host,
             port=self._config.api.port,
             log_level="warning",
-            access_log=False
+            access_log=False,
+            # Without a bound, uvicorn waits for in-flight connections forever -
+            # and while it waits it still holds the SIGINT handler it installed,
+            # so the collector's own shutdown never starts. A held-open download
+            # would turn Ctrl+C into nothing visible happening at all.
+            timeout_graceful_shutdown=5
         ))
 
         self._monitoring_tasks.append(asyncio.create_task(
@@ -1043,8 +1070,15 @@ class FiniexDataCollector:
 
 
 
-async def cmd_collect(config: AppConfig) -> None:
-    """Run collection daemon."""
+async def cmd_collect(config: AppConfig, show_display: bool = True) -> None:
+    """
+    Run collection daemon.
+
+    Args:
+        config: The effective configuration
+        show_display: Render the live display. Off leaves the file log as the
+            only record, which is how a service-wrapped instance runs
+    """
     logger = get_logger("FiniexDataCollector")
 
     # === VALIDATION PHASE ===
@@ -1072,7 +1106,7 @@ async def cmd_collect(config: AppConfig) -> None:
     logger.info("Configuration validated successfully")
 
     # === START COLLECTION ===
-    app = FiniexDataCollector(config)
+    app = FiniexDataCollector(config, show_display=show_display)
     await app.start_collection()
 
 
@@ -1085,7 +1119,6 @@ def cmd_status(config: AppConfig) -> None:
     logger.info("FiniexDataCollector Status")
     logger.info("=" * 60)
     logger.info(f"Version: {config.version}")
-    logger.info(f"Environment: {config.environment}")
     logger.info("")
     logger.info("Kraken Collector:")
     logger.info(f"  Enabled: {config.kraken.enabled}")
@@ -1127,6 +1160,12 @@ def main():
         help="Path to config file"
     )
 
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="collect without the live display - the file log keeps the record"
+    )
+
     args = parser.parse_args()
 
     # Load config
@@ -1152,7 +1191,7 @@ def main():
     # Execute command
     try:
         if args.command == "collect":
-            asyncio.run(cmd_collect(config))
+            asyncio.run(cmd_collect(config, show_display=not args.no_display))
         elif args.command == "status":
             cmd_status(config)
     except ConfigurationError as e:

@@ -336,9 +336,20 @@ the server, the same pattern the sister projects use — the box is Windows, the
 has to read a local broker terminal's output directory, and a container buys isolation
 nobody needs at the cost of a Linux VM.
 
-**A hard kill costs the in-memory buffer.** Ticks buffer until rotation or `finalize()`, so
-a service stop path that does not deliver a graceful signal loses up to a full file per
-symbol. Any service wrapper must be configured to send an interrupt, not to terminate.
+**A hard kill costs one tick, not a buffer — since the write-ahead log.** Every tick is
+appended to the `.jsonl.part` sidecar and **flushed** before it counts as collected
+(`_append_to_wal`), so a process killed outright loses at most the tick in flight and the
+next start rebuilds the file from the log. This paragraph said the opposite until
+2026-09-17, and the difference matters: the old wording argued against any service wrapper
+that cannot guarantee a graceful signal, and that argument is now obsolete.
+
+**It still holds for a build older than the write-ahead log**, which is what production ran
+until the 1.7.0 rollout: there the buffer lives in RAM and nowhere else, up to
+`max_ticks_per_file` per symbol. Check which build a process is before deciding how
+carefully it has to be stopped.
+
+A graceful stop is still preferable — it closes files instead of leaving logs to recover
+from — but it is no longer the difference between keeping and losing the data.
 
 ---
 

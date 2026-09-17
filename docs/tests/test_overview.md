@@ -57,6 +57,11 @@ the archive file and deleting the log, a torn final line, a log with no ticks, a
 header. And one test that makes `os.replace` throw, because on the happy path both orderings
 of write-then-delete end identically.
 
+Also: a shutdown that arrives just after a rotation names no file. `finalize()` used to hand back
+the path of the file it had only opened, and the shutdown log then reported a file nobody wrote —
+measured on the production box, thirteen names against twelve files. That log is where someone
+looks to decide whether a stop was clean.
+
 ### `tests/writers/test_daily_close.py`
 
 A file bounded only by tick count spans however many days it needs — DASHUSD needs 24 to reach
@@ -123,6 +128,25 @@ a regex because nothing else keeps it in step.
 Also: the tracked config carries no live credentials; the reconnect rule recognises a
 connection coming back (it reported zero for 173 of them); the staleness detection window
 stays under a minute; file logging is not DEBUG by default.
+
+### `tests/utils/test_console_and_counting.py`
+
+Two defences against a display saying something untrue, and one of them can stop the collection.
+
+A Windows console in QuickEdit mode suspends the next write while text is selected, and the live
+display writes from the collector's only event loop — so one stray click stops the WebSocket
+reader and the writers with it. No tick arrives, which is the one gap the write-ahead log cannot
+close: it opens before the safety net, and a gap in a tick series is the same bytes as a quiet
+market. FiniexRAGEngine measured 13.5 hours of it on the same host.
+
+Defends: the console call never raises, anywhere, and returns `None` where there is no console;
+`ENABLE_EXTENDED_FLAGS` is set alongside the cleared QuickEdit bit, without which the console
+ignores the change *and reports success*; and the folder count includes only finished archive
+files, not the open write-ahead logs it used to count as "files".
+
+The failing-console test exists because the mutation check found the hole: every other test
+returns before the Windows branch, so the `except` that keeps a console problem away from the
+collection was carrying no test at all.
 
 ### `tests/utils/test_devcontainer.py`
 

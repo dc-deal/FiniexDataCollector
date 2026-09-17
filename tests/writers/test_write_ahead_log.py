@@ -449,3 +449,37 @@ def test_one_undeletable_log_does_not_end_the_recovery(
     assert len(recovered) == 2, "both symbols must still be rebuilt"
     assert len(wal_files(tmp_path)) == 1, "only the undeletable log remains"
     assert wal_files(tmp_path)[0].name.startswith("BTCUSD")
+
+
+def test_a_shutdown_with_nothing_buffered_names_no_file(
+    tmp_path: Path,
+    tick_series: List[TickData]
+) -> None:
+    """
+    A file rotated moments before the stop leaves an empty buffer behind.
+
+    `finalize()` used to hand back the path of the file it had just opened, and
+    the shutdown then logged `Finalized: <name>` for a file nobody ever wrote.
+    Measured on the production box 2026-09-17: the shutdown named thirteen files
+    and twelve were on disk. That log is exactly where someone looks afterwards
+    to decide whether a stop was clean, so a name with no file behind it sends
+    them hunting at the worst possible moment.
+
+    Args:
+        tmp_path: pytest temp directory
+        tick_series: A synthetic tick series
+    """
+    writer = build_writer(tmp_path, CollectionClock(), max_ticks_per_file=2)
+
+    # Exactly the rotation threshold: the file closes and the next one opens
+    # empty, which is the state a stop can arrive in.
+    for tick in tick_series[:2]:
+        writer.write_tick(tick)
+
+    assert len(archive_files(tmp_path)) == 1, "the rotation itself did not happen"
+    assert len(wal_files(tmp_path)) == 1, "no log was opened for the new file"
+
+    assert writer.finalize() is None, "named a file it did not write"
+
+    assert len(archive_files(tmp_path)) == 1, "an empty buffer produced a file"
+    assert wal_files(tmp_path) == [], "the empty log was left behind"
