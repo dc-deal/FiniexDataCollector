@@ -145,6 +145,23 @@ which the public repository already shows. An identity is the key a consumer's t
 registry is keyed on and names one machine's data directory; it belongs behind the same
 grant as the symbol names.
 
+The payload also carries **`process`** — resident memory, thread and socket counts and
+consumed CPU time, sampled per request:
+
+```json
+"process": {"available": true, "rss_mb": 118.4, "threads": 12, "open_sockets": 9, "cpu_seconds": 431.2}
+```
+
+It is a reading rather than a record, which is why it is computed here and not stored in
+`CollectorStats`. It exists because the box is shared: three services on 8 GB with roughly 2.4 GB
+of headroom, and a collector that runs for weeks is where a slow leak hides. The sister project
+found its own documented memory figure stale by 380 MB the day it measured instead of remembering.
+
+`open_sockets` is **`null`, never `0`**, where the platform refuses the question — Windows does
+for a process without the rights to ask. Zero would read as "none open", which is a measurement
+nobody made. And the whole block answers `available: false` rather than raising: a diagnostic that
+can fail the route carrying it costs more than it reports.
+
 ## `GET /v1/configs` — `config:effective`
 
 The configuration actually in force, after `user_configs/app_config.json` has been merged
@@ -223,6 +240,14 @@ archive holds `files:*`. A per-file grant is possible; it is what the model allo
 what it expects.
 
 ## `GET /v1/logs` — `logs:collector`
+
+**`day` is optional, and omitting it means the newest day present — deliberately not today.**
+From a remote session the box's own date boundary is unknown: a few minutes after midnight UTC
+"today" is an almost empty file while yesterday is the finished one, and in both cases what
+somebody means by "the log" is the newest one there is. An empty log directory answers with
+`day: null` and an empty `available_days` rather than reporting a missing file for a date that was
+never going to exist.
+
 
 One UTC day of the log.
 

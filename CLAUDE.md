@@ -424,6 +424,18 @@ has the reasoning; the day cut is checked *before* a tick is appended, unlike th
 credential blank and disabled; `user_configs/app_config.json` overrides it by deep merge and
 is gitignored. A live credential must never appear in the tracked file.
 
+**Reaching the live instance from here:** `user_configs/remote_endpoints.json` holds the
+base URL and the operator's token for the collector running on the production server, with
+`remote_endpoints.example.json` as the tracked counterpart carrying the shape and the rules
+but no values. Nothing reads it at runtime — the collector does not know it exists. It is
+there so a session can query production without the operator looking the URL up again.
+
+Three rules come with it. **One token per consumer**, so revoking the operator's does not
+take the consuming project's surface away with it. **Print the URL, never the token** — a
+command that needs it reads it from the file. And a 403 from a route means the grant is
+missing, not that the route is broken: the token authorises exactly the grants listed
+beside it.
+
 ---
 
 ## The closing report

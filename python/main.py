@@ -101,27 +101,30 @@ def validate_symbols(symbols: List[str]) -> None:
         )
 
 
-def count_files_in_folder(folder_path: Path) -> int:
+def count_files_in_folder(folder_path: Path, pattern: str) -> int:
     """
-    Count finished archive files in a folder (non-recursive).
+    Count matching files in a folder (non-recursive).
 
-    Only `*_ticks.json`. Counting every file made the number include the open
-    write-ahead logs, so a fresh start reported one "file" per symbol before a
-    single archive file existed, and a crashed run left its orphans inflating it.
-    The display calls this "files", and a reader takes that to mean the archive.
+    The pattern is required rather than defaulted, and that is the whole point.
+    Counting every entry made the archive number include the open write-ahead
+    logs, so a fresh start reported one "file" per symbol before a single
+    archive file existed. Narrowing it to `*_ticks.json` fixed that and set the
+    log count to zero, because this same function counts the log folder too - a
+    default that suited three of four callers is what made the second mistake
+    invisible. Now every caller says what it is counting.
 
     Args:
         folder_path: Path to folder
+        pattern: Glob the files must match, e.g. `*_ticks.json` or `*.log`
 
     Returns:
-        Number of finished archive files
+        Number of matching files
     """
     if not folder_path.exists():
         return 0
 
     try:
-        return sum(1 for item in folder_path.glob("*_ticks.json")
-                   if item.is_file())
+        return sum(1 for item in folder_path.glob(pattern) if item.is_file())
     except Exception:
         return 0
 
@@ -484,7 +487,7 @@ class FiniexDataCollector:
                     if has_subfolders:
                         # Files organized in symbol sub-folders
                         kraken_count = sum(
-                            count_files_in_folder(symbol_folder)
+                            count_files_in_folder(symbol_folder, "*_ticks.json")
                             for symbol_folder in kraken_path.iterdir()
                             if symbol_folder.is_dir()
                         )
@@ -496,7 +499,7 @@ class FiniexDataCollector:
                                 symbol = symbol_folder.name
                                 if symbol in self._stats.symbols:
                                     count = count_files_in_folder(
-                                        symbol_folder)
+                                        symbol_folder, "*_ticks.json")
                                     self._stats.symbols[symbol].folder_file_count = count
                                     symbol_scans.append(f"{symbol}={count}")
 
@@ -505,7 +508,8 @@ class FiniexDataCollector:
                         )
                     else:
                         # Files directly in kraken folder (no sub-folders)
-                        kraken_count = count_files_in_folder(kraken_path)
+                        kraken_count = count_files_in_folder(
+                            kraken_path, "*_ticks.json")
 
                         self._logger.debug(
                             f"[FOLDER_SCAN] Flat structure: {kraken_count} files directly in kraken folder"
@@ -539,7 +543,8 @@ class FiniexDataCollector:
                     )
 
                     if mt5_path.exists():
-                        mt5_count = count_files_in_folder(mt5_path)
+                        mt5_count = count_files_in_folder(
+                            mt5_path, "*_ticks.json")
                         self._logger.debug(
                             f"[FOLDER_SCAN] MT5 total: {mt5_count} files"
                         )
@@ -555,7 +560,7 @@ class FiniexDataCollector:
                 )
 
                 if logs_path.exists():
-                    logs_count = count_files_in_folder(logs_path)
+                    logs_count = count_files_in_folder(logs_path, "*.log")
                     self._logger.debug(
                         f"[FOLDER_SCAN] Logs total: {logs_count} files"
                     )

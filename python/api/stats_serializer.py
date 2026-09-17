@@ -15,9 +15,11 @@ anyone editing this file. The two exclusions are deliberate and named below.
 Location: python/api/stats_serializer.py
 """
 
+import psutil
+
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from python.types.collector_stats import CollectorStats
 
@@ -82,7 +84,64 @@ def serialize_stats(stats: CollectorStats) -> Dict[str, Any]:
     })
 
     payload["uptime_seconds"] = uptime_seconds(stats)
+    payload["process"] = process_resources()
     return payload
+
+
+def process_resources() -> Dict[str, Any]:
+    """
+    What this process is costing the machine, sampled now.
+
+    Collected state lives in `CollectorStats`; this does not, because it is a
+    reading rather than a record - the same reason `disk_space` computes its
+    derived fields here instead of storing them.
+
+    It exists because the box is shared. Three services run on 8 GB with roughly
+    2.4 GB of headroom, and the sister project found its own documented figure
+    stale by 380 MB once it measured instead of remembering. A collector that
+    runs for weeks is exactly where a slow leak hides, and from a remote session
+    this is the only way to see one without a shell on the machine.
+
+    Never raises: a diagnostic that can fail the route carrying it would cost
+    more than it reports.
+
+    Returns:
+        Resident memory, thread and socket counts and consumed CPU time, or
+        `available: false` when psutil cannot say
+    """
+    try:
+        process = psutil.Process()
+        with process.oneshot():
+            times = process.cpu_times()
+            return {
+                "available": True,
+                "rss_mb": round(process.memory_info().rss / (1024 * 1024), 1),
+                "threads": process.num_threads(),
+                "open_sockets": _socket_count(process),
+                "cpu_seconds": round(times.user + times.system, 1)
+            }
+    except Exception:
+        return {"available": False}
+
+
+def _socket_count(process: psutil.Process) -> Optional[int]:
+    """
+    Open network connections, or None when the platform will not say.
+
+    Windows refuses this for a process without the rights to ask, and a refusal
+    must not be reported as `0` - zero reads as "none open", which is a
+    measurement, while None says nothing was measured.
+
+    Args:
+        process: The process to ask
+
+    Returns:
+        The count, or None when it could not be determined
+    """
+    try:
+        return len(process.net_connections())
+    except Exception:
+        return None
 
 
 def uptime_seconds(stats: CollectorStats) -> int:

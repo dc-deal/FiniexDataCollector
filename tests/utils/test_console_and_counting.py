@@ -51,12 +51,32 @@ def test_only_finished_archive_files_are_counted(tmp_path: Path) -> None:
     (tmp_path / ".collector.lock").write_text("{}", encoding="utf-8")
     (tmp_path / "instance.json").write_text("{}", encoding="utf-8")
 
-    assert count_files_in_folder(tmp_path) == 2
+    assert count_files_in_folder(tmp_path, "*_ticks.json") == 2
+
+
+def test_the_log_folder_is_counted_by_its_own_pattern(tmp_path: Path) -> None:
+    """
+    The same function counts the log folder, and narrowing it once broke that.
+
+    Fixing the archive count to `*_ticks.json` set the log count to zero on the
+    production box the same day - visible as `Logs: 0 files` beside a log file
+    that plainly existed. One test covered the case being thought about and none
+    covered the other caller, so the pattern is a required argument now and this
+    is the test that would have caught it.
+
+    Args:
+        tmp_path: pytest temp directory
+    """
+    (tmp_path / "finiexdatacollector_2026-09-16.log").write_text("x", encoding="utf-8")
+    (tmp_path / "finiexdatacollector_2026-09-17.log").write_text("x", encoding="utf-8")
+    (tmp_path / "BTCUSD_20260917_084219_ticks.json").write_text("{}", encoding="utf-8")
+
+    assert count_files_in_folder(tmp_path, "*.log") == 2
 
 
 def test_a_missing_folder_counts_zero(tmp_path: Path) -> None:
     """A folder that does not exist yet is not an error - it is empty."""
-    assert count_files_in_folder(tmp_path / "nothing_here") == 0
+    assert count_files_in_folder(tmp_path / "nothing_here", "*_ticks.json") == 0
 
 
 # =============================================================================
