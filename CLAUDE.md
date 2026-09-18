@@ -151,6 +151,51 @@ held. That is why:
   can be varied — not baked into data where it is permanent and indistinguishable from a
   measurement.
 
+### The other half: an absence is not evidence
+
+The rule above governs fields that *assert*. FiniexRAGEngine sent the half it does not cover
+on 2026-09-17, and it is adopted here — with one place where we break it, and one where we
+nearly built something nobody wanted:
+
+**The producer reports; the consumer decides.** A failure is stated, never absorbed. Never
+emit a value a consumer cannot distinguish from a normal one — an absence in the output says
+which kind of absence it is, **written at the moment it happens, because afterwards it cannot
+be recovered**. Any policy that belongs to whoever carries the risk — a staleness threshold, a
+retry that hides an uncertainty, a fallback that looks like data — is the consumer's to choose,
+not the producer's to assume.
+
+The test: *would a consumer acting on this field do something different if they knew what
+actually happened?* And the counter-test, which matters as much: **not every absence is a
+failure.** A quiet hour is a statement about the world. Measure before calling one an error —
+reporting a quiet market as an outage is the same defect pointed the other way.
+
+**Where we break it: `data_stream_status` is a constant.** `JsonTickWriter._errors` is
+initialised and reset and never appended to, so `total_errors` is 0, every severity count is 0,
+the error rate is 1.0 and the status is `HEALTHY` — in every file ever written, whatever
+happened while it was being written. A consumer **cannot detect this from the data**: the field
+reads as a measurement and there is nothing to compare it against. Tracked in issue #7.
+
+**Where it does not apply, which took a correction to see.** Gaps in the tick stream looked like
+the same defect: a gap because the venue was quiet and a gap because the socket dropped are the
+same bytes, and only the writer knows which. Measured 2026-09-17, gaps over 60 s cost between
+1 % and 16.9 % of a file's covered period.
+
+But the consuming project **detects gaps from the data itself** and has tooling for them, and so
+do the systems behind it — bar rendering and the rest are built on those methods. The cause label
+would not change what any of them does, and the ticks are unrecoverable either way. The operator
+said so on 2026-09-17 and was right.
+
+The difference between the two is the test itself: *would a consumer acting on this do something
+different if they knew?* For `HEALTHY` yes, and they cannot even see the question. For a gap no,
+and they can already see the gap. **A cause the consumer will not act on is transparency, not a
+contract defect** — worth having where it is cheap, not worth a field in every file.
+
+The residue worth keeping: whoever interprets a *window* rather than handling a gap — a coverage
+figure, a parity measurement — is comparing conditions, and 16.9 % lost to our socket is not the
+same condition as a thin market. That judgement belongs to the party carrying the risk, which is
+corollary 2 again: we report what we have, they decide what it means. What we have already
+travels — `/v1/status` carries the reconnect events and the log carries the rest.
+
 ### The invariants an import enforces
 
 A file is rejected whole — up to 50,000 ticks, irreversibly, because the importer never
