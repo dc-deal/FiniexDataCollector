@@ -393,7 +393,9 @@ def test_a_failed_write_leaves_the_log_in_place(
     def refuse(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr("python.writers.json_tick_writer.os.replace", refuse)
+    # The rename lives in wal_archive since the writer and the recovery started
+    # sharing one archive builder; this is still the same last step.
+    monkeypatch.setattr("python.writers.wal_archive.os.replace", refuse)
 
     with pytest.raises(Exception):
         writer.finalize()

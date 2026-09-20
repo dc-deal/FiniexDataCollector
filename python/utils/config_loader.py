@@ -16,6 +16,7 @@ from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field, field_validator, ValidationError
 
 from python.exceptions.collector_exceptions import ConfigurationError
+from python.utils.logging_setup import describe_exception
 
 
 class LoggingConfig(BaseModel):
@@ -102,7 +103,8 @@ class KrakenCollectorConfig(BaseModel):
         streams: List of streams (ticker, trade)
         reconnect_max_delay_seconds: Maximum reconnect delay
         reconnect_initial_delay_seconds: Initial reconnect delay
-        heartbeat_interval_seconds: Heartbeat check interval
+        stale_after_seconds: Silence, heartbeats included, after which the
+            connection is closed and reopened; Kraken sends one every second
         max_ticks_per_file: Maximum ticks before file rotation
     """
     enabled: bool = True
@@ -113,7 +115,7 @@ class KrakenCollectorConfig(BaseModel):
     streams: List[str] = Field(default=["ticker"])
     reconnect_max_delay_seconds: int = Field(default=60, ge=1, le=300)
     reconnect_initial_delay_seconds: int = Field(default=1, ge=1, le=60)
-    heartbeat_interval_seconds: int = Field(default=30, ge=10, le=120)
+    stale_after_seconds: int = Field(default=10, ge=3, le=60)
     max_ticks_per_file: int = Field(default=50000, ge=100, le=1000000)
 
     @field_validator('symbols')
@@ -275,7 +277,7 @@ class ConfigLoader:
                 base_data = json.load(f)
         except json.JSONDecodeError as e:
             raise ConfigurationError(
-                f"Invalid JSON in config file: {e}",
+                f"Invalid JSON in config file: {describe_exception(e)}",
                 config_file=str(self._config_path)
             )
 
@@ -287,7 +289,7 @@ class ConfigLoader:
                     user_data = json.load(f)
             except json.JSONDecodeError as e:
                 raise ConfigurationError(
-                    f"Invalid JSON in user config: {e}",
+                    f"Invalid JSON in user config: {describe_exception(e)}",
                     config_file=str(self.USER_CONFIG_PATH)
                 )
 

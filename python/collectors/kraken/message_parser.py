@@ -14,6 +14,7 @@ from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import MessageParseError
 from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
+from python.utils.logging_setup import describe_exception
 
 
 class KrakenMessageParser:
@@ -57,7 +58,7 @@ class KrakenMessageParser:
             data = json.loads(raw_message)
         except json.JSONDecodeError as e:
             raise MessageParseError(
-                f"Invalid JSON: {e}",
+                f"Invalid JSON: {describe_exception(e)}",
                 raw_message=raw_message
             )
 
@@ -254,7 +255,7 @@ class KrakenMessageParser:
 
         except (KeyError, ValueError, TypeError) as e:
             raise MessageParseError(
-                f"Failed to parse trade: {e}",
+                f"Failed to parse trade: {describe_exception(e)}",
                 raw_message=str(trade),
                 symbol=trade.get("symbol")
             )

@@ -38,6 +38,19 @@ reverses arrival times; a one-tick spread is never reported as zero.
 That last one came from live data, not review: `int(spread_raw / tick_size)` truncated
 `0.00999999999999801` to 0, and 59 % of LTCUSD ticks claimed no spread.
 
+### `tests/collectors/test_stale_detection.py`
+
+A dropped connection costs the trades made while the dead socket is still believed alive, and on
+2026-09-18 that was 537 trades in four drops, 30–40 s of each spent noticing. Silence is now
+judged every second, because Kraken sends a heartbeat every second.
+
+Defends: a silent feed is reopened on the first check past the threshold; a feed that sends its
+heartbeat is left alone; and — the half that matters more — a blocked event loop is not mistaken
+for a dead feed. The midnight cut blocks the loop for 17.85 s while the socket holds unread
+messages, so a short threshold without that exemption would force a reconnect at every day cut.
+A feed that really died during a block is still reopened on the next check. The time source and
+the sleep are driven by hand; waiting for a real outage is not a test strategy.
+
 ### `tests/writers/test_json_tick_writer.py`
 
 Two groups: what the file declares about itself, and what it must satisfy to be imported at
@@ -126,8 +139,8 @@ in the README status line. Two are machine-readable and guarded here; the README
 a regex because nothing else keeps it in step.
 
 Also: the tracked config carries no live credentials; the reconnect rule recognises a
-connection coming back (it reported zero for 173 of them); the staleness detection window
-stays under a minute; file logging is not DEBUG by default.
+connection coming back (it reported zero for 173 of them); the dead-connection threshold stays
+short; file logging is not DEBUG by default.
 
 ### `tests/utils/test_console_and_counting.py`
 
@@ -147,6 +160,73 @@ files, not the open write-ahead logs it used to count as "files".
 The failing-console test exists because the mutation check found the hole: every other test
 returns before the Windows branch, so the `except` that keeps a console problem away from the
 collection was carrying no test at all.
+
+### `tests/writers/test_archive_export.py`
+
+Writing an archive file ran on the collector's only event loop: about 1 s per file plus 66 µs per
+tick, measured on production, and nine files at the UTC day cut meant 21 s in which nothing else
+ran. A closed file is handed to a subprocess instead — the ticks are already on disk in the
+write-ahead log, and the closing state goes in as its last line.
+
+Defends: the handed-over file is **byte for byte** the file the inline path would have written
+(with the clock frozen, because the metadata carries the moment a file was opened); the log
+outlives the window in which the archive is missing, so the ticks are never nowhere; an export
+that never happens is recovered as a *complete* file rather than a shortened one, because the
+closing record travelled with it; a log from a real crash still says it was recovered; an existing
+archive file is never overwritten; and the module actually runs as a program, started the way
+main.py starts it — the module path, the working directory and the exit code are what production
+depends on and none of them can fail in-process.
+
+One test exists because a mutation slipped through: the inline and the handed-over path share one
+builder now, so comparing them cannot see a change in the file format at all. That one holds the
+output against `json.dump`, the encoder every existing file was written with, with a non-ASCII
+value in it and the top-level key order named rather than derived.
+
+### `tests/utils/test_tick_counters.py`
+
+The tick handler in `main.py` had no test at all, which is why a counting error ran for weeks:
+every UTC day cut reported the closed file one tick too large and started the next one one tick
+too small, and the error was carried until the next cut cancelled it. Measured on production —
+"File rotated: … (47,369 ticks)" for a file holding 47,368, and "(49,999)" for one holding 50,000.
+
+Defends: the day cut reports what the file holds and carries the triggering tick into the new
+file, because the cut is checked *before* the tick is appended; a file that fills up reports the
+tick that filled it, because that threshold fires *after*; the two counters are compared while
+the collector runs, with the writer winning; and — the part a direct call would not have caught —
+the comparison is actually reached from the folder monitor, since a check nobody calls observes
+nothing.
+
+### `tests/utils/test_diagnostics.py`
+
+The two numbers a remote session reads when it cannot open a shell: how late the event loop has
+been running, and whether the files that were handed to an archive writer arrived.
+
+Defends: the worst stall is kept with the moment it happened; a wake-up that came early counts as
+no lag rather than as negative; an export in flight is what was handed over and not yet reported;
+a failure names the file that is still owed; and the gauge cannot go below zero.
+
+### `tests/utils/test_error_counters.py`
+
+The error and warning counters were initialised and never raised — nothing called
+`record_error` or `record_warning`. The display said "No errors or warnings", `/v1/status` and the
+weekly report said 0 and 0, while the production log carried forced reconnects. They now follow
+the log through a listener.
+
+Defends: WARNING counts as a warning and ERROR/CRITICAL as errors while INFO counts as nothing; a
+failing listener never costs the log line itself; the collector actually wires its stats to the
+log — the shape the original defect had was a working counter nothing was connected to; and the
+display renders a logged message as text, because that code had never run with an entry in it and
+Rich raises on a message holding a closing-tag shape like `[/red]`.
+
+### `tests/utils/test_describe_exception.py`
+
+`TimeoutError`, `ConnectionResetError` and aiohttp's `ClientPayloadError` turn into an empty
+string, so a caught exception interpolated bare leaves a log line naming no cause. Production
+logged "Command polling error: " and nothing more during the 2026-09-19 midnight close.
+
+Defends: the helper names an exception without text and keeps the text of one that has it; and no
+source file writes a caught exception into text without it — a convention held by one helper only
+holds while nobody adds a site that skips it.
 
 ### `tests/utils/test_doc_links.py`
 
@@ -181,6 +261,11 @@ route refuses an anonymous caller, an unknown token, and a valid token without t
 grant naming a surface that does not exist fails at parse time rather than silently granting
 nothing; and the producing identity is served on the gated route, in the shape a tick file
 carries it, while staying off both open routes.
+
+Also: an accept failure — after which CPython's proactor loop closes the listening socket on
+Windows — reaches the log file instead of stderr, through the handler a real loop calls, while
+every other loop event keeps asyncio's default handling. And the route carries `loop_lag` and
+`exports`, the two figures that make a blocked loop visible from off the machine.
 
 ### `tests/api/test_diagnostic_routes.py`
 

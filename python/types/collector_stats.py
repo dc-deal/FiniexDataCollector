@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Optional, Dict
 
+from python.types.log_level import ERROR, LogLevel
+
 
 @dataclass
 class SymbolStats:
@@ -179,6 +181,87 @@ class DiskSpaceStats:
             return "EMERGENCY"
 
 
+@dataclass
+class LoopLag:
+    """
+    How late the collector's event loop runs, measured rather than assumed.
+
+    Everything shares one loop, so a long piece of work anywhere delays the
+    stamping of every tick that arrives meanwhile - and that delay is invisible
+    in a tick file until it passes the consumer's 30 s window and costs the
+    whole file.
+
+    Attributes:
+        samples: How many measurements the numbers rest on
+        last_ms: The most recent lateness
+        max_ms: The worst since this process started
+        max_at: When that worst one happened
+        over_500ms: How often the loop was late by more than half a second
+    """
+    samples: int = 0
+    last_ms: float = 0.0
+    max_ms: float = 0.0
+    max_at: Optional[datetime] = None
+    over_500ms: int = 0
+
+
+@dataclass
+class CounterCheck:
+    """
+    Whether the displayed tick count still matches what the writer wrote.
+
+    Two counters for one number drift, and this pair drifted by exactly one tick
+    at every UTC day cut until 2026-09-20 — for weeks, unnoticed, because
+    nothing compared them. What is reported here is the comparison, not the
+    repair: `mismatches` staying at zero is the evidence that the counts are
+    sound, and any other number is the signal to go looking.
+
+    Attributes:
+        checks: Comparisons made since this process started
+        mismatches: How many of them disagreed
+        last_mismatch_symbol: The symbol of the most recent disagreement
+        last_mismatch_counted: What the display had said
+        last_mismatch_written: What the writer held, and what was taken
+        last_mismatch_at: When that was
+    """
+    checks: int = 0
+    mismatches: int = 0
+    last_mismatch_symbol: Optional[str] = None
+    last_mismatch_counted: int = 0
+    last_mismatch_written: int = 0
+    last_mismatch_at: Optional[datetime] = None
+
+
+@dataclass
+class ExportStats:
+    """
+    The archive writers that run as subprocesses.
+
+    Attributes:
+        started: Files handed over since this process started
+        finished: Files the writer reported as written
+        failed: Handovers that ended without a file; their logs stay on disk
+        in_flight: Handed over and not yet reported
+        last_file: The last file a writer finished
+        last_ticks: How many ticks it held
+        last_ms: How long that writer took, including process start
+        max_ms: The slowest one so far
+        last_failed_file: The last file that was not written - its log is still
+            on disk and the next start recovers it
+        last_failed_at: When that was
+    """
+    started: int = 0
+    finished: int = 0
+    failed: int = 0
+    in_flight: int = 0
+    last_file: Optional[str] = None
+    last_ticks: int = 0
+    last_ms: float = 0.0
+    max_ms: float = 0.0
+    last_failed_file: Optional[str] = None
+    last_failed_at: Optional[datetime] = None
+
+
 class CollectorStats:
     """
     Aggregated statistics for the entire collector.
@@ -214,6 +297,9 @@ class CollectorStats:
         self.last_reconnect: Optional[ReconnectEvent] = None
         self.disk_space: DiskSpaceStats = DiskSpaceStats()
         self.folders: Dict[str, FolderStats] = {}
+        self.loop_lag: LoopLag = LoopLag()
+        self.exports: ExportStats = ExportStats()
+        self.counter_check: CounterCheck = CounterCheck()
 
         # Config
         self.max_recent_logs: int = 50
@@ -359,6 +445,99 @@ class CollectorStats:
         """
         self.total_warnings += 1
         self._add_log_entry("WARNING", message)
+
+    def record_loop_lag(self, lateness_ms: float) -> None:
+        """
+        Record one measurement of how late the event loop ran.
+
+        Args:
+            lateness_ms: Milliseconds the wake-up came after it was due
+        """
+        lateness_ms = max(0.0, lateness_ms)
+        self.loop_lag.samples += 1
+        self.loop_lag.last_ms = round(lateness_ms, 1)
+
+        if lateness_ms > 500:
+            self.loop_lag.over_500ms += 1
+
+        if lateness_ms > self.loop_lag.max_ms:
+            self.loop_lag.max_ms = round(lateness_ms, 1)
+            self.loop_lag.max_at = datetime.now(timezone.utc)
+
+    def record_counter_check(self, symbol: str, counted: int,
+                             written: int) -> None:
+        """
+        Record one comparison of the displayed count against the written one.
+
+        Args:
+            symbol: The symbol compared
+            counted: What the display and the status API had
+            written: What the writer holds, which is what the file says
+        """
+        self.counter_check.checks += 1
+
+        if counted == written:
+            return
+
+        self.counter_check.mismatches += 1
+        self.counter_check.last_mismatch_symbol = symbol
+        self.counter_check.last_mismatch_counted = counted
+        self.counter_check.last_mismatch_written = written
+        self.counter_check.last_mismatch_at = datetime.now(timezone.utc)
+
+    def record_export_started(self) -> None:
+        """A closed file was handed to an archive writer."""
+        self.exports.started += 1
+        self.exports.in_flight += 1
+
+    def record_export_finished(self, filename: str, ticks: int,
+                               duration_ms: float) -> None:
+        """
+        An archive writer reported a finished file.
+
+        Args:
+            filename: The archive file it wrote
+            ticks: How many ticks it held
+            duration_ms: How long it took, process start included
+        """
+        self.exports.finished += 1
+        self.exports.in_flight = max(0, self.exports.in_flight - 1)
+        self.exports.last_file = filename
+        self.exports.last_ticks = ticks
+        self.exports.last_ms = round(duration_ms, 1)
+        self.exports.max_ms = max(self.exports.max_ms, round(duration_ms, 1))
+
+    def record_export_failed(self, filename: str) -> None:
+        """
+        An archive writer produced no file; its log is still on disk.
+
+        Args:
+            filename: The archive file that is still owed
+        """
+        self.exports.failed += 1
+        self.exports.in_flight = max(0, self.exports.in_flight - 1)
+        self.exports.last_failed_file = filename
+        self.exports.last_failed_at = datetime.now(timezone.utc)
+
+    def record_logged(self, level: LogLevel, logger_name: str,
+                      message: str) -> None:
+        """
+        Count one logged line at WARNING or above - the log listener.
+
+        Registered with add_log_listener, so the counters follow the log
+        instead of depending on each error path remembering to report itself.
+
+        Args:
+            level: Level of the line; ERROR and CRITICAL count as errors
+            logger_name: The logger that wrote it - part of the listener
+                signature, not stored, because the entry shape is shared with
+                the display and the status API
+            message: The logged text
+        """
+        if level >= ERROR:
+            self.record_error(message)
+        else:
+            self.record_warning(message)
 
     def _add_log_entry(self, level: str, message: str) -> None:
         """Add log entry, maintaining max size."""

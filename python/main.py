@@ -11,12 +11,14 @@ Location: python/main.py
 
 import argparse
 import asyncio
+import json
 import signal
 import sys
 import os
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import psutil
 
@@ -33,7 +35,8 @@ from python.utils.instance_identity import (
 )
 from python.utils.instance_lock import InstanceLock
 from python.utils.config_loader import ConfigLoader, AppConfig
-from python.utils.logging_setup import setup_logging, get_logger
+from python.utils.logging_setup import (add_log_listener, describe_exception,
+                                        get_logger, setup_logging)
 from python.utils.console_mode import disable_quick_edit
 from python.utils.live_display import LiveDisplay
 from python.types.collector_stats import CollectorStats
@@ -180,7 +183,62 @@ async def serve_status_api(server: Any, logger: Any) -> None:
             f"Status API could not start (exit {e.code}) - the port is most "
             f"likely already in use. Collection continues without it.")
     except Exception as e:
-        logger.error(f"Status API stopped: {e}")
+        logger.error(f"Status API stopped: {describe_exception(e)}")
+
+
+# What CPython's proactor loop - Windows, 3.13 and 3.14 alike - hands the loop's
+# exception handler when accept() raises, immediately before it closes the
+# listening socket for good (BaseProactorEventLoop._start_serving). uvicorn is
+# not told: serve() keeps running, nothing listens, and the edge answers 502.
+ACCEPT_FAILED = "Accept failed on a socket"
+
+# The repository root, which is what `python -m python.writers.wal_archive`
+# needs as a working directory - derived from this file rather than from where
+# the collector happens to be started.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# A file of 50,000 ticks took about 4 s to write on the production box. A child
+# still running after this has hung; its log stays on disk and the next start
+# recovers it, so the ceiling costs nothing but the wait.
+EXPORT_TIMEOUT_SECONDS = 300
+
+# How long a graceful stop waits for the archive writers it started. Their logs
+# are on disk either way, so this is about leaving a tidy archive, not about
+# keeping the data.
+EXPORT_SHUTDOWN_WAIT_SECONDS = 60
+
+# Ten samples a second: fine enough to catch a stall, far too little to matter.
+LOOP_LAG_INTERVAL_SECONDS = 0.1
+
+
+def report_loop_exception(logger: Any) -> Callable[[Any, Dict[str, Any]], None]:
+    """
+    Build the event loop's exception handler.
+
+    asyncio reports through the standard `logging` module, which this project
+    never connects, so without this the one event that silently kills the
+    status API went to stderr and never reached the log file. Everything else
+    keeps asyncio's default handling.
+
+    Args:
+        logger: Where the accept failure is recorded
+
+    Returns:
+        A handler for loop.set_exception_handler
+    """
+    def handler(loop: Any, context: Dict[str, Any]) -> None:
+        if context.get("message") == ACCEPT_FAILED:
+            error = context.get("exception")
+            cause = (describe_exception(error) if error
+                     else "no exception given")
+            logger.error(
+                f"Status API stopped listening: asyncio closed its socket after "
+                f"an accept failure ({cause}). It stays unreachable until the "
+                f"collector restarts; collection is unaffected.")
+            return
+        loop.default_exception_handler(context)
+
+    return handler
 
 
 class FiniexDataCollector:
@@ -211,8 +269,10 @@ class FiniexDataCollector:
         self._api_server = None
         self._scheduler: Optional[WeeklyJobScheduler] = None
 
-        # Live monitoring
+        # Live monitoring. The error and warning counters follow the log: every
+        # WARNING and ERROR line counts, whoever wrote it.
         self._stats = CollectorStats()
+        add_log_listener(self._stats.record_logged)
         self._live_display: Optional[LiveDisplay] = None
 
         # State
@@ -224,6 +284,12 @@ class FiniexDataCollector:
 
         # Monitoring tasks
         self._monitoring_tasks = []
+
+        # Archive writers running as subprocesses. Held so a graceful stop can
+        # wait for them: their logs are still on disk, so nothing is lost if it
+        # cannot, but a file finished after the process it belongs to has gone
+        # reads like a file nobody wrote.
+        self._export_tasks: set = set()
 
         # Reconnect tracking
         self._disconnect_time: Optional[datetime] = None
@@ -237,6 +303,8 @@ class FiniexDataCollector:
 
         # Setup signal handlers
         self._setup_signal_handlers()
+        asyncio.get_running_loop().set_exception_handler(
+            report_loop_exception(self._logger))
 
         # Initialize Telegram alerts
         if self._config.telegram.enabled:
@@ -384,6 +452,84 @@ class FiniexDataCollector:
             f"Status API on http://{self._config.api.host}:"
             f"{self._config.api.port}")
 
+    def _export_archive(self, wal_path: Path, archive_path: Path) -> None:
+        """
+        Hand a closed file to a subprocess that writes it.
+
+        Called by a writer from inside `write_tick`, so it must not block: it
+        only starts a task. Writing the file here cost about 1 s plus 66 us per
+        tick on the production box, on the collector's only event loop, nine
+        times in a row at the UTC day cut - measured 2026-09-20.
+
+        Args:
+            wal_path: The write-ahead log holding the ticks and the closing state
+            archive_path: The archive file that is owed
+        """
+        self._stats.record_export_started()
+        task = asyncio.create_task(self._run_export(wal_path, archive_path))
+        self._export_tasks.add(task)
+        task.add_done_callback(self._export_tasks.discard)
+
+    async def _run_export(self, wal_path: Path, archive_path: Path) -> None:
+        """
+        Run the archive writer for one file and report what it did.
+
+        A failure is left where it is: the log stays on disk, and the next start
+        recovers it. That is the whole reason the parent does not delete it.
+
+        Args:
+            wal_path: The write-ahead log to convert
+            archive_path: The archive file it becomes
+        """
+        started = time.monotonic()
+        name = archive_path.name
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "python.writers.wal_archive",
+                str(wal_path),
+                cwd=str(PROJECT_ROOT),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=EXPORT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            self._stats.record_export_failed(name)
+            self._logger.error(
+                f"The archive writer for {name} did not finish within "
+                f"{EXPORT_TIMEOUT_SECONDS}s - its log stays on disk and the "
+                f"next start recovers it")
+            return
+        except Exception as e:
+            self._stats.record_export_failed(name)
+            self._logger.error(
+                f"Could not run the archive writer for {name}: "
+                f"{describe_exception(e)} - its log stays on disk and the next "
+                f"start recovers it")
+            return
+
+        duration_ms = (time.monotonic() - started) * 1000
+
+        if process.returncode != 0:
+            self._stats.record_export_failed(name)
+            self._logger.error(
+                f"The archive writer refused {name} "
+                f"(exit {process.returncode}): "
+                f"{stderr.decode('utf-8', 'replace').strip()[:200]} - its log "
+                f"stays on disk and the next start recovers it")
+            return
+
+        ticks = 0
+        try:
+            ticks = int(json.loads(stdout.decode("utf-8")).get("ticks", 0))
+        except Exception:
+            # The file is written; only the count for the report is missing.
+            pass
+
+        self._stats.record_export_finished(name, ticks, duration_ms)
+        self._logger.info(
+            f"Exported {name} ({ticks:,} ticks) in {duration_ms:.0f} ms")
+
     async def _start_monitoring_tasks(self) -> None:
         """Start background monitoring tasks."""
         # Disk space monitoring
@@ -392,6 +538,12 @@ class FiniexDataCollector:
         )
         self._monitoring_tasks.append(disk_task)
 
+        # How late this loop runs. It is the instrument for the one defect a
+        # tick file cannot show: a blocked loop stamps collected_msc late, and
+        # the consuming importer rejects a whole file beyond 30 s of lag.
+        lag_task = asyncio.create_task(self._monitor_loop_lag())
+        self._monitoring_tasks.append(lag_task)
+
         # Folder scanning
         folder_task = asyncio.create_task(
             self._monitor_folders()
@@ -399,6 +551,48 @@ class FiniexDataCollector:
         self._monitoring_tasks.append(folder_task)
 
         self._logger.info("Monitoring tasks started")
+
+    async def _await_pending_exports(self) -> None:
+        """
+        Let the archive writers still running finish before the process ends.
+
+        Nothing is lost if they do not: every one of them has its write-ahead
+        log on disk, and the next start recovers it. What the wait buys is a
+        stop that leaves the archive complete rather than a directory of logs
+        somebody has to trust a later start with.
+        """
+        if not self._export_tasks:
+            return
+
+        pending = list(self._export_tasks)
+        self._logger.info(
+            f"Waiting for {len(pending)} archive writer(s) to finish")
+
+        _finished, still_running = await asyncio.wait(
+            pending, timeout=EXPORT_SHUTDOWN_WAIT_SECONDS)
+
+        if still_running:
+            self._logger.warning(
+                f"{len(still_running)} archive writer(s) did not finish in "
+                f"{EXPORT_SHUTDOWN_WAIT_SECONDS}s - their logs stay on disk and "
+                f"the next start recovers them")
+
+    async def _monitor_loop_lag(self) -> None:
+        """
+        Measure how late the event loop runs its own timers.
+
+        Everything this collector does shares one loop, so a long piece of work
+        anywhere delays the stamping of every tick that arrives meanwhile. That
+        delay is invisible in a tick file - `collected_msc` simply reads later
+        than it should - until it passes the consumer's 30 s window and costs
+        the whole file. Ten samples a second cost nothing and make it visible
+        on `/v1/status` from off the machine.
+        """
+        while self._is_running:
+            asked_at = time.monotonic()
+            await asyncio.sleep(LOOP_LAG_INTERVAL_SECONDS)
+            lateness = time.monotonic() - asked_at - LOOP_LAG_INTERVAL_SECONDS
+            self._stats.record_loop_lag(lateness * 1000)
 
     async def _monitor_disk_space(self) -> None:
         """Monitor disk space usage."""
@@ -447,11 +641,43 @@ class FiniexDataCollector:
                     )
 
             except Exception as e:
-                self._logger.error(f"Disk space check failed: {e}")
+                self._logger.error(
+                    f"Disk space check failed: {describe_exception(e)}")
                 self._logger.debug(
                     f"[DISK_MONITOR] Exception details:", exc_info=True)
 
             await asyncio.sleep(interval)
+
+    def _reconcile_tick_counters(self) -> None:
+        """
+        Hold the displayed tick count against the one the writer wrote.
+
+        Two counters exist for one number: the writer counts what went into the
+        file, and the tick handler keeps a second one for the display, the
+        status API and the weekly report. They drifted by exactly one tick at
+        every UTC day cut until 2026-09-20 - invisible for weeks, because
+        nothing ever compared them.
+
+        The writer wins, because the writer is what the file says. The
+        disagreement is counted and logged rather than quietly repaired: a
+        resynchronisation nobody hears about would hide the next cause just as
+        well as the first one hid this one.
+        """
+        for symbol, writer in self._writers.items():
+            symbol_stats = self._stats.symbols.get(symbol)
+            if symbol_stats is None:
+                continue
+
+            counted = symbol_stats.current_file_ticks
+            written = writer.current_tick_count
+            self._stats.record_counter_check(symbol, counted, written)
+
+            if counted != written:
+                self._logger.warning(
+                    f"Tick counters disagree for {symbol}: the display says "
+                    f"{counted:,}, the writer holds {written:,} - taking the "
+                    f"writer's count")
+                symbol_stats.current_file_ticks = written
 
     async def _monitor_folders(self) -> None:
         """Monitor folder file counts."""
@@ -464,6 +690,8 @@ class FiniexDataCollector:
         while self._is_running:
             try:
                 scan_start = datetime.now(timezone.utc)
+
+                self._reconcile_tick_counters()
 
                 # Kraken data folder
                 kraken_path = Path(self._config.paths.raw_data_dir) / "kraken"
@@ -574,7 +802,8 @@ class FiniexDataCollector:
                 )
 
             except Exception as e:
-                self._logger.error(f"Folder scan failed: {e}")
+                self._logger.error(
+                    f"Folder scan failed: {describe_exception(e)}")
                 self._logger.debug(
                     f"[FOLDER_SCAN] Exception details:", exc_info=True)
 
@@ -625,7 +854,8 @@ class FiniexDataCollector:
                 broker_type=self._config.kraken.broker_type,
                 max_ticks_per_file=self._config.kraken.max_ticks_per_file,
                 origin=origin,
-                data_collector="kraken"
+                data_collector="kraken",
+                exporter=self._export_archive
             )
 
             self._writers[normalized] = writer
@@ -639,7 +869,7 @@ class FiniexDataCollector:
             url=self._config.kraken.websocket_url,
             reconnect_initial_delay=self._config.kraken.reconnect_initial_delay_seconds,
             reconnect_max_delay=self._config.kraken.reconnect_max_delay_seconds,
-            heartbeat_interval=self._config.kraken.heartbeat_interval_seconds
+            stale_after=self._config.kraken.stale_after_seconds
         )
 
         # Set callbacks
@@ -754,12 +984,12 @@ class FiniexDataCollector:
         try:
             await collector.start()
         except Exception as e:
-            self._logger.error(f"Collector failed: {e}")
+            self._logger.error(f"Collector failed: {describe_exception(e)}")
 
             if self._telegram:
                 await self._telegram.send_error(
                     "Collector Failed",
-                    f"Kraken collector stopped: {e}"
+                    f"Kraken collector stopped: {describe_exception(e)}"
                 )
 
     def _on_tick_received(self, tick) -> None:
@@ -825,41 +1055,50 @@ class FiniexDataCollector:
             )
 
             if old_file and new_file and old_file != new_file:
-                # File was rotated!
-                # count_after contains the FINAL tick count for the OLD file
+                # Both numbers come from the writer, because only the writer
+                # knows which file this tick landed in. The day cut is checked
+                # BEFORE the tick is appended, so the tick that triggered it
+                # belongs to the NEW file; the count threshold fires after, so
+                # that trigger belongs to the old one. Counting along here got
+                # it wrong by exactly one, in either direction, and carried the
+                # error into the next file - measured on production: "File
+                # rotated: ... (47,369 ticks)" for a file holding 47,368, and
+                # "(49,999)" for one holding 50,000.
                 self._stats.record_file_created(
                     symbol=symbol,
                     filename=old_file.name,
-                    tick_count=count_after  # Final count of OLD file
+                    tick_count=writer.last_closed_tick_count
                 )
 
-                # CRITICAL: Reset tick count for NEW file
-                # The new file is empty (writer just started it)
-                self._stats.symbols[symbol].current_file_ticks = 0
+                # Not zero: after a day cut the new file already holds the tick
+                # that caused the cut.
+                self._stats.symbols[symbol].current_file_ticks = \
+                    writer.current_tick_count
 
                 self._logger.debug(
                     f"[ROTATION] Detected: symbol={symbol}, "
                     f"rotated_file={old_file.name}, "
-                    f"final_count={count_after}, "
+                    f"final_count={writer.last_closed_tick_count}, "
                     f"new_file={new_file.name}, "
-                    f"stats_reset=0"
+                    f"carried_over={writer.current_tick_count}"
                 )
 
                 self._logger.info(
-                    f"File rotated: {old_file.name} ({count_after:,} ticks)"
-                )
+                    f"File rotated: {old_file.name} "
+                    f"({writer.last_closed_tick_count:,} ticks)")
 
                 # Send rotation notification (if enabled)
                 if self._telegram and self._config.telegram.send_on_rotation:
                     self._logger.debug(
                         f"[TELEGRAM] Sending rotation alert: symbol={symbol}, "
-                        f"file={old_file.name}, count={count_after}"
+                        f"file={old_file.name}, "
+                        f"count={writer.last_closed_tick_count}"
                     )
                     asyncio.create_task(
                         self._telegram.send_file_rotation_notice(
                             symbol=symbol,
                             filename=old_file.name,
-                            tick_count=count_after
+                            tick_count=writer.last_closed_tick_count
                         )
                     )
         else:
@@ -1044,6 +1283,8 @@ class FiniexDataCollector:
                     tick_count=tick_count
                 )
 
+        await self._await_pending_exports()
+
         # Ask the API to finish before the tasks are cancelled, so an in-flight
         # request is answered rather than dropped.
         if self._api_server:
@@ -1183,7 +1424,7 @@ def main():
             print(f"Config not found: {config_path}")
             sys.exit(1)
     except Exception as e:
-        print(f"Failed to load config: {e}")
+        print(f"Failed to load config: {describe_exception(e)}")
         sys.exit(1)
 
     # Setup logging (from config - required section)
@@ -1201,11 +1442,11 @@ def main():
             cmd_status(config)
     except ConfigurationError as e:
         logger = get_logger("FiniexDataCollector")
-        logger.error(f"Configuration error: {e}")
+        logger.error(f"Configuration error: {describe_exception(e)}")
         sys.exit(1)
     except Exception as e:
         logger = get_logger("FiniexDataCollector")
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal error: {describe_exception(e)}")
         sys.exit(1)
 
 

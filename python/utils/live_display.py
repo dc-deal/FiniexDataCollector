@@ -23,6 +23,7 @@ from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
 from rich.layout import Layout
+from rich.markup import escape
 from rich.text import Text
 from rich import box
 
@@ -387,6 +388,21 @@ class LiveDisplay:
         else:
             parts.append(f"Reconnects: {reconnect_count}")
 
+        # The archive writers, and how late this loop has been running. Both
+        # describe the one thing a tick file cannot show: a blocked loop stamps
+        # collected_msc late, and the importer refuses a file beyond 30 s of it.
+        exports = self._stats.exports
+        if exports.started:
+            owed = exports.started - exports.finished
+            parts.append(
+                f"Exports: {exports.finished} written"
+                + (f", {owed} owed" if owed else "")
+                + (f", {exports.failed} failed" if exports.failed else ""))
+
+        lag = self._stats.loop_lag
+        if lag.samples:
+            parts.append(f"Loop max: {lag.max_ms:.0f} ms")
+
         summary = "[bold]📁 Storage:[/bold] " + " │ ".join(parts)
 
         return Text.from_markup(summary)
@@ -430,6 +446,11 @@ class LiveDisplay:
                 msg = entry.message
                 if len(msg) > 60:
                     msg = msg[:57] + "..."
+                # A log line is text, not markup. Unescaped, a message holding
+                # a closing-tag shape like "[/x]" raises MarkupError inside the
+                # render - and until 2026-09-19 no entry had ever reached this
+                # code, because nothing filled recent_logs.
+                msg = escape(msg)
 
                 lines.append(
                     f"[dim]{time_str}[/dim] "

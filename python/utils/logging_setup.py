@@ -8,7 +8,7 @@ Location: python/utils/logging_setup.py
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, TextIO
+from typing import Callable, Dict, List, Optional, TextIO
 
 from python.types.log_level import (
     LogLevel,
@@ -32,6 +32,26 @@ def _print_error(message: str) -> None:
         message: Error message
     """
     print(f"{ANSI_RED}[LOGGER ERROR] {message}{ANSI_RESET}", file=sys.stderr)
+
+
+def describe_exception(error: BaseException) -> str:
+    """
+    Name an exception so that a log line always says what happened.
+
+    Several exceptions this collector meets turn into an empty string -
+    TimeoutError, ConnectionResetError, aiohttp's ClientPayloadError - so
+    interpolating the exception directly writes a line that names no cause at
+    all. Measured on production 2026-09-19: "Command polling error: " at
+    00:00:19, and nothing after the colon.
+
+    Args:
+        error: The caught exception
+
+    Returns:
+        "Type: text", or just "Type" when the exception carries no text
+    """
+    text = str(error)
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
 
 
 class FiniexLogger:
@@ -83,7 +103,8 @@ class FiniexLogger:
                 self._file_handle = log_path.open("a", encoding="utf-8")
                 self._file_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             except Exception as e:
-                _print_error(f"Failed to open log file {log_path}: {e}")
+                _print_error(
+                    f"Failed to open log file {log_path}: {describe_exception(e)}")
 
     def _log(self, level: LogLevel, message: str) -> None:
         """
@@ -115,7 +136,19 @@ class FiniexLogger:
                 self._file_handle.write(plain_line)
                 self._file_handle.flush()
             except Exception as e:
-                _print_error(f"Failed to write to log file: {e}")
+                _print_error(
+                    f"Failed to write to log file: {describe_exception(e)}")
+
+        # Independent of both output levels: a warning is counted because it
+        # happened, not because this configuration chose to print it.
+        if level >= WARNING:
+            for listener in list(_listeners):
+                try:
+                    listener(level, self._name, message)
+                except Exception as e:
+                    # A listener must never cost the line itself.
+                    _print_error(
+                        f"Log listener failed: {describe_exception(e)}")
 
     def _roll_over_if_needed(self, today: str) -> None:
         """
@@ -134,7 +167,8 @@ class FiniexLogger:
         except Exception as e:
             # Keep writing into the old file rather than losing the line: a
             # misnamed log is recoverable, a dropped one is not.
-            _print_error(f"Failed to roll over log file: {e}")
+            _print_error(
+                f"Failed to roll over log file: {describe_exception(e)}")
             self._file_date = today
             return
 
@@ -185,6 +219,36 @@ _global_file_level: Optional[LogLevel] = None
 _global_log_dir: Optional[Path] = None
 _initialized = False
 
+# Told about every line at WARNING and above. This is how the collector's error
+# and warning counters learn what happened: before it existed they started at
+# zero and nothing ever raised them, so the display, /v1/status and the weekly
+# report all said "no errors" while the log carried forced reconnects - measured
+# on production 2026-09-19. A count derived from the log cannot be forgotten by
+# a code path that never calls it.
+_listeners: List[Callable[[LogLevel, str, str], None]] = []
+
+
+def add_log_listener(listener: Callable[[LogLevel, str, str], None]) -> None:
+    """
+    Register a callable told about every WARNING, ERROR and CRITICAL line.
+
+    Args:
+        listener: Called with (level, logger name, message)
+    """
+    _listeners.append(listener)
+
+
+def remove_log_listener(
+        listener: Callable[[LogLevel, str, str], None]) -> None:
+    """
+    Unregister a listener; unknown listeners are ignored.
+
+    Args:
+        listener: A callable previously passed to add_log_listener
+    """
+    if listener in _listeners:
+        _listeners.remove(listener)
+
 
 def setup_logging(
     console_level: str,
@@ -224,8 +288,10 @@ def setup_logging(
     try:
         _global_log_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        _print_error(f"Failed to create log directory {log_dir}: {e}")
-        raise RuntimeError(f"Failed to create log directory: {e}")
+        _print_error(
+            f"Failed to create log directory {log_dir}: {describe_exception(e)}")
+        raise RuntimeError(
+            f"Failed to create log directory: {describe_exception(e)}")
 
     _initialized = True
 

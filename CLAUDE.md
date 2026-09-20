@@ -227,10 +227,19 @@ and flushed before it counts as collected, and that log is deleted **after** the
 is written, never before. A window with the data in two places is recoverable; a window with
 it in neither is not.
 
+**The archive file is written by a subprocess.** The ticks are already in the log, so a closed
+file is handed over as a path: the rotation appends its closing state as the log's last line,
+closes the log without deleting it, and `python -m python.writers.wal_archive` writes the
+archive and removes the log. The ordering above is unchanged by that — the log outlives the
+window in which the archive does not exist — and a child that dies costs nothing, because the
+next start recovers what it left. Inline, that write cost about 1 s per file plus 66 µs per
+tick on the production box, on the collector's only event loop, nine times over at the UTC day
+cut. A graceful stop still writes inline: there is no loop left to protect.
+
 Both are explained in `docs/architecture/durability.md`, including every recovery case. Read
-it before touching `_finalize_current_file()` or `recover_orphaned_buffers()` — the ordering
-looks arbitrary and is not, and on the happy path both orderings end identically, which is
-what makes the wrong one survive a review.
+it before touching `_finalize_current_file()`, `recover_orphaned_buffers()` or
+`python/writers/wal_archive.py` — the ordering looks arbitrary and is not, and on the happy
+path both orderings end identically, which is what makes the wrong one survive a review.
 
 The `.lock` sidecar was **removed** in 1.6.0. Nothing ever read it — not here, not in the
 consuming project — while the README claimed it prevented processing of active files. The
@@ -317,6 +326,10 @@ suite gets an entry in `docs/tests/test_overview.md` in the same change.
 - **Module docstring with a `Location:` line** at the top of every file, matching the
   existing files.
 - **Google-style docstrings** with `Args:` and `Returns:` on public functions.
+- **A caught exception is written into text through `describe_exception()`**, never bare.
+  `TimeoutError` and `ConnectionResetError` turn into an empty string, and a bare one left
+  production logging "Command polling error: " with nothing after the colon.
+  `tests/utils/test_describe_exception.py` fails on any new bare site.
 - **Comments explain why, not what.** A comment that restates the line above it is noise; a
   comment naming the failure a line prevents is the reason the line survives a refactor.
 - **Dead code is removed on sight, not noted for later.** The same applies to dead

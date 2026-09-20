@@ -29,7 +29,7 @@ from typing import Optional
 import psutil
 
 from python.exceptions.collector_exceptions import ConfigurationError
-from python.utils.logging_setup import get_collector_logger
+from python.utils.logging_setup import describe_exception, get_collector_logger
 
 LOCK_FILENAME = ".collector.lock"
 
@@ -101,7 +101,8 @@ class InstanceLock:
         except FileNotFoundError:
             pass
         except OSError as e:
-            self._logger.warning(f"Could not remove {self._path.name}: {e}")
+            self._logger.warning(
+                f"Could not remove {self._path.name}: {describe_exception(e)}")
 
         self._held = False
 
@@ -122,7 +123,7 @@ class InstanceLock:
             return None
         except (OSError, json.JSONDecodeError) as e:
             self._logger.warning(
-                f"Unreadable lock file {self._path.name} ({e}), treating as stale")
+                f"Unreadable lock file {self._path.name} ({describe_exception(e)}), treating as stale")
             return None
 
         pid = record.get("pid")

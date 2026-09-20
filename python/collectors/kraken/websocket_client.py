@@ -31,7 +31,7 @@ from python.exceptions.collector_exceptions import (
 )
 from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
-from python.utils.logging_setup import get_collector_logger
+from python.utils.logging_setup import describe_exception, get_collector_logger
 
 
 # What makes Kraken push a ticker update. The API default is "trades", which
@@ -42,6 +42,20 @@ from python.utils.logging_setup import get_collector_logger
 # trade tick is supposed to describe. quote_age_ms is the instrument that shows
 # the difference, so this is a measured setting, not a guessed one.
 TICKER_EVENT_TRIGGER = "bbo"
+
+# How often the feed's silence is judged. Kraken sends a heartbeat every second
+# on a subscribed connection - measured 2026-09-19 on a quiet pair, the largest
+# gap between any two messages 1.03 s over 45 s - so a live feed is never quiet
+# for long, and checking every second costs nothing. Checking only every
+# `stale_after` seconds, as before, added up to a whole interval to detection.
+STALE_CHECK_INTERVAL = 1.0
+
+# A check that wakes this much later than it asked to was not sleeping: the
+# event loop was blocked - a file closing, the midnight cascade, 17.85 s
+# measured on production 2026-09-19. The silence it would see is then ours, not
+# the feed's, because the receive loop has not had its turn to read what
+# arrived. Judged anyway, it would force a reconnect at every day cut.
+LATE_WAKE_TOLERANCE = 1.0
 
 
 class KrakenWebSocketClient(AbstractCollector):
@@ -68,7 +82,7 @@ class KrakenWebSocketClient(AbstractCollector):
         url: str = DEFAULT_URL,
         reconnect_initial_delay: float = 1.0,
         reconnect_max_delay: float = 60.0,
-        heartbeat_interval: float = 30.0
+        stale_after: float = 10.0
     ):
         """
         Initialize Kraken WebSocket client.
@@ -82,7 +96,8 @@ class KrakenWebSocketClient(AbstractCollector):
             url: WebSocket URL
             reconnect_initial_delay: Initial reconnect delay in seconds
             reconnect_max_delay: Maximum reconnect delay in seconds
-            heartbeat_interval: Heartbeat check interval in seconds
+            stale_after: Seconds without any message, heartbeats included,
+                after which the connection is closed and reopened
         """
         super().__init__(name="kraken", symbols=symbols)
 
@@ -90,7 +105,12 @@ class KrakenWebSocketClient(AbstractCollector):
         self._streams = streams if streams else ["ticker"]
         self._reconnect_initial_delay = reconnect_initial_delay
         self._reconnect_max_delay = reconnect_max_delay
-        self._heartbeat_interval = heartbeat_interval
+        self._stale_after = stale_after
+
+        # The time source and the sleep are attributes so a test can drive both
+        # without patching the module-wide ones the event loop itself runs on.
+        self._monotonic: Callable[[], float] = time.monotonic
+        self._sleep: Callable[[float], Any] = asyncio.sleep
 
         # Validate streams
         for stream in self._streams:
@@ -103,7 +123,11 @@ class KrakenWebSocketClient(AbstractCollector):
         self._logger = get_collector_logger("kraken")
 
         self._connection_status = "disconnected"
+        # Wall clock for reporting when, monotonic for measuring how long: a
+        # silence derived from two wall-clock readings turns every forward NTP
+        # step into a dead connection.
         self._last_message_time: Optional[datetime] = None
+        self._last_message_monotonic: Optional[float] = None
         self._reconnect_attempt = 0
         self._should_reconnect = True
 
@@ -161,13 +185,14 @@ class KrakenWebSocketClient(AbstractCollector):
             self._set_status("connected")
             self._reconnect_attempt = 0
             self._last_message_time = datetime.now(timezone.utc)
+            self._last_message_monotonic = self._monotonic()
 
             self._logger.info("WebSocket connected successfully")
             return True
 
         except Exception as e:
             self._set_status("failed")
-            self._logger.error(f"Connection failed: {e}")
+            self._logger.error(f"Connection failed: {describe_exception(e)}")
             raise WebSocketConnectionError(
                 message=str(e),
                 url=self._url,
@@ -190,7 +215,8 @@ class KrakenWebSocketClient(AbstractCollector):
             try:
                 await self._websocket.close()
             except Exception as e:
-                self._logger.warning(f"Error closing WebSocket: {e}")
+                self._logger.warning(
+                    f"Error closing WebSocket: {describe_exception(e)}")
 
         self._websocket = None
         self._set_status("disconnected")
@@ -253,7 +279,8 @@ class KrakenWebSocketClient(AbstractCollector):
                         f"Subscription confirmation timeout: {stream}")
 
             except Exception as e:
-                self._logger.error(f"Subscription failed for {stream}: {e}")
+                self._logger.error(
+                    f"Subscription failed for {stream}: {describe_exception(e)}")
                 raise WebSocketSubscriptionError(
                     message=str(e),
                     channel=stream,
@@ -294,14 +321,17 @@ class KrakenWebSocketClient(AbstractCollector):
                 )
 
             except (ConnectionClosed, ConnectionClosedError, ConnectionClosedOK) as e:
-                self._logger.warning(f"Connection closed: {e}")
+                self._logger.warning(
+                    f"Connection closed: {describe_exception(e)}")
                 self._set_status("reconnecting")
 
             except WebSocketConnectionError as e:
-                self._logger.error(f"Connection error: {e}")
+                self._logger.error(
+                    f"Connection error: {describe_exception(e)}")
 
             except Exception as e:
-                self._logger.error(f"Unexpected error: {e}")
+                self._logger.error(
+                    f"Unexpected error: {describe_exception(e)}")
                 self._errors_count += 1
 
             # Reconnect with backoff
@@ -324,6 +354,7 @@ class KrakenWebSocketClient(AbstractCollector):
 
         async for message in self._websocket:
             self._last_message_time = datetime.now(timezone.utc)
+            self._last_message_monotonic = self._monotonic()
 
             # Skip heartbeats
             if self._parser.is_heartbeat(message):
@@ -337,39 +368,47 @@ class KrakenWebSocketClient(AbstractCollector):
                         self._emit_tick(tick)
 
             except Exception as e:
-                self._logger.warning(f"Message parse error: {e}")
+                self._logger.warning(
+                    f"Message parse error: {describe_exception(e)}")
                 self._errors_count += 1
 
     async def _heartbeat_loop(self) -> None:
-        """Monitor connection health via heartbeat."""
-        while self._is_running and self._websocket:
-            await asyncio.sleep(self._heartbeat_interval)
+        """
+        Close and reopen a connection that has gone silent.
 
-            if not self._last_message_time:
+        Detection is what a drop costs: the trades Kraken makes while a dead
+        socket is still believed alive are never received. Measured on
+        production 2026-09-18, four drops lost 537 trades at 41-51 s of silence
+        each on the liquid pairs, of which the old check - every 10 s,
+        reconnect at three times that - accounted for 30-40 s.
+        """
+        while self._is_running and self._websocket:
+            asleep_since = self._monotonic()
+            await self._sleep(STALE_CHECK_INTERVAL)
+            now = self._monotonic()
+
+            if now - asleep_since > STALE_CHECK_INTERVAL + LATE_WAKE_TOLERANCE:
+                # The loop was blocked, so this silence is ours; the next round
+                # sees what the receive loop reads in the meantime.
                 continue
 
-            # Check for stale connection
-            silence = (datetime.now(timezone.utc) -
-                       self._last_message_time).total_seconds()
+            if self._last_message_monotonic is None:
+                continue
 
-            if silence > self._heartbeat_interval * 2:
-                self._logger.warning(
-                    f"No messages for {silence:.0f}s, connection may be stale"
-                )
-
-                # Force reconnect
-                if silence > self._heartbeat_interval * 3:
-                    self._logger.error(
-                        "Connection appears dead, forcing reconnect")
-                    # Announce it before closing. close() is a CLEAN close, so
-                    # the receive loop ends without raising and the handler that
-                    # would set this status never runs - which left the status
-                    # at "connected" across every forced reconnect. Measured on
-                    # the production log: 173 forced reconnects, 0 recorded.
-                    self._set_status("reconnecting")
-                    if self._websocket:
-                        await self._websocket.close()
-                    break
+            silence = now - self._last_message_monotonic
+            if silence > self._stale_after:
+                self._logger.error(
+                    f"No messages for {silence:.0f}s - connection appears "
+                    f"dead, forcing reconnect")
+                # Announce it before closing. close() is a CLEAN close, so
+                # the receive loop ends without raising and the handler that
+                # would set this status never runs - which left the status
+                # at "connected" across every forced reconnect. Measured on
+                # the production log: 173 forced reconnects, 0 recorded.
+                self._set_status("reconnecting")
+                if self._websocket:
+                    await self._websocket.close()
+                break
 
     def _get_reconnect_delay(self) -> float:
         """
@@ -421,6 +460,6 @@ class KrakenWebSocketClient(AbstractCollector):
                 "url": self._url,
                 "streams": self._streams,
                 "reconnect_attempts": self._reconnect_attempt,
-                "heartbeat_interval": self._heartbeat_interval
+                "stale_after": self._stale_after
             }
         )

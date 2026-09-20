@@ -34,7 +34,7 @@ from python.api.stats_serializer import (
     health_payload,
     serialize_stats
 )
-from python.main import serve_status_api
+from python.main import ACCEPT_FAILED, report_loop_exception, serve_status_api
 from python.api.token_loader import ConsumerToken, load_token_registry
 from python.types.collector_stats import CollectorStats
 from python.types.tick_types import OriginBlock
@@ -336,6 +336,79 @@ def test_a_status_api_that_stops_later_does_not_kill_the_collector() -> None:
     assert "socket went away" in recorded[0]
 
 
+class _RecordingLoop:
+    """Stands in for the loop; records what reached asyncio's default handling."""
+
+    def __init__(self) -> None:
+        self.defaulted: List[Dict[str, Any]] = []
+
+    def default_exception_handler(self, context: Dict[str, Any]) -> None:
+        self.defaulted.append(context)
+
+
+def test_an_accept_failure_reaches_the_log_instead_of_stderr() -> None:
+    """
+    The one loop event that silently kills the status API is logged as such.
+
+    On Windows, CPython's proactor loop closes the listening socket when
+    accept() raises, and tells only the loop's exception handler - which
+    defaulted to stderr, outside the log file. uvicorn keeps running on a
+    socket that no longer exists.
+    """
+    recorded: List[str] = []
+
+    class RecordingLogger:
+        def error(self, message: str) -> None:
+            recorded.append(message)
+
+    loop = _RecordingLoop()
+    report_loop_exception(RecordingLogger())(loop, {
+        "message": ACCEPT_FAILED,
+        "exception": OSError(
+            64, "The specified network name is no longer available")})
+
+    assert len(recorded) == 1
+    assert "unreachable" in recorded[0]
+    assert "OSError" in recorded[0]
+    assert not loop.defaulted, "reported twice: once here, once on stderr"
+
+
+def test_every_other_loop_event_keeps_asyncio_default_handling() -> None:
+    """Only the accept failure is taken over; nothing else changes route."""
+    recorded: List[str] = []
+
+    class RecordingLogger:
+        def error(self, message: str) -> None:
+            recorded.append(message)
+
+    loop = _RecordingLoop()
+    context = {"message": "Task exception was never retrieved"}
+    report_loop_exception(RecordingLogger())(loop, context)
+
+    assert loop.defaulted == [context]
+    assert recorded == []
+
+
+def test_a_real_loop_hands_the_accept_failure_to_the_installed_handler() -> None:
+    """The handler is reached through the call asyncio itself makes."""
+    recorded: List[str] = []
+
+    class RecordingLogger:
+        def error(self, message: str) -> None:
+            recorded.append(message)
+
+    async def fail_an_accept() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(report_loop_exception(RecordingLogger()))
+        loop.call_exception_handler({
+            "message": ACCEPT_FAILED, "exception": ConnectionResetError()})
+
+    asyncio.run(fail_an_accept())
+
+    assert len(recorded) == 1
+    assert "ConnectionResetError" in recorded[0]
+
+
 # =============================================================================
 # DIAGNOSIS FROM A DISTANCE
 # =============================================================================
@@ -356,6 +429,35 @@ def test_the_status_reports_what_the_process_costs(client: TestClient) -> None:
     assert process["rss_mb"] > 0
     assert process["threads"] >= 1
     assert process["cpu_seconds"] >= 0
+
+
+def test_the_status_shows_the_stall_a_tick_file_cannot_show(
+    client: TestClient,
+    stats: CollectorStats
+) -> None:
+    """
+    The instrument for the day-cut defect, readable from off the machine.
+
+    A blocked event loop stamps `collected_msc` late, and nothing in a tick file
+    says so - it just reads later than it should, until the lag passes the
+    consuming importer's 30 s window and the whole file is refused. Measured on
+    production 2026-09-20: 21 s of blocking at the UTC day cut. The counters
+    beside it say whether the files that were handed to an archive writer ever
+    arrived.
+    """
+    stats.record_loop_lag(1750.0)
+    stats.record_export_started()
+    stats.record_export_finished(
+        "BTCUSD_20260920_000004_ticks.json", 42, 310.0)
+
+    payload = client.get("/v1/status", headers=as_reader()).json()
+
+    assert payload["loop_lag"]["max_ms"] == 1750.0
+    assert payload["loop_lag"]["over_500ms"] == 1
+    assert payload["loop_lag"]["max_at"].endswith("+00:00")
+    assert payload["exports"]["finished"] == 1
+    assert payload["exports"]["in_flight"] == 0
+    assert payload["exports"]["last_file"] == "BTCUSD_20260920_000004_ticks.json"
 
 
 def test_a_refused_socket_count_is_unknown_and_not_zero(

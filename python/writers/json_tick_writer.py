@@ -3,23 +3,30 @@ FiniexDataCollector - JSON Tick Writer
 Writes ticks to JSON files matching MT5 output format.
 
 Features:
-- 50,000 tick file rotation
-- Lock file protection for active files
-- Atomic writes (temp file + rename)
+- Rotation at max_ticks_per_file and at the UTC day boundary
+- A write-ahead log per file, which also marks the file as open
+- Atomic writes (temp file + rename), here or in a subprocess
 - Quality metrics calculation
 
 Location: python/writers/json_tick_writer.py
 """
 
 import json
-import os
-import tempfile
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any, TextIO
+from typing import Callable, Optional, List, Dict, Any, TextIO
 
 from python.writers.base import AbstractTickWriter
+from python.writers.wal_archive import (
+    CLOSE_RECORD_KEY,
+    WalContents,
+    WalUnreadable,
+    archive_path_for,
+    build_archive_text,
+    read_wal,
+    write_archive_atomically,
+)
 from python.types.tick_types import (
     COLLECTED_MSC_TIMEBASE,
     DATA_FORMAT_VERSION,
@@ -41,7 +48,7 @@ from python.exceptions.collector_exceptions import (
     FileRotationError
 )
 from python.utils.collection_clock import CollectionClock
-from python.utils.logging_setup import get_collector_logger
+from python.utils.logging_setup import describe_exception, get_collector_logger
 
 
 class JsonTickWriter(AbstractTickWriter):
@@ -62,7 +69,8 @@ class JsonTickWriter(AbstractTickWriter):
         broker_type: str = "",
         max_ticks_per_file: int = 50000,
         data_collector: str = "kraken",
-        origin: Optional[OriginBlock] = None
+        origin: Optional[OriginBlock] = None,
+        exporter: Optional[Callable[[Path, Path], None]] = None
     ):
         """
         Initialize JSON tick writer.
@@ -81,6 +89,11 @@ class JsonTickWriter(AbstractTickWriter):
             origin: Which instance produced these files. Absent only in tests;
                 main.py always supplies it, and a collector that cannot
                 establish its identity refuses to start.
+            exporter: Called with (write-ahead log, archive file) when a file
+                closes, and expected to write the archive and remove the log -
+                main.py hands that to a subprocess. Without one the file is
+                written here, inline, which is what a graceful stop does and
+                what every test does unless it says otherwise.
         """
         super().__init__(output_dir, symbol, max_ticks_per_file)
 
@@ -90,6 +103,7 @@ class JsonTickWriter(AbstractTickWriter):
         self._broker_type = broker_type
         self._data_collector = data_collector
         self._origin = origin
+        self._exporter = exporter
         self._logger = get_collector_logger(f"writer.{symbol}")
 
         # Current file state
@@ -105,6 +119,10 @@ class JsonTickWriter(AbstractTickWriter):
         # consistent whatever the clock is doing.
         self._file_day: Optional[str] = None
         self._errors: List[Dict[str, Any]] = []
+        # How many ticks the file that closed last held. The caller cannot
+        # derive it: at the day cut the triggering tick belongs to the NEW file,
+        # at the count threshold to the old one.
+        self._last_closed_tick_count = 0
 
         # Write-ahead log: every tick lands here the moment it arrives, so a
         # crash costs the last line rather than the whole buffer. Ticks are held
@@ -197,13 +215,16 @@ class JsonTickWriter(AbstractTickWriter):
         if not self._current_file:
             return None
 
+        # Read before _start_new_file resets it - this line reported "0 ticks"
+        # for every rotation the production log holds, because the counter was
+        # read after the reset.
+        tick_count = self._current_tick_count
+
         closed_file = self._finalize_current_file()
         self._start_new_file()
 
         self._logger.info(
-            f"Rotated file: {closed_file.name} "
-            f"({self._current_tick_count} ticks)"
-        )
+            f"Rotated file: {closed_file.name} ({tick_count} ticks)")
 
         return closed_file
 
@@ -222,6 +243,10 @@ class JsonTickWriter(AbstractTickWriter):
         The check belongs here and not in `_finalize_current_file`, which the
         rotation path also calls and which reads `.name` off the result.
 
+        The file is written here rather than handed to a subprocess: the loop
+        this hands off to protect is ending anyway, and a child started now
+        would outlive the process that is supposed to wait for it.
+
         Returns:
             Path to the finalized file, or None when there was nothing to write
         """
@@ -233,11 +258,16 @@ class JsonTickWriter(AbstractTickWriter):
             self._current_file = None
             return None
 
-        return self._finalize_current_file()
+        return self._finalize_current_file(use_exporter=False)
 
     def get_current_filepath(self) -> Optional[Path]:
         """Get path to current active file."""
         return self._current_file
+
+    @property
+    def last_closed_tick_count(self) -> int:
+        """Ticks in the file that closed last, as it was written."""
+        return self._last_closed_tick_count
 
     def _start_new_file(self) -> None:
         """Initialize new tick file and its write-ahead log."""
@@ -277,16 +307,31 @@ class JsonTickWriter(AbstractTickWriter):
 
         self._logger.debug(f"Started new file: {filename}")
 
-    def _finalize_current_file(self) -> Path:
+    def _finalize_current_file(self, use_exporter: bool = True) -> Path:
         """
-        Write buffer to file and remove lock.
+        Close the current file: hand it to the exporter, or write it here.
+
+        Args:
+            use_exporter: False writes the file on the spot even when an
+                exporter is configured - what a graceful stop does, because
+                there is no event loop left to protect and no child to wait for
 
         Returns:
-            Path to written file
+            Path of the file, which the exporter may not have written yet
         """
         if not self._current_file or not self._ticks_buffer:
             self._close_wal(delete=True)
             return self._current_file
+
+        completed_file = self._current_file
+        tick_count = len(self._ticks_buffer)
+
+        # The buffer is the file: whoever reports this count afterwards reports
+        # what was written, not what a second counter believed.
+        self._last_closed_tick_count = tick_count
+
+        if self._exporter and use_exporter:
+            return self._hand_over_to_exporter(completed_file, tick_count)
 
         # Build file content
         content = self._build_file_content()
@@ -307,18 +352,102 @@ class JsonTickWriter(AbstractTickWriter):
         self._close_wal(delete=True)
 
         self._files_created += 1
-        completed_file = self._current_file
 
         # Reset state
         self._current_file = None
         self._ticks_buffer = []
 
         self._logger.info(
-            f"Finalized: {completed_file.name} "
-            f"({self._current_tick_count} ticks)"
-        )
+            f"Finalized: {completed_file.name} ({tick_count} ticks)")
 
         return completed_file
+
+    def _hand_over_to_exporter(self, completed_file: Path,
+                               tick_count: int) -> Path:
+        """
+        Give the finished log to whoever writes the archive file.
+
+        The data is already on disk, line by line, so nothing is serialized
+        here: the closing state goes into the log as its last record and the log
+        is closed but **kept**. Whoever writes the archive removes it afterwards,
+        which preserves the ordering the whole mechanism rests on - the log
+        outlives the window in which the archive does not exist yet.
+
+        Measured on production 2026-09-20: writing the file here cost about 1 s
+        plus 66 us per tick, on the collector's only event loop, nine times in a
+        row at the UTC day cut.
+
+        Args:
+            completed_file: The archive file that is now owed
+            tick_count: How many ticks it will hold
+
+        Returns:
+            Path of the archive file, which does not exist yet
+        """
+        self._append_close_record()
+        wal_path = self._wal_path
+        self._close_wal(delete=False)
+
+        if wal_path is None:
+            # Nothing to hand over: opening the log failed earlier and was
+            # reported then, so these ticks exist in memory only. They are
+            # written here rather than handed to a reader of a file that does
+            # not exist. State is untouched at this point, so the inline path
+            # still finds its buffer.
+            self._logger.error(
+                f"{completed_file.name} has no write-ahead log to export from "
+                f"- writing it inline instead")
+            return self._finalize_current_file(use_exporter=False)
+
+        self._files_created += 1
+        self._current_file = None
+        self._ticks_buffer = []
+
+        self._logger.info(
+            f"Closed: {completed_file.name} ({tick_count} ticks) - "
+            f"handed to the archive writer")
+
+        try:
+            # Absolute, because the exporter does not share this process's
+            # working directory: the subprocess runs from the repository root so
+            # it can import the package, while `raw_data_dir` is relative in the
+            # shipped configuration. Measured on the first live run: every
+            # export failed with FileNotFoundError on a path that was correct
+            # where it was built.
+            self._exporter(wal_path.resolve(), completed_file.resolve())
+        except Exception as e:
+            # This runs inside write_tick, on the tick path. A handover that
+            # throws must cost the file's export, which the next start repairs
+            # from the log, and never the tick that happened to trigger it.
+            self._logger.error(
+                f"Could not hand {completed_file.name} to the archive writer: "
+                f"{describe_exception(e)} - its log stays on disk and the next "
+                f"start recovers it")
+
+        return completed_file
+
+    def _append_close_record(self) -> None:
+        """
+        Append the closing state as the log's last line.
+
+        Everything a finished file needs that the log does not already hold:
+        the summary as the writer computed it, including the anchor counters at
+        close and the end time. Without it a file built from the log could only
+        state what a reader can infer, and would describe itself as recovered.
+        """
+        if not self._wal:
+            return
+
+        try:
+            self._wal.write(json.dumps(
+                {CLOSE_RECORD_KEY: self._build_close_record()}) + "\n")
+            self._wal.flush()
+        except Exception as e:
+            # The file can still be built without it; it would then read as a
+            # recovered file, which is a true statement about a log that was
+            # never closed properly.
+            self._logger.error(
+                f"Could not write the closing record: {describe_exception(e)}")
 
     def _open_wal(self) -> None:
         """
@@ -342,7 +471,8 @@ class JsonTickWriter(AbstractTickWriter):
         except Exception as e:
             # Collection continues without the safety net rather than stopping:
             # losing a buffer on a crash is worse than never collecting at all.
-            self._logger.error(f"Could not open write-ahead log: {e}")
+            self._logger.error(
+                f"Could not open write-ahead log: {describe_exception(e)}")
             self._wal = None
 
     def _append_to_wal(self, tick: TickData) -> None:
@@ -371,7 +501,8 @@ class JsonTickWriter(AbstractTickWriter):
             self._wal.write(json.dumps(self._tick_to_dict(tick)) + "\n")
             self._wal.flush()
         except Exception as e:
-            self._logger.error(f"Write-ahead log write failed: {e}")
+            self._logger.error(
+                f"Write-ahead log write failed: {describe_exception(e)}")
             self._wal = None
 
     def _close_wal(self, delete: bool) -> None:
@@ -393,7 +524,8 @@ class JsonTickWriter(AbstractTickWriter):
             try:
                 self._wal_path.unlink()
             except Exception as e:
-                self._logger.warning(f"Could not remove write-ahead log: {e}")
+                self._logger.warning(
+                    f"Could not remove write-ahead log: {describe_exception(e)}")
 
         self._wal_path = None
 
@@ -439,15 +571,18 @@ class JsonTickWriter(AbstractTickWriter):
             error_tracking=ErrorTracking()
         )
 
-    def _build_file_content(self) -> Dict[str, Any]:
+    def _build_close_record(self) -> Dict[str, Any]:
         """
-        Build complete file content structure.
+        Build the errors and summary blocks as they stand at close.
+
+        Split out of _build_file_content so the same two blocks can be appended
+        to the write-ahead log: a file finished by a subprocess is then finished
+        from exactly what the writer knew, not from what a reader could infer.
 
         Returns:
-            Dict matching MT5 JSON format
+            Dict with an "errors" and a "summary" block
         """
         now = datetime.now(timezone.utc)
-        metadata = self._build_metadata()
 
         # Summary
         duration_minutes = 0.0
@@ -485,10 +620,7 @@ class JsonTickWriter(AbstractTickWriter):
             recommendations=self._get_recommendations()
         )
 
-        # Build final structure
         return {
-            "metadata": self._metadata_to_dict(metadata),
-            "ticks": [self._tick_to_dict(t) for t in self._ticks_buffer],
             "errors": {
                 "by_severity": {
                     "negligible": 0,
@@ -500,6 +632,22 @@ class JsonTickWriter(AbstractTickWriter):
             "summary": self._summary_to_dict(summary)
         }
 
+    def _build_file_content(self) -> Dict[str, Any]:
+        """
+        Build complete file content structure.
+
+        Returns:
+            Dict matching MT5 JSON format
+        """
+        close = self._build_close_record()
+
+        return {
+            "metadata": self._metadata_to_dict(self._build_metadata()),
+            "ticks": [self._tick_to_dict(t) for t in self._ticks_buffer],
+            "errors": close["errors"],
+            "summary": close["summary"]
+        }
+
     def _atomic_write(self, content: Dict[str, Any]) -> None:
         """
         Write content atomically using temp file + rename.
@@ -507,24 +655,13 @@ class JsonTickWriter(AbstractTickWriter):
         Args:
             content: File content dict
         """
-        # Create temp file in same directory
-        fd, temp_path = tempfile.mkstemp(
-            dir=self._symbol_dir,
-            suffix=".tmp"
-        )
-
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(content, f, indent=2)
-
-            # Atomic rename
-            os.replace(temp_path, self._current_file)
-
-        except Exception:
-            # Clean up temp file on error
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-            raise
+        write_archive_atomically(
+            build_archive_text(WalContents(
+                metadata=content["metadata"],
+                ticks=content["ticks"],
+                close={"errors": content["errors"],
+                       "summary": content["summary"]})),
+            self._current_file)
 
     def _get_symbol_info(self) -> SymbolInfo:
         """
@@ -654,7 +791,7 @@ def _drop_log(wal_path: Path, logger) -> bool:
         return True
     except OSError as e:
         logger.warning(
-            f"Could not remove {wal_path.name} ({e}) - left in place, "
+            f"Could not remove {wal_path.name} ({describe_exception(e)}) - left in place, "
             f"the next start will find it again")
         return False
 
@@ -693,7 +830,7 @@ def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path
     recovered: List[Path] = []
 
     for wal_path in sorted(target_dir.glob("*_ticks.jsonl.part")):
-        archive_path = wal_path.with_suffix("").with_suffix(".json")
+        archive_path = archive_path_for(wal_path)
 
         if archive_path.exists():
             logger.info(
@@ -702,115 +839,51 @@ def recover_orphaned_buffers(output_dir: Path, data_collector: str) -> List[Path
             continue
 
         try:
-            lines = wal_path.read_text(encoding="utf-8").splitlines()
-        except Exception as e:
-            logger.error(f"Cannot read {wal_path.name}: {e}")
-            continue
-
-        if not lines:
-            _drop_log(wal_path, logger)
-            continue
-
-        try:
-            metadata = json.loads(lines[0])
-        except json.JSONDecodeError:
+            contents = read_wal(wal_path)
+        except WalUnreadable:
+            if wal_path.stat().st_size == 0:
+                _drop_log(wal_path, logger)
+                continue
             corrupt = wal_path.with_suffix(".corrupt")
             wal_path.rename(corrupt)
             logger.error(
                 f"{wal_path.name} has an unreadable header, kept as "
                 f"{corrupt.name} - not recovered")
             continue
+        except Exception as e:
+            logger.error(
+                f"Cannot read {wal_path.name}: {describe_exception(e)}")
+            continue
 
-        ticks: List[Dict[str, Any]] = []
-        anchor = {
-            "resyncs": metadata.get("anchor_resyncs", 0),
-            "max_correction_ms": metadata.get("anchor_max_correction_ms", 0)
-        }
+        if contents.torn_lines > 1:
+            # Only the final line can be torn by a crash mid-write; more than
+            # one means damage this routine should not paper over silently.
+            logger.warning(
+                f"{wal_path.name}: {contents.torn_lines} unreadable lines, "
+                f"skipped")
 
-        for line in lines[1:]:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                # Only the final line can be torn; anything earlier would mean
-                # the file is damaged in a way this routine should not paper over.
-                if line is not lines[-1]:
-                    logger.warning(
-                        f"{wal_path.name}: unreadable line inside the log, skipped")
-                continue
-
-            if "time_msc" in record:
-                ticks.append(record)
-            elif "anchor_resyncs" in record:
-                anchor = {
-                    "resyncs": record["anchor_resyncs"],
-                    "max_correction_ms": record["anchor_max_correction_ms"]
-                }
-
-        if not ticks:
+        if not contents.ticks:
             _drop_log(wal_path, logger)
             logger.info(f"{wal_path.name} held no ticks, removed")
             continue
 
-        last_event = ticks[-1]["time_msc"]
-        start_unix = metadata.get("start_time_unix", 0)
-        duration_minutes = round(
-            (last_event / 1000 - start_unix) / 60, 1) if start_unix else 0.0
-
-        content = {
-            "metadata": metadata,
-            "ticks": ticks,
-            "errors": {
-                "by_severity": {"negligible": 0, "serious": 0, "fatal": 0},
-                "details": []
-            },
-            "summary": {
-                "total_ticks": len(ticks),
-                "total_errors": 0,
-                "data_stream_status": "HEALTHY",
-                "quality_metrics": {
-                    "overall_quality_score": 1.0,
-                    "data_integrity_score": 1.0,
-                    "data_reliability_score": 1.0,
-                    "negligible_error_rate": 0.0,
-                    "serious_error_rate": 0.0,
-                    "fatal_error_rate": 0.0
-                },
-                "timing": {
-                    "end_time": datetime.fromtimestamp(
-                        last_event / 1000, tz=timezone.utc
-                    ).strftime("%Y.%m.%d %H:%M:%S"),
-                    "duration_minutes": duration_minutes,
-                    "avg_ticks_per_minute": round(
-                        len(ticks) / duration_minutes, 1
-                    ) if duration_minutes > 0 else 0.0
-                },
-                "anchor": anchor,
-                "recommendations": (
-                    "Recovered from a write-ahead log after an unclean stop. "
-                    "The file is shorter than a rotation would have made it; "
-                    "that is where the previous run ended."
-                )
-            }
-        }
-
-        # Same atomic path as a normal rotation: a consumer never sees a partial
-        # file, recovered or not.
-        fd, temp_path = tempfile.mkstemp(
-            dir=str(target_dir), suffix=".tmp", text=True)
+        # The same builder and the same atomic path a rotation uses, so a
+        # recovered file and a rotated one cannot differ in anything but what
+        # the log actually held.
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(content, handle, indent=2, ensure_ascii=False)
-            os.replace(temp_path, archive_path)
+            write_archive_atomically(
+                build_archive_text(contents), archive_path)
         except Exception as e:
-            logger.error(f"Could not write {archive_path.name}: {e}")
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+            logger.error(
+                f"Could not write {archive_path.name}: {describe_exception(e)}")
             continue
 
         _drop_log(wal_path, logger)
         recovered.append(archive_path)
         logger.info(
             f"Recovered {archive_path.name} from its write-ahead log "
-            f"({len(ticks):,} ticks)")
+            f"({len(contents.ticks):,} ticks)"
+            + (" - closed by its writer, so it is a complete file"
+               if contents.close else ""))
 
     return recovered

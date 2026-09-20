@@ -137,6 +137,36 @@ Two deliberate exceptions:
   Those are computed properties, so a plain dataclass conversion drops them — and they are
   the part a monitor acts on.
 
+**`loop_lag` is the instrument for the one defect a tick file cannot show.** Everything the
+collector does shares one event loop, so a long piece of work anywhere delays the stamping of
+every tick that arrives meanwhile. In the file that reads as a `collected_msc` a few seconds
+later than it should — nothing says why — until the lag passes the importer's 30 s window and
+the whole file is refused. Ten samples a second measure how late the loop runs its own timers:
+`max_ms` with the moment it happened, `over_500ms`, the last reading and the sample count. On
+production 2026-09-20 the UTC day cut blocked the loop for 21 s; the archive writers now run as
+subprocesses because of it.
+
+**`exports` counts those subprocesses**: handed over, finished, failed, in flight, the last file
+with its tick count and duration, and the file a failure left owed. A failed export is not lost
+data — its write-ahead log stays on disk and the next start recovers it — but it is a file the
+archive does not have yet, and `last_failed_file` is what names it.
+
+**`counter_check` is the guard on the tick counts this route serves.** The writer counts what
+goes into the file; the tick handler keeps a second count for the display, for `symbols[…]
+.current_file_ticks` here, and for the weekly report. Two counters for one number drift: these
+two disagreed by exactly one tick at every UTC day cut until 2026-09-20, and nothing compared
+them. Now they are compared once a minute — `mismatches` staying at zero is the evidence that
+the counts are sound, and anything else names the symbol and both numbers. The writer wins,
+because the writer is what the file will say.
+
+**`total_errors`, `total_warnings` and `recent_logs` count the log.** Every line written at
+ERROR or CRITICAL counts as an error, every WARNING as a warning, since the process started;
+`recent_logs` holds the most recent of them, as many as the display keeps. They are derived through a listener on the logger
+rather than raised by each error path, because the error paths never raised them: until
+2026-09-19 all three were constants — 0, 0 and empty — in every payload ever served, while the
+production log carried forced reconnects. A forced reconnect is an ERROR line and counts; the
+reconnects themselves are in `reconnect_events`.
+
 Alongside the stats, the payload carries **`origin`** — the same block a tick file
 carries, field for field, so a consumer parses one structure and not two:
 
@@ -349,6 +379,14 @@ construction rather than by discipline.
 **It cannot take the collector down.** The server runs as a task on the collector's own
 event loop with its own exception guard. A status surface that stops the collection is
 worse than no status surface.
+
+**It can stop listening without stopping, on Windows.** When `accept()` raises, CPython's
+proactor loop (3.13 and 3.14 alike) closes the listening socket for good and tells only the
+loop's exception handler; uvicorn keeps running on a socket that no longer exists, and the edge
+answers 502. The collector installs a handler that writes this into the log file as an ERROR —
+asyncio's default would have printed it to stderr, outside the log — so the cause is on record.
+It does not bring the API back: that takes a collector restart. Not observed in production so
+far.
 
 **It is off unless `api.enabled` is set**, and it binds loopback. The port never gets a
 firewall rule; reaching it from elsewhere is the reverse proxy's job.

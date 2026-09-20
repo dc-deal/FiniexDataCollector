@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from python.exceptions.collector_exceptions import ConfigurationError
-from python.utils.logging_setup import get_collector_logger
+from python.utils.logging_setup import describe_exception, get_collector_logger
 
 IDENTITY_FILENAME = "instance.json"
 
@@ -73,7 +73,7 @@ def _read_identity(path: Path) -> str:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         raise ConfigurationError(
-            f"Cannot read the instance identity at {path}: {e}. "
+            f"Cannot read the instance identity at {path}: {describe_exception(e)}. "
             f"Refusing to start rather than write files nobody can attribute. "
             f"Restore it from a backup, or from the consumer's registry."
         )
@@ -136,7 +136,7 @@ def mint_or_read(data_root: Path) -> str:
         return _read_identity(path)
     except OSError as e:
         raise ConfigurationError(
-            f"Cannot create the instance identity at {path}: {e}. "
+            f"Cannot create the instance identity at {path}: {describe_exception(e)}. "
             f"Refusing to start rather than write files nobody can attribute."
         )
 

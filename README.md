@@ -44,6 +44,11 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 - **Write-Ahead Log** - every tick is appended to a `.jsonl.part` sidecar before it counts as
   collected, and that log is removed only after the archive file exists. A crash costs the
   last tick rather than the whole buffer; the next start rebuilds the file from the log.
+- **The archive file is written by a subprocess** - the ticks are already on disk, so a closed
+  file is handed over as a path rather than serialized on the collector's event loop. Writing
+  it inline cost about 1 s per file plus 66 µs per tick, and at the UTC day cut nine files in a
+  row: 21 s in which no tick was stamped on time. A failed export costs nothing but time, since
+  its log is still there for the next start.
 - **Quality Metrics** - Spread calculation, tick frequency, error tracking
 
 ### Status API
@@ -176,7 +181,7 @@ every price written.
 │         ▼                                                       │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │  JSON TICK WRITER                                       │    │
-│  │  50k rotation, write-ahead log, atomic writes            │    │
+│  │  rotation, write-ahead log, export to a subprocess       │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │         │                                                       │
 │         ▼                                                       │

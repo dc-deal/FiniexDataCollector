@@ -18,7 +18,7 @@ import certifi
 
 from python.alerts.base import AbstractAlertProvider, Alert, AlertLevel
 from python.exceptions.collector_exceptions import AlertDeliveryError
-from python.utils.logging_setup import get_logger
+from python.utils.logging_setup import describe_exception, get_logger
 
 
 class TelegramAlertProvider(AbstractAlertProvider):
@@ -128,7 +128,8 @@ class TelegramAlertProvider(AbstractAlertProvider):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self._logger.error(f"Command polling error: {e}")
+                self._logger.error(
+                    f"Command polling error: {describe_exception(e)}")
                 await asyncio.sleep(5)
 
     async def _process_updates(self, updates: list) -> None:
@@ -188,8 +189,9 @@ class TelegramAlertProvider(AbstractAlertProvider):
                 if not success:
                     await self._send_message("❌ Failed to generate report")
             except Exception as e:
-                self._logger.error(f"Report callback failed: {e}")
-                await self._send_message(f"❌ Report generation error: {e}")
+                self._logger.error(
+                    f"Report callback failed: {describe_exception(e)}")
+                await self._send_message(f"❌ Report generation error: {describe_exception(e)}")
         else:
             await self._send_message("❌ Report callback not configured")
 
@@ -245,7 +247,8 @@ class TelegramAlertProvider(AbstractAlertProvider):
 
         except Exception as e:
             self._errors_count += 1
-            self._logger.error(f"Failed to send Telegram alert: {e}")
+            self._logger.error(
+                f"Failed to send Telegram alert: {describe_exception(e)}")
             raise AlertDeliveryError(
                 message=str(e),
                 provider="telegram",
@@ -280,7 +283,8 @@ class TelegramAlertProvider(AbstractAlertProvider):
             return False
 
         except Exception as e:
-            self._logger.error(f"Telegram connection test failed: {e}")
+            self._logger.error(
+                f"Telegram connection test failed: {describe_exception(e)}")
             return False
 
     async def send_weekly_report(
@@ -398,7 +402,7 @@ class TelegramAlertProvider(AbstractAlertProvider):
             self._logger.error("Telegram API timeout")
             return False
         except Exception as e:
-            self._logger.error(f"Telegram send error: {e}")
+            self._logger.error(f"Telegram send error: {describe_exception(e)}")
             return False
 
     def _format_telegram_message(self, alert: Alert) -> str:

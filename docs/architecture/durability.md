@@ -46,13 +46,57 @@ The log is deleted **after** the archive file is written, never before.
 
     1. append tick to .jsonl.part          data in the log
     2. ... rotation threshold reached
-    3. write .json atomically              data in BOTH places
-    4. delete .jsonl.part                  data in the archive file
+    3. append the closing record           the log now holds a complete file
+    4. write .json atomically              data in BOTH places
+    5. delete .jsonl.part                  data in the archive file
 
 A window where the data sits in two places is recoverable. A window where it sits in neither
 is not. `tests/writers/test_write_ahead_log.py` contains a test that makes `os.replace` throw,
 because on the happy path both orderings end identically — which is what would make the wrong
 one survive a review.
+
+Steps 4 and 5 happen in **another process** (below). The ordering is unchanged by that: the log
+outlives the window in which the archive does not exist yet, whoever closes it.
+
+## Who writes the file, and why not this process
+
+Writing the archive used to happen inline, on the collector's only event loop. Measured on
+production 2026-09-20: about **1 s per file plus 66 µs per tick**, and at the UTC day cut nine
+files close within seconds of each other — 21 s in which nothing else ran. No socket was read, no
+other symbol was written, the status API did not answer. Every tick that arrived meanwhile got its
+`collected_msc` stamped that late, up to 17.85 s measured the night before, against an importer
+that refuses a whole file beyond 30 s of lag.
+
+So a closed file is **handed over**: the ticks are already on disk, line by line, so nothing is
+serialized here.
+
+    rotation:   append the closing record, close the log (keep it), open the next file
+    subprocess: python -m python.writers.wal_archive <log>
+                -> build the file, write it atomically, delete the log
+
+Measured on a development laptop, 50,000 ticks: the loop stalls **6-14 ms** with the handover,
+against **774 ms** inline. A worker thread is not the answer — the fast C encoder holds the GIL
+for its whole run, so the loop still stalled 114 ms.
+
+**A failure costs nothing but time.** If the child dies, hangs past its timeout, or never starts,
+the log stays exactly where it is and the next start recovers it. That is what the parent gives up
+by not deleting it, and the reason it must not.
+
+**The graceful stop writes inline instead.** There is no loop left to protect, and a child started
+at that moment would outlive the process meant to wait for it.
+
+`/v1/status` carries `exports` (handed over, finished, failed, in flight, and the file a failure
+left owed) and `loop_lag`, which measures the stall directly rather than leaving it to be inferred
+from tick timestamps.
+
+## The closing record
+
+The last line a rotation appends to its log is the summary and errors block it computed at close —
+the end time, the anchor counters, the tick count. Without it a file built from the log could only
+state what a reader can infer, and would describe itself as recovered.
+
+It shares the log with the ticks, as its own kind of line, so a reader that does not know the key
+skips it: a log written by this build is still readable by the one before it.
 
 ## Recovery
 
@@ -62,6 +106,7 @@ leftover logs into archive files through the same atomic path.
 | Situation | What recovery does |
 |---|---|
 | Log present, no archive file | Rebuild the file, delete the log |
+| Log carries a closing record | Rebuild it **as the rotation would have**, not as a recovered file — the writer's own summary is in there |
 | Archive file already present | Keep the file, drop the log — **never overwrite**, a consumer may already have read it |
 | Final line torn by a crash mid-write | Skip that line, keep the rest |
 | Header unreadable | Rename to `.corrupt` and stop. Inventing metadata would produce a file stating things nobody measured |

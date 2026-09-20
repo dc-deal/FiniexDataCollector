@@ -33,7 +33,7 @@
     ],
     "reconnect_max_delay_seconds": 60,
     "reconnect_initial_delay_seconds": 1,
-    "heartbeat_interval_seconds": 10,
+    "stale_after_seconds": 10,
     "max_ticks_per_file": 50000
   },
   "mt5": {

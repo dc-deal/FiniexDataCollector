@@ -12,7 +12,7 @@ from typing import Optional, Callable, Awaitable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from python.utils.logging_setup import get_logger
+from python.utils.logging_setup import describe_exception, get_logger
 from python.utils.config_loader import SchedulerConfig
 
 
@@ -162,7 +162,7 @@ class WeeklyJobScheduler:
                 self._logger.warning("No report callback set")
 
         except Exception as e:
-            self._logger.error(f"Report failed: {e}")
+            self._logger.error(f"Report failed: {describe_exception(e)}")
             result["success"] = False
             result["error_message"] = str(e)
 

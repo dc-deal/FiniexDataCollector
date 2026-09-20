@@ -74,13 +74,37 @@ apart.
 
 ## When a connection drops
 
-The collector detects a stale connection after roughly three times
-`heartbeat_interval_seconds` and reconnects on its own, resubscribing both channels. Kraken
-sends a ticker snapshot on subscribe, so the quote cache is refreshed before the first trade
-arrives — measured at 235 ms after a reconnect rather than the length of the outage.
+The collector closes and reopens a connection that has been silent for `stale_after_seconds`
+and resubscribes both channels. Silence counts every message, heartbeats included, and Kraken
+sends one every second on a live connection — measured at a largest gap of 1.03 s on a quiet
+pair — so the check runs every second. Kraken sends a ticker snapshot on subscribe, so the
+quote cache is refreshed before the first trade arrives — measured at 235 ms after a reconnect
+rather than the length of the outage.
 
-Each drop costs the market data of its detection window. At the shipped interval of 10 s that
-is roughly 30–40 s; it was 105 s at the previous 30 s setting.
+Each drop costs the market data of its detection window plus about 6 s to reconnect and
+resubscribe. At the shipped 10 s that is roughly 11 s of noticing. Before 2026-09-19 the check
+ran every 10 s and reconnected at three times that: 41–51 s of silence per drop on the liquid
+pairs, measured by `trade_id` gaps on production — 537 trades in four drops in one evening.
+
+## Reading a rotation in the log
+
+Two lines describe every closed file, and they come from different places:
+
+    Closed: BTCUSD_..._ticks.json (47368 ticks) - handed to the archive writer   <- the writer
+    File rotated: BTCUSD_..._ticks.json (47,368 ticks)                            <- the handler
+    Exported BTCUSD_..._ticks.json (47,368 ticks) in 840 ms                       <- the subprocess
+
+**They are a cross-check, not a repetition.** The first counts the buffer that became the file,
+the second the counter the display and `/v1/status` show, the third what the subprocess actually
+wrote. Until 2026-09-20 the middle one disagreed with the other two by one tick at every day cut.
+`counter_check` on `/v1/status` now compares the first two once a minute; `mismatches` above zero
+is the signal.
+
+**A blocked event loop is not a dead feed.** While a file closes nothing reads the socket — the
+midnight cut blocked the loop for 17.85 s — and messages wait there unread. A check that wakes
+late therefore skips its judgement for that round; the next one sees what the receive loop read
+in the meantime. Without that exemption a 10 s threshold would force a reconnect at every day
+cut.
 
 ## Where things are
 

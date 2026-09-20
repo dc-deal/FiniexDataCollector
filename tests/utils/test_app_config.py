@@ -105,17 +105,18 @@ def test_a_connection_that_never_left_is_not_a_reconnect() -> None:
     assert not is_reconnect("failed", "failed")
 
 
-def test_the_detection_window_stays_under_a_minute() -> None:
+def test_the_detection_window_stays_short() -> None:
     """
-    Detection costs more than the outage: the staleness threshold is twice the
-    heartbeat interval, and a forced reconnect waits three times it. Measured at
-    30 s that was 60-90 s of lost market data per event, against 2-3 s to
-    reconnect. The ceiling here is what keeps that from drifting back.
+    Detection costs more than the outage. Checked every 10 s with a reconnect at
+    three times that, production lost 41-51 s per drop on the liquid pairs, 30-40
+    s of it spent noticing, against about 6 s to reconnect. Kraken sends a
+    heartbeat every second, so a few seconds of silence is already unambiguous.
+    The ceiling here is what keeps the threshold from drifting back.
     """
-    interval = tracked_config()["kraken"]["heartbeat_interval_seconds"]
+    threshold = tracked_config()["kraken"]["stale_after_seconds"]
 
-    assert interval * 3 <= 45, (
-        f"a forced reconnect would take up to {interval * 3}s to trigger")
+    assert threshold <= 15, (
+        f"a dead connection would go unnoticed for {threshold}s")
 
 
 def test_file_logging_is_not_debug_by_default() -> None:
