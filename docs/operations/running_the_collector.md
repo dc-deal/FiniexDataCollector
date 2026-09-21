@@ -33,6 +33,31 @@ See [watching a collector](watching_a_collector.md).
 Docker in this repository is the **development** environment: the compose service runs
 `tail -f /dev/null` and never starts the collector. Production runs from a virtualenv.
 
+## One collector per output directory
+
+Starting a second one against the same `raw_data_dir` is **refused**, and the refusal is the
+first thing that happens — before Telegram, before the scheduler, before the status port. The
+message names the pid that holds it:
+
+    Another collector is already writing to dataaw (pid 4892).
+
+This is not about duplicate work. Startup recovery cannot tell a crashed run's write-ahead log
+from a running instance's: on Windows removing a live log fails and aborts the start, and on
+Linux it **succeeds**, taking away the running instance's only protection.
+
+A lock left by a crash is **taken over**, not obeyed — the holder is identified by pid *and*
+process creation time, so a reused pid cannot lock the directory forever, and a truncated lock
+file counts as stale. Verified 2026-09-21: second start refused, first process killed outright,
+third start took over and recovered the log the kill left behind.
+
+**Exit codes**, which matter once a service manager is in front of it:
+
+| Code | Meaning | What a manager should do |
+|---|---|---|
+| 0 | stopped cleanly | nothing |
+| 1 | crashed | restart |
+| 2 | bad configuration, or the directory is taken | **stay stopped** — a retry produces the same failure |
+
 ## Stopping
 
 **Ctrl+C, once.** Not the window close button, not `Stop-Process`, not `kill -9`.

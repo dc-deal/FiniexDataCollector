@@ -1,12 +1,31 @@
 {
-  "_comment": "Remote collector instances this machine may query, and the credential for each. Copy to remote_endpoints.json and fill in. The collector itself never reads this file - it does not know it exists. One program does: `python -m python.main watch`, the viewer, which takes the base_url and token of the entry named by --endpoint (default: live). For everything else it is a note to whoever is working here, machine-readable so a session does not have to be told the URL again.",
+  "_comment": "Collector instances this machine may query, and the credential for each. Copy to remote_endpoints.json and fill in. The collector itself never reads this file - it does not know it exists. One program does: `python -m python.main watch`, this project's own status shell, which takes the base_url and token of the entry named by --endpoint (default: watch). For everything else it is a note to whoever is working here, machine-readable so a session does not have to be told the URL again.",
+  "_naming": "Entries here are named after WHAT THEY REACH and with what rights. 'watch' is this repository's own shell - it has nothing to do with the FiniexViewer project, which is a separate peer with its own credentials. The consumer name on the box should say the same thing: 'collector_watch', never 'viewer'.",
   "_rules": [
     "The real file is gitignored. It never becomes tracked, never reaches the bus, never gets pasted into an issue.",
-    "One token per consumer, so revoking one does not disturb the others. This one is the operator's; the consuming project has its own; the viewer has its own.",
+    "One token per consumer, so revoking one does not disturb the others. This one is the operator's; the consuming project has its own; the status shell has its own.",
     "The token authorises exactly the grants listed beside it. If a route answers 403, the grant is missing - it is not a bug in the route.",
     "Print the URL freely, never the token. A command that needs it reads it from here."
   ],
   "endpoints": {
+    "watch": {
+      "base_url": "https://<hostname>",
+      "token": "<40 characters, generated on the box, its own>",
+      "grants": [
+        "status:detail"
+      ],
+      "consumer": "collector_watch",
+      "note": "What `python -m python.main watch` uses by default. status:detail and nothing else: this shell sits open on a desk all day, and a token that can also fetch archive files is a credential left lying in a window."
+    },
+    "watch_local": {
+      "base_url": "http://127.0.0.1:8110",
+      "token": "<the same collector_watch token, on the box itself>",
+      "grants": [
+        "status:detail"
+      ],
+      "consumer": "collector_watch",
+      "note": "The same shell against a collector on this machine. Loopback, so it reads once a second instead of once every two."
+    },
     "live": {
       "base_url": "https://<hostname>",
       "token": "<40 characters, generated on the box>",
@@ -17,24 +36,9 @@
         "config:effective",
         "logs:collector"
       ],
+      "consumer": "operator",
       "instance_id": "<minted at the data root on first start; /v1/status states it>",
-      "note": "Which machine this reaches, and who maintains it"
-    },
-    "viewer": {
-      "base_url": "https://<hostname>",
-      "token": "<40 characters, generated on the box, its own>",
-      "grants": [
-        "status:detail"
-      ],
-      "note": "For `python -m python.main watch --endpoint viewer`. status:detail and nothing else: a viewer sits open on a desk all day, and a token that can also fetch archive files is a credential left lying in a window."
-    },
-    "local": {
-      "base_url": "http://127.0.0.1:8110",
-      "token": "<the viewer token again, on the box itself>",
-      "grants": [
-        "status:detail"
-      ],
-      "note": "The same viewer against a collector on this machine. Loopback, so it refreshes once a second instead of once every two."
+      "note": "The operator's own credential, for diagnostics from a session - archive listings, log excerpts, file transfers. Not what the status shell should be pointed at."
     }
   }
 }

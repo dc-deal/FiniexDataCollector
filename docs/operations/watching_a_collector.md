@@ -25,16 +25,58 @@ A viewer in its own process fixes both by construction. What freezes is no longe
 
 ## Starting it
 
-    python -m python.main watch                    # the endpoint named "live"
-    python -m python.main watch --endpoint local   # another entry
-    python -m python.main watch --interval 5       # override the refresh rate
+    python -m python.main watch                          # the entry named "watch"
+    python -m python.main watch --endpoint watch_local   # on the box itself
+    python -m python.main watch --interval 5             # override the refresh rate
 
 It reads `user_configs/remote_endpoints.json` for the base URL and the credential. Nothing else
 is needed — no config file, no log directory, no write access.
 
-**One token per consumer.** The viewer's entry should carry `status:detail` and nothing else. It
-sits open on a desk all day, where a token that can also fetch archive files is a credential left
-lying in a window. Mint it on the box; the operator puts it in the overlay.
+## The credential it needs
+
+`/v1/status` is gated on `status:detail`, so there is no way in without a token. It gets **its
+own**, carrying that grant and nothing else: this shell sits open on a desk all day, and a token
+that can also fetch archive files and log excerpts is a credential left lying in a window.
+
+**Name it `collector_watch`.** Not `viewer` — that reads as the FiniexViewer project, which is a
+separate peer with its own credentials, and a session cleaning up tokens later would have to
+guess which one it was looking at.
+
+Generate it on the box, in PowerShell as Administrator (verified on Windows PowerShell 5.1):
+
+```powershell
+$bytes = New-Object byte[] 20
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$token = ($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
+$token
+```
+
+Forty hex characters from the cryptographic RNG — `Get-Random` is not one, and this is a
+credential.
+
+Then two places, neither of them tracked by git:
+
+**On the box**, in `user_configs/app_config.json`, so the collector accepts it:
+
+```json
+"api": {
+  "tokens": {
+    "collector_watch": {
+      "token": "<the forty characters>",
+      "grants": ["status:detail"],
+      "note": "python -m python.main watch - the status shell, read-only"
+    }
+  }
+}
+```
+
+That section is a deep-merge overlay: adding this key leaves the other consumers alone. The
+collector reads tokens at startup, so it needs a restart to see a new one.
+
+**On whichever machine runs the shell**, in `user_configs/remote_endpoints.json`, under the entry
+`--endpoint` names. `remote_endpoints.example.json` carries the shape.
+
+**Print the URL, never the token.** A command that needs it reads it from the file.
 
 **Refresh rate** defaults to once a second on loopback and once every two seconds anywhere else.
 Every redraw is an HTTP request, which is free on loopback and not free through a TLS proxy.

@@ -102,3 +102,31 @@ def test_a_collector_on_this_machine_is_read_more_often() -> None:
     assert default_interval("http://127.0.0.1:8110") == 1.0
     assert default_interval("http://localhost:8110") == 1.0
     assert default_interval("https://collector.example") == 2.0
+
+
+def test_the_shell_defaults_to_the_narrow_credential() -> None:
+    """
+    The example is what a new machine is set up from, so its shape is the rule.
+
+    Two entries in it reach the same collector with very different rights. The
+    status shell sits open on a desk all day; pointing its default at the
+    operator's credential would leave a token that can also fetch archive files
+    and log excerpts lying in a window, for a screen that needs one route.
+
+    The name matters as much as the grant: `watch` is this repository's own
+    shell. `viewer` would read as the FiniexViewer project, which is a separate
+    peer with its own credentials, and a session cleaning up tokens later would
+    have to guess which one it was looking at.
+    """
+    import json
+
+    document = json.loads(
+        Path("user_configs/remote_endpoints.example.json").read_text(
+            encoding="utf-8"))
+    endpoints = document["endpoints"]
+
+    assert "watch" in endpoints, "the default --endpoint has no example entry"
+    assert endpoints["watch"]["grants"] == ["status:detail"], (
+        "the status shell's example carries more than the one route it reads")
+    assert "viewer" not in endpoints, (
+        "'viewer' collides with the FiniexViewer project - use 'watch'")

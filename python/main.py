@@ -201,6 +201,11 @@ ACCEPT_FAILED = "Accept failed on a socket"
 # the collector happens to be started.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Exit code for a failure a restart cannot fix: a malformed configuration, or an
+# output directory another live collector already owns. Everything else exits 1,
+# where a service manager's default restart is the right response.
+EXIT_CONFIGURATION = 2
+
 # A file of 50,000 ticks took about 4 s to write on the production box. A child
 # still running after this has hung; its log stays on disk and the next start
 # recovers it, so the ceiling costs nothing but the wait.
@@ -319,6 +324,22 @@ class FiniexDataCollector:
         self._gc_watcher.start()
         asyncio.get_running_loop().set_exception_handler(
             report_loop_exception(self._logger))
+
+        # Claim the output directory FIRST, before anything with a side effect.
+        #
+        # Two reasons, and the second is what moved this call up here. Recovery
+        # cannot distinguish a crashed run's write-ahead log from a running
+        # instance's, and on Linux it would delete the live one - that ordering
+        # is why the lock exists at all.
+        #
+        # But it used to be taken after Telegram, the scheduler, the monitoring
+        # tasks and the API bind. A second instance therefore announced "Collector
+        # Started" to the operator's phone, started a scheduler and reached for
+        # port 8110, and only then discovered it was not allowed to run. Under a
+        # service manager that restarts on exit, that is one phone alert per
+        # restart cycle for as long as the conflict lasts.
+        self._instance_lock = InstanceLock(Path(self._config.paths.raw_data_dir))
+        self._instance_lock.acquire()
 
         # Initialize Telegram alerts
         if self._config.telegram.enabled:
@@ -926,12 +947,6 @@ class FiniexDataCollector:
 
         # Create writers for each symbol
         raw_dir = Path(self._config.paths.raw_data_dir)
-
-        # Claim the directory before touching anything in it. Recovery below
-        # cannot distinguish a crashed run's write-ahead log from a running
-        # instance's, and on Linux it would delete the live one.
-        self._instance_lock = InstanceLock(raw_dir)
-        self._instance_lock.acquire()
 
         # Before recovery, because a recovered file carries the identity too.
         origin = self._establish_identity()
@@ -1592,7 +1607,7 @@ def main():
     parser.add_argument(
         "--endpoint",
         type=str,
-        default="live",
+        default="watch",
         help="watch: which entry of user_configs/remote_endpoints.json to read"
     )
 
@@ -1642,7 +1657,12 @@ def main():
     except ConfigurationError as e:
         logger = get_logger("FiniexDataCollector")
         logger.error(f"Configuration error: {describe_exception(e)}")
-        sys.exit(1)
+        # Deliberately not 1. A service manager restarts on exit by default, and
+        # restarting cannot fix a bad configuration or a directory another live
+        # instance already owns - it only produces the same failure at whatever
+        # interval the manager throttles to. Map this code to "stay stopped" and
+        # leave everything else on restart, where a restart is exactly the answer.
+        sys.exit(EXIT_CONFIGURATION)
     except Exception as e:
         logger = get_logger("FiniexDataCollector")
         logger.error(f"Fatal error: {describe_exception(e)}")
