@@ -151,6 +151,13 @@ with its tick count and duration, and the file a failure left owed. A failed exp
 data — its write-ahead log stays on disk and the next start recovers it — but it is a file the
 archive does not have yet, and `last_failed_file` is what names it.
 
+**`scans` says what the background work costs**, now that it no longer shows up as stamping
+lag: the folder walk and the disk reading run in a worker thread, and these are their last and
+worst durations. They were on the event loop until 2026-09-21, where they stalled it by up to
+4.3 s about once a minute — measured in the tick data itself, as arrival lag that was ours
+rather than the venue's. If `loop_lag` ever rises together with these, they are back on the
+loop.
+
 **`counter_check` is the guard on the tick counts this route serves.** The writer counts what
 goes into the file; the tick handler keeps a second count for the display, for `symbols[…]
 .current_file_ticks` here, and for the weekly report. Two counters for one number drift: these

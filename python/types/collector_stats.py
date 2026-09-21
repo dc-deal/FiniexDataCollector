@@ -206,6 +206,28 @@ class LoopLag:
 
 
 @dataclass
+class ScanTimings:
+    """
+    How long the background scans take, and therefore what they would cost.
+
+    They run off the event loop, so these numbers no longer show up as stamping
+    lag — which is exactly why they are worth reporting: measured 2026-09-21,
+    while they still ran on the loop, they stalled it up to 4.3 s about once a
+    minute. If `loop_lag` ever rises with these, they are back on the loop.
+
+    Attributes:
+        folder_scan_last_ms: The most recent walk over the archive, MT5 and logs
+        folder_scan_max_ms: The worst one since this process started
+        disk_check_last_ms: The most recent disk-space reading
+        disk_check_max_ms: The worst one
+    """
+    folder_scan_last_ms: float = 0.0
+    folder_scan_max_ms: float = 0.0
+    disk_check_last_ms: float = 0.0
+    disk_check_max_ms: float = 0.0
+
+
+@dataclass
 class CounterCheck:
     """
     Whether the displayed tick count still matches what the writer wrote.
@@ -300,6 +322,7 @@ class CollectorStats:
         self.loop_lag: LoopLag = LoopLag()
         self.exports: ExportStats = ExportStats()
         self.counter_check: CounterCheck = CounterCheck()
+        self.scans: ScanTimings = ScanTimings()
 
         # Config
         self.max_recent_logs: int = 50
@@ -463,6 +486,28 @@ class CollectorStats:
         if lateness_ms > self.loop_lag.max_ms:
             self.loop_lag.max_ms = round(lateness_ms, 1)
             self.loop_lag.max_at = datetime.now(timezone.utc)
+
+    def record_folder_scan(self, duration_ms: float) -> None:
+        """
+        Record how long the folder scan took.
+
+        Args:
+            duration_ms: Milliseconds spent counting and measuring folders
+        """
+        self.scans.folder_scan_last_ms = round(duration_ms, 1)
+        self.scans.folder_scan_max_ms = max(
+            self.scans.folder_scan_max_ms, round(duration_ms, 1))
+
+    def record_disk_check(self, duration_ms: float) -> None:
+        """
+        Record how long reading the disk usage took.
+
+        Args:
+            duration_ms: Milliseconds spent on the reading
+        """
+        self.scans.disk_check_last_ms = round(duration_ms, 1)
+        self.scans.disk_check_max_ms = max(
+            self.scans.disk_check_max_ms, round(duration_ms, 1))
 
     def record_counter_check(self, symbol: str, counted: int,
                              written: int) -> None:

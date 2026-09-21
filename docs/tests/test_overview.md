@@ -205,6 +205,11 @@ Defends: the worst stall is kept with the moment it happened; a wake-up that cam
 no lag rather than as negative; an export in flight is what was handed over and not yet reported;
 a failure names the file that is still owed; and the gauge cannot go below zero.
 
+Also, and this is the half that needed a thread to test: the folder scan and the disk reading run
+**off the event loop**. Both tests check which thread the work actually ran in, because the defect
+they guard against is invisible in behaviour — the numbers come out the same either way, and the
+only trace is arrival lag in the tick data.
+
 ### `tests/utils/test_error_counters.py`
 
 The error and warning counters were initialised and never raised — nothing called
@@ -274,8 +279,11 @@ origin: the consuming project asked which tick files spanned a host migration, w
 and the answer could not be given because nobody holding the question had access to the
 archive.
 
-Defends: no credential leaves through the config route, including a key that did not exist when
-the redaction was written; only finished files can be fetched, never an open write-ahead log;
+Defends: **no route runs on the event loop** — a route defined with `def` is served from a
+threadpool, `async def` is not, and one keyword would put a 22 MB file transfer, an archive walk
+or a day of log onto the loop that stamps every tick; no credential leaves through the config
+route, including a key that did not exist when the redaction was written; only finished files can
+be fetched, never an open write-ahead log;
 a path escaping the archive is refused even when its name passes the pattern; the served bytes
 match the register's checksum; no route is authenticated but ungated; and compression changes
 the size without changing what arrives.

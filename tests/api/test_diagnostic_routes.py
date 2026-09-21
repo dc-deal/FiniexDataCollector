@@ -11,6 +11,7 @@ not be given because nobody with the question had access to the archive.
 Location: tests/api/test_diagnostic_routes.py
 """
 
+import inspect
 import json
 import re
 import warnings
@@ -362,6 +363,29 @@ def test_no_route_is_authenticated_but_ungated(client: TestClient) -> None:
         "a gated route appeared or disappeared; listing them here is what keeps "
         "a router that drops out of the app from leaving the walk green while "
         "the surface it protected goes unreachable")
+
+
+def test_no_route_does_its_work_on_the_event_loop(client: TestClient) -> None:
+    """
+    A route defined with `def` runs in a threadpool; `async def` runs on the loop.
+
+    That distinction is the whole reason the file transfer does not cost the
+    collection: handing out a 22 MB archive file, walking the archive to build
+    the register, or reading a day of log are all blocking work, and the loop
+    they would block is the one that stamps every tick's arrival time. The
+    consuming project fetches files in a loop, so this is not a rare event.
+
+    Nothing in FastAPI warns about the change. One keyword moves the work onto
+    the loop, and it would show as arrival lag in the data rather than as an
+    error anywhere.
+    """
+    on_the_loop = [
+        route.path for route in client.app.routes
+        if getattr(route, "path", "").startswith("/v1")
+        and inspect.iscoroutinefunction(getattr(route, "endpoint", None))]
+
+    assert not on_the_loop, (
+        f"these routes would block the collector's event loop: {on_the_loop}")
 
 
 def test_the_open_routes_stay_open(client: TestClient) -> None:

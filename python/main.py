@@ -18,7 +18,7 @@ import os
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import psutil
 
@@ -604,14 +604,12 @@ class FiniexDataCollector:
 
         while self._is_running:
             try:
-                # Get disk usage for raw data directory
-                data_path = Path(self._config.paths.raw_data_dir).resolve()
-
-                self._logger.debug(
-                    f"[DISK_MONITOR] Checking path: {data_path}"
-                )
-
-                usage = psutil.disk_usage(str(data_path))
+                # In a thread for the same reason as the folder scan: on the
+                # production box a filesystem call is not free, and anything
+                # slow here lands in the next tick's stamp.
+                usage, duration_ms = await asyncio.to_thread(
+                    self._read_disk_usage)
+                self._stats.record_disk_check(duration_ms)
 
                 self._stats.update_disk_space(
                     total=usage.total,
@@ -648,6 +646,22 @@ class FiniexDataCollector:
 
             await asyncio.sleep(interval)
 
+    def _read_disk_usage(self) -> Tuple[Any, float]:
+        """
+        Read the disk usage of the data directory, in a worker thread.
+
+        Returns:
+            The psutil usage record and how long the reading took, in ms
+        """
+        started = time.monotonic()
+        data_path = Path(self._config.paths.raw_data_dir).resolve()
+
+        self._logger.debug(f"[DISK_MONITOR] Checking path: {data_path}")
+
+        usage = psutil.disk_usage(str(data_path))
+
+        return usage, (time.monotonic() - started) * 1000
+
     def _reconcile_tick_counters(self) -> None:
         """
         Hold the displayed tick count against the one the writer wrote.
@@ -680,7 +694,17 @@ class FiniexDataCollector:
                 symbol_stats.current_file_ticks = written
 
     async def _monitor_folders(self) -> None:
-        """Monitor folder file counts."""
+        """
+        Count the files on disk, off the event loop.
+
+        Counting files and measuring folders is file I/O, and on the production
+        box file I/O is expensive: measured 2026-09-21, this scan and the disk
+        check stalled the loop by up to 4.3 s about once a minute, which landed
+        in every tick's `collected_msc` as arrival lag that was ours rather than
+        the venue's. A thread is the right answer here, unlike for the JSON
+        encoder that used to write the archive files: these are syscalls, and a
+        syscall releases the GIL.
+        """
         interval = self._config.monitoring.folder_scan_interval_seconds
 
         self._logger.debug(
@@ -689,118 +713,12 @@ class FiniexDataCollector:
 
         while self._is_running:
             try:
-                scan_start = datetime.now(timezone.utc)
-
+                # Stays here: it compares two counters this loop owns, and
+                # touches no file.
                 self._reconcile_tick_counters()
 
-                # Kraken data folder
-                kraken_path = Path(self._config.paths.raw_data_dir) / "kraken"
-
-                self._logger.debug(
-                    f"[FOLDER_SCAN] Scanning Kraken: path={kraken_path}, "
-                    f"exists={kraken_path.exists()}"
-                )
-
-                if kraken_path.exists():
-                    # Check if files are in sub-folders (per symbol) or directly in kraken folder
-                    has_subfolders = any(
-                        item.is_dir()
-                        for item in kraken_path.iterdir()
-                    )
-
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Kraken structure: has_subfolders={has_subfolders}"
-                    )
-
-                    if has_subfolders:
-                        # Files organized in symbol sub-folders
-                        kraken_count = sum(
-                            count_files_in_folder(symbol_folder, "*_ticks.json")
-                            for symbol_folder in kraken_path.iterdir()
-                            if symbol_folder.is_dir()
-                        )
-
-                        # Update per-symbol folder counts
-                        symbol_scans = []
-                        for symbol_folder in kraken_path.iterdir():
-                            if symbol_folder.is_dir():
-                                symbol = symbol_folder.name
-                                if symbol in self._stats.symbols:
-                                    count = count_files_in_folder(
-                                        symbol_folder, "*_ticks.json")
-                                    self._stats.symbols[symbol].folder_file_count = count
-                                    symbol_scans.append(f"{symbol}={count}")
-
-                        self._logger.debug(
-                            f"[FOLDER_SCAN] Per-symbol counts: {', '.join(symbol_scans) if symbol_scans else 'none'}"
-                        )
-                    else:
-                        # Files directly in kraken folder (no sub-folders)
-                        kraken_count = count_files_in_folder(
-                            kraken_path, "*_ticks.json")
-
-                        self._logger.debug(
-                            f"[FOLDER_SCAN] Flat structure: {kraken_count} files directly in kraken folder"
-                        )
-
-                        # Cannot determine per-symbol counts in flat structure
-                        # Set folder_file_count to 0 for all symbols
-                        for symbol in self._stats.symbols:
-                            self._stats.symbols[symbol].folder_file_count = 0
-
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Kraken total: {kraken_count} files"
-                    )
-
-                    self._stats.update_folder_stats(
-                        "kraken", str(kraken_path), kraken_count)
-                else:
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Kraken path does not exist: {kraken_path}"
-                    )
-                    self._stats.update_folder_stats(
-                        "kraken", str(kraken_path), 0)
-
-                # MT5 folder
-                if self._config.mt5.enabled and self._config.mt5.raw_data_path:
-                    mt5_path = Path(self._config.mt5.raw_data_path)
-
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Scanning MT5: path={mt5_path}, "
-                        f"exists={mt5_path.exists()}"
-                    )
-
-                    if mt5_path.exists():
-                        mt5_count = count_files_in_folder(
-                            mt5_path, "*_ticks.json")
-                        self._logger.debug(
-                            f"[FOLDER_SCAN] MT5 total: {mt5_count} files"
-                        )
-                        self._stats.update_folder_stats(
-                            "mt5", str(mt5_path), mt5_count)
-
-                # Logs folder
-                logs_path = Path(self._config.paths.logs_dir)
-
-                self._logger.debug(
-                    f"[FOLDER_SCAN] Scanning Logs: path={logs_path}, "
-                    f"exists={logs_path.exists()}"
-                )
-
-                if logs_path.exists():
-                    logs_count = count_files_in_folder(logs_path, "*.log")
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Logs total: {logs_count} files"
-                    )
-                    self._stats.update_folder_stats(
-                        "logs", str(logs_path), logs_count)
-
-                scan_duration = (datetime.now(timezone.utc) -
-                                 scan_start).total_seconds()
-                self._logger.debug(
-                    f"[FOLDER_SCAN] Completed in {scan_duration:.2f}s"
-                )
-
+                self._stats.record_folder_scan(
+                    await asyncio.to_thread(self._scan_folders))
             except Exception as e:
                 self._logger.error(
                     f"Folder scan failed: {describe_exception(e)}")
@@ -808,6 +726,126 @@ class FiniexDataCollector:
                     f"[FOLDER_SCAN] Exception details:", exc_info=True)
 
             await asyncio.sleep(interval)
+
+    def _scan_folders(self) -> float:
+        """
+        Walk the archive, the MT5 directory and the logs, and count what is there.
+
+        Runs in a worker thread; it only reads the filesystem and writes counts
+        into the stats object.
+
+        Returns:
+            How long the walk took, in milliseconds
+        """
+        scan_start = time.monotonic()
+
+        # Kraken data folder
+        kraken_path = Path(self._config.paths.raw_data_dir) / "kraken"
+
+        self._logger.debug(
+            f"[FOLDER_SCAN] Scanning Kraken: path={kraken_path}, "
+            f"exists={kraken_path.exists()}"
+        )
+
+        if kraken_path.exists():
+            # Check if files are in sub-folders (per symbol) or directly in kraken folder
+            has_subfolders = any(
+                item.is_dir()
+                for item in kraken_path.iterdir()
+            )
+
+            self._logger.debug(
+                f"[FOLDER_SCAN] Kraken structure: has_subfolders={has_subfolders}"
+            )
+
+            if has_subfolders:
+                # Files organized in symbol sub-folders
+                kraken_count = sum(
+                    count_files_in_folder(symbol_folder, "*_ticks.json")
+                    for symbol_folder in kraken_path.iterdir()
+                    if symbol_folder.is_dir()
+                )
+
+                # Update per-symbol folder counts
+                symbol_scans = []
+                for symbol_folder in kraken_path.iterdir():
+                    if symbol_folder.is_dir():
+                        symbol = symbol_folder.name
+                        if symbol in self._stats.symbols:
+                            count = count_files_in_folder(
+                                symbol_folder, "*_ticks.json")
+                            self._stats.symbols[symbol].folder_file_count = count
+                            symbol_scans.append(f"{symbol}={count}")
+
+                self._logger.debug(
+                    f"[FOLDER_SCAN] Per-symbol counts: {', '.join(symbol_scans) if symbol_scans else 'none'}"
+                )
+            else:
+                # Files directly in kraken folder (no sub-folders)
+                kraken_count = count_files_in_folder(
+                    kraken_path, "*_ticks.json")
+
+                self._logger.debug(
+                    f"[FOLDER_SCAN] Flat structure: {kraken_count} files directly in kraken folder"
+                )
+
+                # Cannot determine per-symbol counts in flat structure
+                # Set folder_file_count to 0 for all symbols
+                for symbol in self._stats.symbols:
+                    self._stats.symbols[symbol].folder_file_count = 0
+
+            self._logger.debug(
+                f"[FOLDER_SCAN] Kraken total: {kraken_count} files"
+            )
+
+            self._stats.update_folder_stats(
+                "kraken", str(kraken_path), kraken_count)
+        else:
+            self._logger.debug(
+                f"[FOLDER_SCAN] Kraken path does not exist: {kraken_path}"
+            )
+            self._stats.update_folder_stats(
+                "kraken", str(kraken_path), 0)
+
+        # MT5 folder
+        if self._config.mt5.enabled and self._config.mt5.raw_data_path:
+            mt5_path = Path(self._config.mt5.raw_data_path)
+
+            self._logger.debug(
+                f"[FOLDER_SCAN] Scanning MT5: path={mt5_path}, "
+                f"exists={mt5_path.exists()}"
+            )
+
+            if mt5_path.exists():
+                mt5_count = count_files_in_folder(
+                    mt5_path, "*_ticks.json")
+                self._logger.debug(
+                    f"[FOLDER_SCAN] MT5 total: {mt5_count} files"
+                )
+                self._stats.update_folder_stats(
+                    "mt5", str(mt5_path), mt5_count)
+
+        # Logs folder
+        logs_path = Path(self._config.paths.logs_dir)
+
+        self._logger.debug(
+            f"[FOLDER_SCAN] Scanning Logs: path={logs_path}, "
+            f"exists={logs_path.exists()}"
+        )
+
+        if logs_path.exists():
+            logs_count = count_files_in_folder(logs_path, "*.log")
+            self._logger.debug(
+                f"[FOLDER_SCAN] Logs total: {logs_count} files"
+            )
+            self._stats.update_folder_stats(
+                "logs", str(logs_path), logs_count)
+
+        duration_ms = (time.monotonic() - scan_start) * 1000
+        self._logger.debug(f"[FOLDER_SCAN] Completed in {duration_ms:.0f} ms")
+
+        return duration_ms
+
 
     async def _start_kraken_collector(self) -> None:
         """Initialize and start Kraken WebSocket collector."""

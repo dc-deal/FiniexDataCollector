@@ -15,7 +15,101 @@ written would otherwise only show up as an absence in the archive.
 Location: tests/utils/test_diagnostics.py
 """
 
+import asyncio
+import threading
+
+from python.main import FiniexDataCollector
 from python.types.collector_stats import CollectorStats
+from python.utils.config_loader import ConfigLoader
+from python.utils.logging_setup import remove_log_listener
+
+
+class FakeUsage:
+    """What psutil.disk_usage returns, as much of it as the monitor reads."""
+    total = 100 * 1024 ** 3
+    used = 40 * 1024 ** 3
+    free = 60 * 1024 ** 3
+
+
+def run_one_round(collector, monitor) -> int:
+    """
+    Run one round of a monitoring task and stop it.
+
+    Args:
+        collector: The collector owning the task
+        monitor: The bound coroutine function to run
+
+    Returns:
+        The identity of the thread the event loop ran on
+    """
+    collector._is_running = True
+
+    async def round_trip() -> int:
+        loop_thread = threading.get_ident()
+        task = asyncio.create_task(monitor())
+        await asyncio.sleep(0.3)
+        collector._is_running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return loop_thread
+
+    return asyncio.run(round_trip())
+
+
+def build_collector():
+    """A collector with its own stats and no task running."""
+    return FiniexDataCollector(ConfigLoader().load(), show_display=False)
+
+
+def test_the_folder_scan_runs_off_the_event_loop() -> None:
+    """
+    Counting files is file I/O, and on the production box file I/O is expensive.
+
+    Measured 2026-09-21, while this still ran on the loop: stalls of up to 4.3 s
+    about once a minute, which land in every tick's `collected_msc` as arrival
+    lag that was ours rather than the venue's. The consuming project reads that
+    field as latency.
+    """
+    collector = build_collector()
+    ran_in = []
+
+    def scan() -> float:
+        ran_in.append(threading.get_ident())
+        return 12.5
+
+    try:
+        collector._scan_folders = scan
+        loop_thread = run_one_round(collector, collector._monitor_folders)
+
+        assert ran_in, "the scan did not run at all"
+        assert ran_in[0] != loop_thread, "the scan ran on the event loop"
+        assert collector._stats.scans.folder_scan_last_ms == 12.5
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+
+def test_the_disk_check_runs_off_the_event_loop() -> None:
+    """The same for the disk reading, which is a filesystem call too."""
+    collector = build_collector()
+    ran_in = []
+
+    def read():
+        ran_in.append(threading.get_ident())
+        return FakeUsage(), 3.0
+
+    try:
+        collector._read_disk_usage = read
+        loop_thread = run_one_round(collector, collector._monitor_disk_space)
+
+        assert ran_in, "the disk check did not run at all"
+        assert ran_in[0] != loop_thread, "the disk check ran on the event loop"
+        assert collector._stats.scans.disk_check_last_ms == 3.0
+        assert collector._stats.disk_space.free_bytes == FakeUsage.free
+    finally:
+        remove_log_listener(collector._stats.record_logged)
 
 
 def test_the_worst_stall_is_kept_with_the_moment_it_happened() -> None:
