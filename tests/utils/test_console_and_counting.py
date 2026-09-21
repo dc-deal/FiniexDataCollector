@@ -28,7 +28,8 @@ from python.utils.console_mode import (
     ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     STD_OUTPUT_HANDLE,
     disable_quick_edit,
-    enable_ansi_colours
+    enable_ansi_colours,
+    enable_ctrl_c_handling
 )
 
 
@@ -141,6 +142,7 @@ def test_a_console_that_refuses_is_not_a_reason_to_stop(
 
     assert disable_quick_edit() is False, "a console failure must not escape"
     assert enable_ansi_colours() is False, "nor from the colour call"
+    assert enable_ctrl_c_handling() is False, "nor from the Ctrl+C call"
 
 
 def test_the_colour_flag_is_the_one_windows_defines() -> None:
@@ -164,3 +166,78 @@ def test_the_colour_call_is_harmless_where_there_is_no_console() -> None:
     assert result in (True, False, None)
     if sys.platform != "win32":
         assert result is None
+
+
+def test_ctrl_c_handling_is_turned_on_rather_than_off(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The second argument is the whole call, and both values are valid API calls.
+
+    `SetConsoleCtrlHandler(NULL, TRUE)` INSTALLS the "ignore Ctrl+C" entry;
+    `FALSE` removes it. One character apart, opposite meanings, and the wrong one
+    would make the collector permanently unstoppable by the mechanism NSSM uses
+    to stop it - silently, because the call still succeeds.
+
+    Measured 2026-09-21: launched from a shell that had Ctrl+C off, the collector
+    ignored a console Ctrl+C for a full minute and never wrote its archive. The
+    same build with this call shut down in 0.15 s. The setting is inherited,
+    which is why the collector sets it for itself rather than trusting a parent.
+
+    Args:
+        monkeypatch: pytest patching helper
+    """
+    import ctypes
+
+    calls = []
+
+    class RecordingKernel32:
+        """Just enough kernel32 to see what was asked for."""
+
+        def SetConsoleCtrlHandler(self, handler, add):
+            calls.append((handler, add))
+            return 1
+
+    class Windll:
+        kernel32 = RecordingKernel32()
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", Windll(), raising=False)
+
+    assert enable_ctrl_c_handling() is True
+    assert calls == [(None, False)], (
+        "a NULL handler with Add=True installs the opposite of what is wanted")
+
+
+def test_the_collector_re_enables_ctrl_c_before_registering_its_handler(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A call nobody makes protects nothing.
+
+    The guard lives at a call site inside `_setup_signal_handlers`, so the test
+    runs that method rather than the helper - the failure being defended against
+    is precisely that the call site disappears in a later edit while the helper
+    stays perfectly correct and perfectly unused.
+
+    Args:
+        monkeypatch: pytest patching helper
+    """
+    import python.main as main_module
+    from python.utils.config_loader import ConfigLoader
+    from python.utils.logging_setup import remove_log_listener
+
+    enabled = []
+    monkeypatch.setattr(main_module, "enable_ctrl_c_handling",
+                        lambda: enabled.append(True) or True)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(main_module.signal, "signal", lambda *a: None)
+
+    collector = main_module.FiniexDataCollector(ConfigLoader().load(),
+                                                show_display=False)
+    try:
+        collector._setup_signal_handlers()
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+    assert enabled, "nothing re-enables Ctrl+C before the handler is registered"

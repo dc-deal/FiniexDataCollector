@@ -141,3 +141,43 @@ def enable_ansi_colours() -> Optional[bool]:
         return bool(check.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING)
     except Exception:
         return False
+
+
+def enable_ctrl_c_handling() -> Optional[bool]:
+    """
+    Make sure this process can still be asked to stop.
+
+    A console process can have Ctrl+C processing switched OFF entirely, and that
+    setting is INHERITED by everything it launches. A parent that turned it off
+    leaves the child unable to receive the one signal a graceful shutdown depends
+    on - and the failure is completely silent: the event is accepted by the
+    console, the handler never runs, and the process simply keeps going.
+
+    Measured on 2026-09-21 while testing how NSSM stops the service. Launched from
+    a shell that had it off, the collector ignored a console Ctrl+C for a full
+    minute and never wrote its archive. The same build, with this call added,
+    shut down in under a second. Nothing about the collector had changed.
+
+    NSSM's `AppStopMethodConsole` sends exactly that event, and a service started
+    by the Service Control Manager should inherit nothing - but "should" is what
+    this call removes from the sentence, for one line and no cost.
+
+    Never raises: a console that will not take the change is a reason to log, not
+    a reason to refuse to collect.
+
+    Returns:
+        True when Ctrl+C processing is on, False when the call was refused, and
+        None when there is nothing to do - not Windows
+    """
+    if sys.platform != "win32":
+        return None
+
+    try:
+        import ctypes
+
+        # A NULL handler with Add=False removes the "ignore Ctrl+C" entry that
+        # was inherited. With Add=True it would install it, which is the exact
+        # opposite and the mistake this comment exists to prevent.
+        return bool(ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False))
+    except Exception:
+        return False

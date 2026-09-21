@@ -37,7 +37,8 @@ from python.utils.instance_lock import InstanceLock
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import (add_log_listener, describe_exception,
                                         get_logger, setup_logging)
-from python.utils.console_mode import disable_quick_edit, enable_ansi_colours
+from python.utils.console_mode import (disable_quick_edit, enable_ansi_colours,
+                                       enable_ctrl_c_handling)
 from python.viewer.endpoints import EndpointError, default_interval, load_endpoint
 from python.viewer.watch import run_viewer
 from python.utils.gc_watcher import GcWatcher
@@ -1333,6 +1334,18 @@ class FiniexDataCollector:
     def _setup_signal_handlers(self) -> None:
         """Setup graceful shutdown handlers (cross-platform)."""
         if sys.platform == "win32":
+            # Before registering anything: a parent process can leave Ctrl+C
+            # processing switched off, and the setting is inherited. Measured
+            # 2026-09-21 - the handler below never ran, the console accepted the
+            # event, and the collector kept collecting for a full minute with its
+            # archive unwritten. Under NSSM that is the difference between a stop
+            # and a kill.
+            if enable_ctrl_c_handling() is False:
+                self._logger.warning(
+                    "Could not re-enable Ctrl+C handling on this console. A stop "
+                    "signal may not reach the shutdown handler; the write-ahead "
+                    "logs still protect the data, and the next start recovers.")
+
             # Windows: use signal.signal (SIGTERM not available)
             def win_handler(signum, frame):
                 asyncio.create_task(self._signal_handler())

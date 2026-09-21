@@ -52,9 +52,23 @@ A remaining `.jsonl.part` means that symbol's file was never finalized. Nothing 
 next start rebuilds it — but it tells you the stop was not clean.
 
 On Linux both SIGINT and SIGTERM are handled through the event loop. On Windows the handler is
-installed with `signal.signal`, which only runs while the main thread executes bytecode; an
-interactive Ctrl+C is the reliable path there, and a signal delivered to a service is not
-something this project has verified.
+installed with `signal.signal`, which only runs while the main thread executes bytecode.
+
+**A stop from a service manager was verified on 2026-09-21**, and it found something first.
+NSSM's `AppStopMethodConsole` detaches from its own console, attaches to the service's, and
+raises a console Ctrl+C there. Reproducing exactly that sequence: the collector **ignored it for
+a full minute** and its archive was never written. The cause was not the handler — it was that
+**Ctrl+C processing can be switched off in a process and is INHERITED by everything it
+launches**, and the shell running the test had it off. The event is accepted by the console, the
+handler never runs, and nothing is logged. The collector now calls
+`SetConsoleCtrlHandler(NULL, FALSE)` for itself before registering the handler, so it no longer
+depends on what launched it. With that one call, the same test stopped it in **0.15 s**, wrote
+the archive, removed the write-ahead log, and the file passed every import invariant.
+
+**A kill is still not a loss.** Had the stop failed, the write-ahead log would have held every
+tick and the next start would have rebuilt the file — which is what the 2026-09-20 host reset
+demonstrated on the real archive. The difference a graceful stop makes is a finished archive
+file instead of a recovery.
 
 ## Reading the live display
 
