@@ -206,6 +206,58 @@ class LoopLag:
 
 
 @dataclass
+class GcPauses:
+    """
+    What garbage collection costs this process.
+
+    The collector holds every tick of an open file in memory, and a generation-2
+    collection walks all of them - on the event loop, between two ticks, with
+    nothing in Python reporting it.
+
+    Attributes:
+        collections: How many collections per generation, index 0 to 2
+        max_ms: The longest pause per generation
+        last_ms: The most recent pause
+        last_generation: Which generation that was
+        total_ms: Everything spent collecting since this process started
+    """
+    collections: List[int] = field(default_factory=lambda: [0, 0, 0])
+    max_ms: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    last_ms: float = 0.0
+    last_generation: int = -1
+    total_ms: float = 0.0
+
+
+@dataclass
+class StallEvent:
+    """
+    One moment the event loop stood still, with what was going on.
+
+    A stall costs stamping accuracy: `collected_msc` reads that much later than
+    the tick arrived, and beyond the consumer's 30 s window a whole file is
+    refused. The cause is recorded beside it because the first attribution made
+    from reasoning alone was wrong - the folder scan was blamed and then
+    measured at 15 ms.
+
+    Attributes:
+        at: When the stall was observed
+        ms: How late the loop was
+        gc_ms: How much of it was garbage collection
+        gc_generation: The highest generation collected in that window, -1 for none
+        render_ms: How long the live display's last redraw took
+        exports_in_flight: Archive writers running at that moment
+        cause: What the numbers above account for, or "unknown"
+    """
+    at: datetime
+    ms: float
+    gc_ms: float
+    gc_generation: int
+    render_ms: float
+    exports_in_flight: int
+    cause: str
+
+
+@dataclass
 class ScanTimings:
     """
     How long the background scans take, and therefore what they would cost.
@@ -220,11 +272,16 @@ class ScanTimings:
         folder_scan_max_ms: The worst one since this process started
         disk_check_last_ms: The most recent disk-space reading
         disk_check_max_ms: The worst one
+        render_last_ms: The live display's most recent redraw, which unlike the
+            two above does run on the event loop
+        render_max_ms: The worst redraw
     """
     folder_scan_last_ms: float = 0.0
     folder_scan_max_ms: float = 0.0
     disk_check_last_ms: float = 0.0
     disk_check_max_ms: float = 0.0
+    render_last_ms: float = 0.0
+    render_max_ms: float = 0.0
 
 
 @dataclass
@@ -323,8 +380,11 @@ class CollectorStats:
         self.exports: ExportStats = ExportStats()
         self.counter_check: CounterCheck = CounterCheck()
         self.scans: ScanTimings = ScanTimings()
+        self.gc: GcPauses = GcPauses()
+        self.stalls: List[StallEvent] = []
 
         # Config
+        self.max_stalls: int = 10
         self.max_recent_logs: int = 50
         self.max_reconnect_history: int = 100
 
@@ -486,6 +546,74 @@ class CollectorStats:
         if lateness_ms > self.loop_lag.max_ms:
             self.loop_lag.max_ms = round(lateness_ms, 1)
             self.loop_lag.max_at = datetime.now(timezone.utc)
+
+    def record_gc_pause(self, generation: int, duration_ms: float) -> None:
+        """
+        Record one garbage collection, as the interpreter reported it.
+
+        Args:
+            generation: Which generation was collected, 0 to 2
+            duration_ms: How long the pause lasted
+        """
+        self.gc.last_ms = round(duration_ms, 1)
+        self.gc.last_generation = generation
+        self.gc.total_ms = round(self.gc.total_ms + duration_ms, 1)
+
+        if 0 <= generation < len(self.gc.collections):
+            self.gc.collections[generation] += 1
+            self.gc.max_ms[generation] = max(
+                self.gc.max_ms[generation], round(duration_ms, 1))
+
+    def record_render(self, duration_ms: float) -> None:
+        """
+        Record how long the live display took to draw one frame.
+
+        Args:
+            duration_ms: Milliseconds spent rendering, on the event loop
+        """
+        self.scans.render_last_ms = round(duration_ms, 1)
+        self.scans.render_max_ms = max(
+            self.scans.render_max_ms, round(duration_ms, 1))
+
+    def record_stall(self, duration_ms: float, gc_ms: float,
+                     gc_generation: int, render_ms: float,
+                     exports_in_flight: int) -> None:
+        """
+        Record a moment the event loop stood still, with what explains it.
+
+        The cause is derived from what was measured in the same window, and says
+        "unknown" when nothing accounts for at least half of it. An attribution
+        made from reasoning rather than measurement was wrong once already.
+
+        Args:
+            duration_ms: How late the loop was
+            gc_ms: Garbage collection time inside that window
+            gc_generation: Highest generation collected, -1 for none
+            render_ms: The display's most recent redraw
+            exports_in_flight: Archive writers running at that moment
+        """
+        half = duration_ms / 2
+
+        if gc_ms >= half:
+            cause = f"garbage collection, generation {gc_generation}"
+        elif render_ms >= half:
+            cause = "the live display"
+        elif exports_in_flight:
+            cause = "an archive export was handed over"
+        else:
+            cause = "unknown"
+
+        self.stalls.append(StallEvent(
+            at=datetime.now(timezone.utc),
+            ms=round(duration_ms, 1),
+            gc_ms=round(gc_ms, 1),
+            gc_generation=gc_generation,
+            render_ms=round(render_ms, 1),
+            exports_in_flight=exports_in_flight,
+            cause=cause))
+
+        if len(self.stalls) > self.max_stalls:
+            self.stalls = self.stalls[-self.max_stalls:]
 
     def record_folder_scan(self, duration_ms: float) -> None:
         """

@@ -205,6 +205,13 @@ Defends: the worst stall is kept with the moment it happened; a wake-up that cam
 no lag rather than as negative; an export in flight is what was handed over and not yet reported;
 a failure names the file that is still owed; and the gauge cannot go below zero.
 
+And the attribution chain, which exists because the first attribution was wrong: a collection is
+timed by the interpreter's own callback; only the collections inside a stall's window count
+towards it; a stall names the one thing that accounts for at least half of it and says `unknown`
+otherwise; the list stays short; and a **real** stall reaches the record — that test blocks the
+event loop on purpose, because driving the recorder by hand would leave untested the only thing
+that matters, namely that the monitor notices at all.
+
 Also, and this is the half that needed a thread to test: the folder scan and the disk reading run
 **off the event loop**. Both tests check which thread the work actually ran in, because the defect
 they guard against is invisible in behaviour — the numbers come out the same either way, and the

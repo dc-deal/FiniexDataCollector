@@ -493,6 +493,22 @@ base URL and the operator's token for the collector running on the production se
 but no values. Nothing reads it at runtime — the collector does not know it exists. It is
 there so a session can query production without the operator looking the URL up again.
 
+**Reaching FiniexTestingIDE's API from here.** It runs in that project's dev container and is
+published on the laptop's loopback. Verified 2026-09-21:
+
+| | |
+|---|---|
+| Base | `http://127.0.0.1:8000/api/v1` — **not** `/v1`, and no schema at `/openapi.json` |
+| Open | `GET /api/v1/health` → `{"status": "ok", "version": "1.4.0"}` |
+| Auth | enforced, consumers `ragengine` and `viewer`; **this project holds no token** |
+| Runs | only while the operator has it started; it is not a service |
+
+What it is good for: the IDE builds **bars out of our ticks**, so questions this collector cannot
+answer from its own archive — how a period looks once aggregated, what an import made of a file —
+have an address. Before using any of it, ask the operator for a token minted for `datacollector`
+and for the route list; borrowing another consumer's token would break the rule below in the
+other project's house.
+
 Three rules come with it. **One token per consumer**, so revoking the operator's does not
 take the consuming project's surface away with it. **Print the URL, never the token** — a
 command that needs it reads it from the file. And a 403 from a route means the grant is

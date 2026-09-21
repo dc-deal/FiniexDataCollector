@@ -15,6 +15,7 @@ Location: python/utils/live_display.py
 """
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Optional, List
 
@@ -100,8 +101,15 @@ class LiveDisplay:
 
             while self._running:
                 try:
-                    # Render
+                    # Render, and time it. This runs on the collector's only
+                    # event loop, so a slow console is a slow tick stamp - and
+                    # on Windows the legacy renderer is slow. Measured rather
+                    # than assumed, because a stall gets attributed from these
+                    # numbers.
+                    started = time.monotonic()
                     live.update(self._render())
+                    self._stats.record_render(
+                        (time.monotonic() - started) * 1000)
 
                     # Wait
                     await asyncio.sleep(self._update_interval)

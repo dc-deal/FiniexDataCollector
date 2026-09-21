@@ -38,6 +38,7 @@ from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import (add_log_listener, describe_exception,
                                         get_logger, setup_logging)
 from python.utils.console_mode import disable_quick_edit
+from python.utils.gc_watcher import GcWatcher
 from python.utils.live_display import LiveDisplay
 from python.types.collector_stats import CollectorStats
 from python.types.tick_types import OriginBlock
@@ -210,6 +211,11 @@ EXPORT_SHUTDOWN_WAIT_SECONDS = 60
 # Ten samples a second: fine enough to catch a stall, far too little to matter.
 LOOP_LAG_INTERVAL_SECONDS = 0.1
 
+# Above this, a stall is written down with what was going on around it. Low
+# enough to catch what a consumer would notice, high enough that ordinary
+# scheduling jitter does not fill the list.
+STALL_ATTRIBUTION_MS = 250
+
 
 def report_loop_exception(logger: Any) -> Callable[[Any, Dict[str, Any]], None]:
     """
@@ -275,6 +281,10 @@ class FiniexDataCollector:
         add_log_listener(self._stats.record_logged)
         self._live_display: Optional[LiveDisplay] = None
 
+        # Times every garbage collection, so a loop stall can name its cause
+        # instead of being reasoned about afterwards.
+        self._gc_watcher = GcWatcher(self._stats)
+
         # State
         self._is_running = False
         self._shutdown_event = asyncio.Event()
@@ -303,6 +313,7 @@ class FiniexDataCollector:
 
         # Setup signal handlers
         self._setup_signal_handlers()
+        self._gc_watcher.start()
         asyncio.get_running_loop().set_exception_handler(
             report_loop_exception(self._logger))
 
@@ -592,7 +603,21 @@ class FiniexDataCollector:
             asked_at = time.monotonic()
             await asyncio.sleep(LOOP_LAG_INTERVAL_SECONDS)
             lateness = time.monotonic() - asked_at - LOOP_LAG_INTERVAL_SECONDS
-            self._stats.record_loop_lag(lateness * 1000)
+            lateness_ms = lateness * 1000
+            self._stats.record_loop_lag(lateness_ms)
+
+            # A stall worth explaining is asked what else happened in its own
+            # window, rather than attributed afterwards from reasoning. The
+            # first such attribution was wrong: the folder scan was blamed and
+            # then measured at 15 ms.
+            if lateness_ms >= STALL_ATTRIBUTION_MS:
+                gc_ms, generation = self._gc_watcher.time_spent_since(asked_at)
+                self._stats.record_stall(
+                    duration_ms=lateness_ms,
+                    gc_ms=gc_ms,
+                    gc_generation=generation,
+                    render_ms=self._stats.scans.render_last_ms,
+                    exports_in_flight=self._stats.exports.in_flight)
 
     async def _monitor_disk_space(self) -> None:
         """Monitor disk space usage."""
@@ -1287,6 +1312,8 @@ class FiniexDataCollector:
     async def _shutdown(self) -> None:
         """Graceful shutdown of all components."""
         self._logger.info("Shutting down...")
+
+        self._gc_watcher.stop()
 
         # Stop live display first (so we can see logs)
         if self._live_display:

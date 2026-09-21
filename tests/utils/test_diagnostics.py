@@ -16,9 +16,12 @@ Location: tests/utils/test_diagnostics.py
 """
 
 import asyncio
+import gc
 import threading
+import time
 
 from python.main import FiniexDataCollector
+from python.utils.gc_watcher import GcWatcher
 from python.types.collector_stats import CollectorStats
 from python.utils.config_loader import ConfigLoader
 from python.utils.logging_setup import remove_log_listener
@@ -110,6 +113,117 @@ def test_the_disk_check_runs_off_the_event_loop() -> None:
         assert collector._stats.disk_space.free_bytes == FakeUsage.free
     finally:
         remove_log_listener(collector._stats.record_logged)
+
+
+def test_a_collection_is_timed_by_the_interpreter_itself() -> None:
+    """
+    The pause is measured where it happens, not inferred afterwards.
+
+    Nothing in Python reports what a collection cost, and the collector holds
+    every tick of an open file in memory - tens of thousands of objects that a
+    generation-2 walk touches, on the event loop, between two ticks.
+    """
+    stats = CollectorStats()
+    watcher = GcWatcher(stats)
+    watcher.start()
+    try:
+        gc.collect()
+    finally:
+        watcher.stop()
+
+    assert stats.gc.collections[2] >= 1, "a full collection went unrecorded"
+    assert stats.gc.last_generation == 2
+    assert stats.gc.total_ms >= 0.0
+
+
+def test_only_the_collections_inside_the_window_are_attributed() -> None:
+    """
+    A stall asks what happened in ITS window, not what happened at some point.
+
+    Counting an older pause would explain a stall with something that was over
+    before it began - which is the mistake the whole instrument exists to stop.
+    """
+    stats = CollectorStats()
+    watcher = GcWatcher(stats)
+    watcher.start()
+    try:
+        gc.collect()
+        boundary = time.monotonic()
+        gc.collect()
+    finally:
+        watcher.stop()
+
+    inside, generation = watcher.time_spent_since(boundary)
+    everything, _ = watcher.time_spent_since(0.0)
+
+    assert generation == 2
+    assert inside <= everything
+    assert watcher.time_spent_since(time.monotonic()) == (0.0, -1)
+
+
+def test_a_stall_names_what_accounts_for_it() -> None:
+    """Half of the stall or more, or it says "unknown" rather than guessing."""
+    stats = CollectorStats()
+
+    stats.record_stall(1000.0, gc_ms=900.0, gc_generation=2,
+                       render_ms=5.0, exports_in_flight=0)
+    stats.record_stall(1000.0, gc_ms=10.0, gc_generation=0,
+                       render_ms=800.0, exports_in_flight=0)
+    stats.record_stall(1000.0, gc_ms=1.0, gc_generation=-1,
+                       render_ms=2.0, exports_in_flight=1)
+    stats.record_stall(1000.0, gc_ms=0.0, gc_generation=-1,
+                       render_ms=0.0, exports_in_flight=0)
+
+    causes = [s.cause for s in stats.stalls]
+
+    assert causes[0] == "garbage collection, generation 2"
+    assert causes[1] == "the live display"
+    assert causes[2] == "an archive export was handed over"
+    assert causes[3] == "unknown", "an unexplained stall must say so"
+
+
+def test_the_stall_list_stays_short() -> None:
+    """A diagnostic that grows without bound becomes the next defect."""
+    stats = CollectorStats()
+    for _ in range(stats.max_stalls + 5):
+        stats.record_stall(300.0, 0.0, -1, 0.0, 0)
+
+    assert len(stats.stalls) == stats.max_stalls
+
+
+def test_a_real_stall_reaches_the_record() -> None:
+    """
+    The loop is blocked on purpose, because that is the failure being watched.
+
+    Driving `record_stall` by hand would leave the one thing untested that
+    matters: that the monitor notices at all, and asks the garbage collector
+    about its own window while doing so.
+    """
+    collector = build_collector()
+    collector._gc_watcher.start()
+
+    async def block_the_loop() -> None:
+        collector._is_running = True
+        task = asyncio.create_task(collector._monitor_loop_lag())
+        await asyncio.sleep(0.05)
+        time.sleep(0.4)                      # the stall, deliberately
+        await asyncio.sleep(0.3)
+        collector._is_running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(block_the_loop())
+    finally:
+        collector._gc_watcher.stop()
+        remove_log_listener(collector._stats.record_logged)
+
+    assert collector._stats.stalls, "a 400 ms stall was not written down"
+    assert collector._stats.stalls[-1].ms >= 250
+    assert collector._stats.loop_lag.max_ms >= 250
 
 
 def test_the_worst_stall_is_kept_with_the_moment_it_happened() -> None:

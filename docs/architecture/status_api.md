@@ -151,6 +151,15 @@ with its tick count and duration, and the file a failure left owed. A failed exp
 data — its write-ahead log stays on disk and the next start recovers it — but it is a file the
 archive does not have yet, and `last_failed_file` is what names it.
 
+**`stalls` names what stopped the loop, and `gc` is usually the answer to that.** A stall above
+250 ms is written down with what was measured in its own window: how much of it was garbage
+collection and of which generation, how long the display's last redraw took, and how many archive
+writers were starting. The cause is stated only when one of those accounts for at least half of
+it — otherwise the entry says `unknown`, because an attribution made from reasoning rather than
+measurement was wrong once already: the folder scan was blamed for 4.3 s stalls and then measured
+at 15 ms. `gc` carries the collections and worst pause per generation; the collector holds every
+tick of an open file in memory, which is what a generation-2 walk has to traverse.
+
 **`scans` says what the background work costs**, now that it no longer shows up as stamping
 lag: the folder walk and the disk reading run in a worker thread, and these are their last and
 worst durations. They were on the event loop until 2026-09-21, where they stalled it by up to
