@@ -189,6 +189,10 @@ every UTC day cut reported the closed file one tick too large and started the ne
 too small, and the error was carried until the next cut cancelled it. Measured on production —
 "File rotated: … (47,369 ticks)" for a file holding 47,368, and "(49,999)" for one holding 50,000.
 
+Also the payload a screen elsewhere needs (issue #15): the clock's correction counters are copied
+when a tick is stamped, which is the moment they can change; a symbol carries its decimal places
+from the broker specification; and an unknown symbol carries `None` rather than an invented 2.
+
 Defends: the day cut reports what the file holds and carries the triggering tick into the new
 file, because the cut is checked *before* the tick is appended; a file that fills up reports the
 tick that filled it, because that threshold fires *after*; the two counters are compared while
@@ -295,11 +299,65 @@ a path escaping the archive is refused even when its name passes the pattern; th
 match the register's checksum; no route is authenticated but ungated; and compression changes
 the size without changing what arrives.
 
+### `tests/viewer/test_stats_from_payload.py`
+
+The reverse of the status serializer: the payload turned back into the object the renderer
+reads. The pair is only worth having if both halves stay structural rather than enumerated, so
+the round-trip test compares the WHOLE object rather than a list of fields, and covers a member
+added to the statistics on the day it is added.
+
+Defends: everything the collector sends survives the journey; every field whose type a freshly
+built object cannot state is registered, and a stale registration is removed; a **newer**
+collector's unknown key is dropped rather than raised on, because the box and the laptop are
+routinely different builds; an **older** collector missing a required value is named by class
+instead of guessed at; a timestamp arriving without an offset is read as UTC and not as the
+viewer's local time; and something that is not a status payload at all never becomes a
+half-drawn screen.
+
+### `tests/viewer/test_status_feed.py`
+
+The polling loop and every way it can fail. The failure TEXT is asserted rather than a failure
+count, because the four common ones send the operator to four different machines.
+
+Defends: 401 and 403 stay distinguishable — one means the credential, the other means one line
+in a registry; a reason on screen is a sentence and not an exception class name; a build
+mismatch is named as one instead of reading as a broken collector; the timeout leaves room for a
+refused connection to report itself (measured 2.04 s on Windows, which a two-second timeout beat
+by forty milliseconds and mislabelled); the clock skew between the two machines is measured, and
+is `None` rather than `0.0` when nothing was compared; a failed reading never reaches the
+renderer and never clears the previous one; and a recovered feed stops showing why it was down.
+
+### `tests/viewer/test_viewer_screen.py`
+
+What a remote screen says about itself. A viewer draws numbers it did not measure, so the moment
+the collector goes quiet all of them describe the past while looking exactly as current as they
+did a second earlier.
+
+Defends: a silent collector turns the whole frame, not one line inside it, and carries the clock
+time and the age of the last reading; a viewer that has never read anything says so instead of
+inventing a time; the machine being drawn is named; a clock disagreement is shown; an unknown
+price precision prints the value as measured rather than rounding ADAUSD's 0.2103 / 0.2104 to a
+stated spread of zero; file progress is measured against the **collector's** configured limit
+and shows no denominator when none was reported — read from the local config it rendered a
+production file as 241 % of a boundary that instance does not have; and the viewer never writes
+its own render cost into statistics that describe the collector, while the in-process display
+still measures its own frames, which is the number that identified the 2026-09-21 stall.
+
+### `tests/viewer/test_endpoints.py`
+
+Which collector to watch, read out of the overlay. This file was a note to whoever was working
+here until the viewer became the first program to read it.
+
+Defends: an unknown name lists the ones that exist; a missing file says what to copy; an entry
+without a token names the entry; the refresh rate follows from where the collector is; and a
+parse error is reported **without the file's contents**, because the token sits three lines from
+whatever the error is.
+
 ## What is not covered
 
-The **live display** has no tests beyond a render pass with populated values. Its formatters
-(`_format_quote_age`, `_format_last_tick`, `_digits_for`) are pure functions and would be cheap
-to pin.
+The **live display's** remaining formatters (`_format_quote_age`, `_format_last_tick`) are pure
+functions and would be cheap to pin. `_digits_for` and the file-progress line are covered by
+`tests/viewer/test_viewer_screen.py`, which renders real frames to text.
 
 The **Windows paths** cannot be exercised here: the dev container is Linux, the production
 machine is Windows Server. The signal handling, the console encoding and the start script are

@@ -12,12 +12,17 @@ From the project root, as a module:
 
     python -m python.main collect      # collect until stopped
     python -m python.main status       # show state without collecting
+    python -m python.main watch        # draw a collector running elsewhere
 
 The file-path form (`python python/main.py`) fails with `No module named 'python'` — the
 package root is not on `sys.path` that way.
 
 **Set `PYTHONUTF8=1` on Windows.** The live display and the log lines carry box drawing and
 emoji; a cp1252 console truncates the display and kills a piped run outright.
+
+`watch` is a different program that happens to share this entry point: it reads one HTTP
+route and draws the screen, loads none of this configuration, and writes to no log file.
+See [watching a collector](watching_a_collector.md).
 
 **Use a virtualenv**, matching the sister projects:
 

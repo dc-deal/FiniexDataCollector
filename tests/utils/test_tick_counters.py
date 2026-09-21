@@ -125,6 +125,58 @@ def test_a_full_file_reports_the_tick_that_filled_it(
     assert collector._stats.symbols[SYMBOL].current_file_ticks == 0
 
 
+class FakeClock:
+    """A session clock that has absorbed something."""
+    resyncs = 3
+    max_correction_ms = 17
+
+
+def test_a_screen_elsewhere_can_read_what_the_clock_absorbed(
+    collector: FiniexDataCollector,
+    tmp_path: Path
+) -> None:
+    """
+    The display read these off the live clock object, which only a program
+    inside this process can do.
+
+    The clock moves when a tick is stamped, so a tick is when the copy has to
+    happen - a viewer showing zero corrections while the file headers count
+    three would be the same defect this project refuses in its files.
+    """
+    attach_writer(collector, tmp_path)
+    collector._clock = FakeClock()
+
+    collector._on_tick_received(build_ticks(count=1, start_msc=MIDNIGHT)[0])
+
+    assert collector._stats.clock.resyncs == 3
+    assert collector._stats.clock.max_correction_ms == 17
+
+
+def test_a_symbol_carries_its_decimal_places(
+    collector: FiniexDataCollector
+) -> None:
+    """
+    Without it a viewer prints two places for everything.
+
+    That is not cosmetic: ADAUSD trades at 0.2103 against 0.2104, and two places
+    render both as 0.21 - a screen stating a spread of zero where the book has
+    one.
+    """
+    collector._prepare_symbol_stats(SYMBOL)
+
+    assert collector._stats.symbols[SYMBOL].digits == 1, (
+        "BTCUSD carries one decimal place in the test broker specification")
+
+
+def test_an_unknown_symbol_says_it_does_not_know(
+    collector: FiniexDataCollector
+) -> None:
+    """None, not 2. An invented precision is a claim nobody measured."""
+    collector._prepare_symbol_stats("NOSUCHPAIR")
+
+    assert collector._stats.symbols["NOSUCHPAIR"].digits is None
+
+
 def test_the_comparison_actually_runs_on_its_own(
     collector: FiniexDataCollector,
     tmp_path: Path

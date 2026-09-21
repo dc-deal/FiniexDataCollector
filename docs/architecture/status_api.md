@@ -151,6 +151,24 @@ with its tick count and duration, and the file a failure left owed. A failed exp
 data — its write-ahead log stays on disk and the next start recovers it — but it is a file the
 archive does not have yet, and `last_failed_file` is what names it.
 
+**`streams`, `clock`, `max_ticks_per_file` and each symbol's `digits` are here so a screen can be
+drawn from this payload alone** — the first half of issue #15. The display used to read all four
+somewhere else: the subscribed streams, the `CollectionClock`'s correction counters and the
+broker specification's decimal places off live objects only a program inside the collector can
+reach, and the file limit out of the **local** `app_config.json`, on every frame. Both of those
+were defects rather than shortcuts. Two fixed places once rendered ADAUSD's 0.2103 and 0.2104
+both as 0.21, a screen asserting a spread the book did not have, so `digits` is `null` rather
+than `2` when the specification is unknown. And the file limit read locally was the wrong
+machine's: a laptop configured for 1,000 rendered a production file of 12,737 ticks as `1274 %`
+of a boundary that instance does not have.
+
+**This payload is a contract with the viewer**, not only a diagnostic. `python -m python.main
+watch` rebuilds the statistics object out of it and hands it to the same renderer the collector
+used to run itself — see [watching a collector](../operations/watching_a_collector.md). The
+conversion is structural in both directions, so a measurement added to `CollectorStats` reaches a
+remote screen without anyone editing a converter. The one thing that does need an entry is a
+field a freshly built object leaves empty, and a test names it rather than a screen.
+
 **`stalls` names what stopped the loop, and `gc` is usually the answer to that.** A stall above
 250 ms is written down with what was measured in its own window: how much of it was garbage
 collection and of which generation, how long the display's last redraw took, and how many archive

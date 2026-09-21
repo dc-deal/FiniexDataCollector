@@ -35,6 +35,10 @@ ENABLE_QUICK_EDIT_MODE = 0x0040
 ENABLE_EXTENDED_FLAGS = 0x0080
 INVALID_HANDLE_VALUE = -1
 
+# Windows console output flags.
+STD_OUTPUT_HANDLE = -11
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
 
 def disable_quick_edit() -> Optional[bool]:
     """
@@ -80,5 +84,60 @@ def disable_quick_edit() -> Optional[bool]:
             return False
 
         return not check.value & ENABLE_QUICK_EDIT_MODE
+    except Exception:
+        return False
+
+
+def enable_ansi_colours() -> Optional[bool]:
+    """
+    Teach this process's console to interpret the log's colour codes.
+
+    The logger writes ANSI escapes. A Windows console only acts on them when
+    virtual terminal processing is on, and it is off by default - the live
+    display used to switch it on as a side effect of rich taking the console
+    over, so running with `--no-display` left the escapes visible as text:
+    `<-[37mINFO <-[0m` instead of a coloured word, measured on the production
+    box 2026-09-21. The log file is unaffected either way; it never carried
+    colour.
+
+    Never raises, for the same reason as the call above: a console that will not
+    take the change is worth a log line, not a refusal to collect.
+
+    Returns:
+        True when the console will now interpret colour, False when a console
+        was found but would not take the change, and None when there is nothing
+        to do - not Windows, or stdout is redirected rather than a console
+    """
+    if sys.platform != "win32":
+        return None
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        if handle in (0, INVALID_HANDLE_VALUE, None):
+            return None
+
+        mode = ctypes.c_uint32()
+        # Fails when stdout is a pipe or a file: nothing there reads escapes,
+        # and nothing there is confused by them either.
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return None
+
+        if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+            return True
+
+        wanted = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        if not kernel32.SetConsoleMode(handle, wanted):
+            return False
+
+        # Read it back rather than trusting the return code, exactly as above:
+        # older consoles report success and keep the old mode.
+        check = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(check)):
+            return False
+
+        return bool(check.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING)
     except Exception:
         return False

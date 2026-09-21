@@ -30,6 +30,10 @@ class SymbolStats:
         errors_count: Errors for this symbol
         file_count: Number of files created this session
         folder_file_count: Total files in folder (all sessions)
+        digits: Decimal places this instrument's prices carry, from the broker
+            specification. Two fixed places once rendered ADAUSD's 0.2103 and
+            0.2104 both as 0.21, a screen asserting a spread the book did not
+            have - so a screen outside this process needs the real number
     """
     symbol: str
     current_file_ticks: int = 0
@@ -43,6 +47,7 @@ class SymbolStats:
     errors_count: int = 0
     file_count: int = 0
     folder_file_count: int = 0
+    digits: Optional[int] = None
 
     @property
     def is_active(self) -> bool:
@@ -203,6 +208,23 @@ class LoopLag:
     max_ms: float = 0.0
     max_at: Optional[datetime] = None
     over_500ms: int = 0
+
+
+@dataclass
+class ClockState:
+    """
+    What the session clock has had to absorb, for whoever draws the screen.
+
+    The display read these off the live `CollectionClock`, which only a program
+    inside this process can do. They are here so a viewer somewhere else shows
+    the same two numbers the file headers carry.
+
+    Attributes:
+        resyncs: Backwards steps the clock clamped, cumulative over the session
+        max_correction_ms: The largest single correction it absorbed
+    """
+    resyncs: int = 0
+    max_correction_ms: int = 0
 
 
 @dataclass
@@ -383,6 +405,22 @@ class CollectorStats:
         self.gc: GcPauses = GcPauses()
         self.stalls: List[StallEvent] = []
 
+        # What a screen needs and the statistics did not carry: which streams
+        # are subscribed, what the clock has absorbed, and how many decimals a
+        # price is worth printing to. A display inside this process could read
+        # all three from live objects; one in another process cannot, and a
+        # second source for the same fact is how two screens start disagreeing.
+        self.streams: List[str] = []
+        self.clock: ClockState = ClockState()
+
+        # The file boundary this instance was configured with. A screen shows a
+        # file's progress against it, and the display used to read it out of the
+        # local app_config on every frame - which on the collector is a file read
+        # per symbol per second, and in a viewer is the wrong machine's config
+        # entirely: a laptop set to 1,000 rendered a production file of 12,737
+        # ticks as "1274 %" of a limit that instance does not have.
+        self.max_ticks_per_file: int = 0
+
         # Config
         self.max_stalls: int = 10
         self.max_recent_logs: int = 50
@@ -546,6 +584,17 @@ class CollectorStats:
         if lateness_ms > self.loop_lag.max_ms:
             self.loop_lag.max_ms = round(lateness_ms, 1)
             self.loop_lag.max_at = datetime.now(timezone.utc)
+
+    def record_clock(self, resyncs: int, max_correction_ms: int) -> None:
+        """
+        Copy the session clock's counters into the payload.
+
+        Args:
+            resyncs: Backwards steps the clock has clamped
+            max_correction_ms: The largest correction it absorbed
+        """
+        self.clock.resyncs = resyncs
+        self.clock.max_correction_ms = max_correction_ms
 
     def record_gc_pause(self, generation: int, duration_ms: float) -> None:
         """

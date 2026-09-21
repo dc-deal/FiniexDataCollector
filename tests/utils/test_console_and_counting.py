@@ -25,7 +25,10 @@ from python.main import count_files_in_folder
 from python.utils.console_mode import (
     ENABLE_EXTENDED_FLAGS,
     ENABLE_QUICK_EDIT_MODE,
-    disable_quick_edit
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    STD_OUTPUT_HANDLE,
+    disable_quick_edit,
+    enable_ansi_colours
 )
 
 
@@ -137,3 +140,27 @@ def test_a_console_that_refuses_is_not_a_reason_to_stop(
     monkeypatch.setattr(ctypes, "windll", HostileConsoleApi(), raising=False)
 
     assert disable_quick_edit() is False, "a console failure must not escape"
+    assert enable_ansi_colours() is False, "nor from the colour call"
+
+
+def test_the_colour_flag_is_the_one_windows_defines() -> None:
+    """
+    The log writes ANSI escapes and a Windows console ignores them until this
+    bit is set.
+
+    With the live display it happened by accident - rich sets it when it takes
+    the console over - so `--no-display` printed "<-[37mINFO" as text on the
+    production box until 2026-09-21. The log file never carried colour and is
+    unaffected either way.
+    """
+    assert ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0x0004
+    assert STD_OUTPUT_HANDLE == -11
+
+
+def test_the_colour_call_is_harmless_where_there_is_no_console() -> None:
+    """Same contract as the QuickEdit call: never raises, None off Windows."""
+    result = enable_ansi_colours()
+
+    assert result in (True, False, None)
+    if sys.platform != "win32":
+        assert result is None

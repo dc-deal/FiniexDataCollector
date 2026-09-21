@@ -37,7 +37,9 @@ from python.utils.instance_lock import InstanceLock
 from python.utils.config_loader import ConfigLoader, AppConfig
 from python.utils.logging_setup import (add_log_listener, describe_exception,
                                         get_logger, setup_logging)
-from python.utils.console_mode import disable_quick_edit
+from python.utils.console_mode import disable_quick_edit, enable_ansi_colours
+from python.viewer.endpoints import EndpointError, default_interval, load_endpoint
+from python.viewer.watch import run_viewer
 from python.utils.gc_watcher import GcWatcher
 from python.utils.live_display import LiveDisplay
 from python.types.collector_stats import CollectorStats
@@ -368,14 +370,19 @@ class FiniexDataCollector:
                 "window can suspend collection - use --no-display, or uncheck "
                 "QuickEdit in the window's properties.")
 
+        # Whether or not a display follows: the log writes colour codes, and a
+        # Windows console shows them as text until this is on. With the display
+        # it happened by accident, because rich switches it on when it takes the
+        # console over; without it the operator read "<-[37mINFO" for an hour.
+        if enable_ansi_colours() is False:
+            self._logger.warning(
+                "This console will not interpret colour codes; log lines here "
+                "will carry escape sequences. The log file is unaffected.")
+
         # Start live display. Off is a supported way to run: the file log is the
         # record, and that is what a service-wrapped instance uses.
         if self._show_display:
-            self._live_display = LiveDisplay(
-                self._stats,
-                streams=self._config.kraken.streams,
-                clock=self._clock
-            )
+            self._live_display = LiveDisplay(self._stats)
             await self._live_display.start()
         else:
             self._logger.info("Live display off - the file log keeps the record")
@@ -687,6 +694,29 @@ class FiniexDataCollector:
 
         return usage, (time.monotonic() - started) * 1000
 
+    def _prepare_symbol_stats(self, symbol: str) -> None:
+        """
+        Put everything a screen needs about a symbol where a screen can read it.
+
+        The entry exists from here rather than from the first tick, which also
+        makes a configured symbol that never trades visible instead of absent.
+        The digit count comes from the broker specification: two fixed places
+        once rendered ADAUSD's 0.2103 and 0.2104 both as 0.21, a screen
+        asserting a spread the book did not have.
+
+        Args:
+            symbol: Normalized symbol
+        """
+        symbol_stats = self._stats.get_symbol_stats(symbol)
+
+        try:
+            symbol_stats.digits = BrokerConfig.get_digits(symbol)
+        except Exception as e:
+            # A missing specification is not worth refusing to collect over; the
+            # field stays None, which says "not known" rather than inventing 2.
+            self._logger.debug(
+                f"No digit count for {symbol}: {describe_exception(e)}")
+
     def _reconcile_tick_counters(self) -> None:
         """
         Hold the displayed tick count against the one the writer wrote.
@@ -882,6 +912,12 @@ class FiniexDataCollector:
         # rather than once per symbol.
         clock = CollectionClock()
         self._clock = clock
+        self._stats.streams = list(self._config.kraken.streams)
+
+        # The file boundary, reported rather than looked up. A screen elsewhere
+        # has no way to know it, and the one that used to read it off a local
+        # config file read the viewer's machine instead of this one.
+        self._stats.max_ticks_per_file = self._config.kraken.max_ticks_per_file
 
         # One cache for the session, like the clock: the ticker channel fills it
         # and every symbol's trade ticks read their own entry out of it.
@@ -922,6 +958,8 @@ class FiniexDataCollector:
             )
 
             self._writers[normalized] = writer
+
+            self._prepare_symbol_stats(normalized)
 
         # Create collector
         collector = KrakenWebSocketClient(
@@ -1096,6 +1134,13 @@ class FiniexDataCollector:
                 real_volume=tick.real_volume,
                 quote_age_ms=tick.quote_age_ms
             )
+
+            # The clock only moves when a tick is stamped, so this is the moment
+            # its counters can have changed - and where a screen outside this
+            # process gets to see them.
+            if self._clock is not None:
+                self._stats.record_clock(
+                    self._clock.resyncs, self._clock.max_correction_ms)
 
             # Get count AFTER increment - this is the FINAL count for this file
             count_after = self._stats.symbols[symbol].current_file_ticks
@@ -1422,6 +1467,60 @@ async def cmd_collect(config: AppConfig, show_display: bool = True) -> None:
 
 
 
+def cmd_watch(endpoint_name: str, interval: Optional[float]) -> int:
+    """
+    Draw a running collector, from outside it.
+
+    Deliberately free of the collector's configuration and of its logger: this is
+    a second program that reads one HTTP route, and the only thing it shares with
+    the collector is the renderer. It prints to stdout directly for that reason -
+    a viewer that wrote into the service's log file would corrupt the record it
+    exists to display.
+
+    Args:
+        endpoint_name: Entry in `user_configs/remote_endpoints.json`
+        interval: Seconds between readings, or None to decide from the URL
+
+    Returns:
+        Process exit code
+    """
+    try:
+        base_url, token = load_endpoint(endpoint_name)
+    except EndpointError as error:
+        print(f"Cannot watch '{endpoint_name}': {error}")
+        return 1
+
+    seconds = interval if interval else default_interval(base_url)
+
+    # QuickEdit belongs to whichever console carries a live display, and after
+    # issue #15 that is this one. In the service there is no console to protect;
+    # here a stray click would freeze the screen and, unlike before, nothing else.
+    disable_quick_edit()
+    enable_ansi_colours()
+
+    # The screen is full of box drawing and emoji, and a console still on a
+    # legacy code page cannot encode them. Rich then raises inside the update
+    # loop, where the handler swallows it and the screen simply stops moving -
+    # a viewer frozen by its own title, which reads exactly like a collector
+    # that died. A replacement character is a worse-looking screen and a true
+    # one. On a UTF-8 console this changes nothing.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+    # The URL, never the token. A command that needs the credential reads it from
+    # the overlay, so it never reaches a terminal, a screenshot or a bus message.
+    print(f"Watching {base_url} every {seconds:g}s - Ctrl+C to stop")
+
+    try:
+        asyncio.run(run_viewer(base_url, token, seconds))
+    except KeyboardInterrupt:
+        pass
+
+    return 0
+
+
 def cmd_status(config: AppConfig) -> None:
     """Show current status."""
     logger = get_logger("FiniexDataCollector")
@@ -1460,7 +1559,7 @@ def main():
 
     parser.add_argument(
         "command",
-        choices=["collect", "status"],
+        choices=["collect", "status", "watch"],
         help="Command to execute"
     )
 
@@ -1477,7 +1576,29 @@ def main():
         help="collect without the live display - the file log keeps the record"
     )
 
+    parser.add_argument(
+        "--endpoint",
+        type=str,
+        default="live",
+        help="watch: which entry of user_configs/remote_endpoints.json to read"
+    )
+
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="watch: seconds between readings (default: 1 on loopback, 2 remote)"
+    )
+
     args = parser.parse_args()
+
+    # The viewer runs before any of this. It is a different program that happens
+    # to share an entry point: it must not load the collector's configuration and
+    # above all must not open the collector's log file, because on the production
+    # box the service already holds it and two writers on one log is how a record
+    # gets shredded by the thing that was watching it.
+    if args.command == "watch":
+        sys.exit(cmd_watch(args.endpoint, args.interval))
 
     # Load config
     try:

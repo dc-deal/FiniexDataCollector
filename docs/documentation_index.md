@@ -13,6 +13,7 @@ Links only. Order within a section is reading priority — the first entry is wh
 ## Operations
 
 - [Running the collector](operations/running_the_collector.md)
+- [Watching a collector](operations/watching_a_collector.md)
 
 ## Tests
 

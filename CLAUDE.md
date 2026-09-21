@@ -46,6 +46,14 @@ Every line is reviewed by the operator before it is committed. The assistant nev
 - **Measure rather than assume.** Several decisions in this project were made from numbers
   taken off the real archive (spread distribution, arrival lag, quote staleness). When a
   number is cheap to obtain, obtain it.
+- **An attribution is a measurement, not an argument.** Measured 2026-09-21: the event loop
+  stalled up to 4.3 s about once a minute. The folder scan was the obvious culprit, was named
+  as one at 80 % confidence, was moved off the loop — and then measured at 15 ms. The stalls
+  continued. The cause was the **live display**: one Rich frame on that console cost up to
+  3.9 s, which is the whole stall, every time. Two lessons, both now built in: a stall on
+  `/v1/status` carries what was measured in its own window and says `unknown` rather than
+  guessing, and **the thing that draws the screen must not share the loop that stamps the
+  ticks** — issue #15.
 
 ## Architecture planning
 
@@ -443,6 +451,14 @@ This peer is `datacollector`. Setup lives in `.mcp.json` (gitignored; `.mcp.json
 the tracked counterpart) and the `/bus` mount in `docker-compose.yml`, indirected through
 `FINIEX_BUS_PATH` so no private path reaches a public file.
 
+**The config is per environment, and the wrong one fails silently.** `.mcp.json` pointing at
+`/bus` works in the container and dies on a host with `CONNECTION_CLOSED` at session start — no
+error in the transcript, just a bus tool that is not there. The example file carries a block for
+each of the three cases; copy the matching one. The failure matters more than it looks: without
+the tool, "nothing in the inbox" stops being evidence that nothing arrived. The bus client can be
+driven directly in the meantime (`BUS_ROOT=<folder> BUS_PEER=datacollector python -c "import
+bus_mcp"` from its `client/` directory), which writes the same files through the same routine.
+
 ---
 
 ## Issues
@@ -471,9 +487,10 @@ python/
   writers/              base, json_tick_writer
   types/                tick_types (incl. the format constants), broker_config_types
   utils/                collection_clock, config_loader, logging_setup, live_display
+  viewer/               the second process: status_feed, stats_from_payload, endpoints, watch
   alerts/               telegram_bot
   scheduler/            weekly_jobs
-  main.py               CLI entry point: collect | status
+  main.py               CLI entry point: collect | status | watch
 tests/
   collectors/ writers/ utils/   mirroring the source tree
 configs/                tracked defaults; user_configs/ overlays them and is gitignored
@@ -490,24 +507,49 @@ is gitignored. A live credential must never appear in the tracked file.
 **Reaching the live instance from here:** `user_configs/remote_endpoints.json` holds the
 base URL and the operator's token for the collector running on the production server, with
 `remote_endpoints.example.json` as the tracked counterpart carrying the shape and the rules
-but no values. Nothing reads it at runtime — the collector does not know it exists. It is
-there so a session can query production without the operator looking the URL up again.
+but no values. **The collector never reads it** — it does not know it exists. One program does:
+`python -m python.main watch`, the viewer, which takes the `base_url` and `token` of the entry
+named by `--endpoint`. For everything else it is there so a session can query production without
+the operator looking the URL up again.
 
 **Reaching FiniexTestingIDE's API from here.** It runs in that project's dev container and is
 published on the laptop's loopback. Verified 2026-09-21:
 
 | | |
 |---|---|
-| Base | `http://127.0.0.1:8000/api/v1` — **not** `/v1`, and no schema at `/openapi.json` |
-| Open | `GET /api/v1/health` → `{"status": "ok", "version": "1.4.0"}` |
-| Auth | enforced, consumers `ragengine` and `viewer`; **this project holds no token** |
-| Runs | only while the operator has it started; it is not a service |
+| Base | `http://127.0.0.1:8000/api/v1` from this machine — **not** `/v1`, and no schema at `/openapi.json` |
+| Token | `testingide_local` in `user_configs/remote_endpoints.json`, grants `brokers:*` and `bars:*` |
+| `GET /health` | `{"status": "ok", "version": "1.4.0"}`, open |
+| `GET /brokers` | `kraken_spot` for crypto, `mt5` for forex |
+| `GET /brokers/{b}/symbols` | symbols with `market_type` |
+| `GET /brokers/{b}/symbols/{s}/coverage` | start, end, timeframes |
+| `GET /brokers/{b}/symbols/{s}/bars` | `timeframe`, `from`, `to` required, `limit` optional; rows oldest first, `{t, o, h, l, c, v, tc}` |
+| `GET /timeframes` | M1 M5 M15 M30 H1 H4 D1 |
+| Runs | **dev only**, started by hand, no edge, no route from the live box |
 
-What it is good for: the IDE builds **bars out of our ticks**, so questions this collector cannot
-answer from its own archive — how a period looks once aggregated, what an import made of a file —
-have an address. Before using any of it, ask the operator for a token minted for `datacollector`
-and for the route list; borrowing another consumer's token would break the rule below in the
-other project's house.
+**The IDE builds bars out of our ticks**, so this is where a question our own archive cannot
+answer has an address. Verified 2026-09-21 by fetching M1 and M5 bars for BTCUSD out of a day
+this collector produced.
+
+Four semantics that would cost a wrong number rather than an error, stated by them on
+2026-09-21:
+
+- **A bar's timestamp is its OPEN**, left-labelled.
+- **OHLC is the MID of bid/ask, not a traded price.** Their close is not our `last`, and on a
+  wide spread the two separate — which is exactly when someone compares a bar against our tick
+  file for the same minute.
+- **Gaps are omitted, never zero-filled**, so a missing row is "nothing arrived" rather than a
+  quiet minute at zero. A window they have not imported answers `200 []`.
+- **Forex volume is identically zero** (the MT5 CFD feed reports no size); `tc`, the tick count,
+  is the activity measure that exists on both sides. `limit` above 10,000 is refused with
+  `400 invalid_limit` rather than clamped.
+
+**Assume it is down more often than up.** Unreachable means "ask the operator to start it",
+never a fault: no retry loop, no health check, and nothing in the collector process may depend
+on it — a producer that needs its consumer to be up has the dependency backwards.
+
+**Market data only.** No `reports`, no `sweeps`, and another consumer's token is not ours to
+borrow — the rule below applies in their house too.
 
 Three rules come with it. **One token per consumer**, so revoking the operator's does not
 take the consuming project's surface away with it. **Print the URL, never the token** — a

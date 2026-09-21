@@ -460,6 +460,28 @@ def test_the_status_shows_the_stall_a_tick_file_cannot_show(
     assert payload["exports"]["last_file"] == "BTCUSD_20260920_000004_ticks.json"
 
 
+def test_the_status_carries_what_a_screen_needs_to_draw(
+    client: TestClient,
+    stats: CollectorStats
+) -> None:
+    """
+    The three things the in-process display reads off live objects.
+
+    A viewer in another process cannot reach a `CollectionClock` or the broker
+    specification, and a second source for the same fact is how two screens
+    start disagreeing. This is the payload half of the service/viewer split.
+    """
+    stats.streams = ["trade", "ticker"]
+    stats.record_clock(3, 17)
+    stats.get_symbol_stats("ADAUSD").digits = 4
+
+    payload = client.get("/v1/status", headers=as_reader()).json()
+
+    assert payload["streams"] == ["trade", "ticker"]
+    assert payload["clock"] == {"resyncs": 3, "max_correction_ms": 17}
+    assert payload["symbols"]["ADAUSD"]["digits"] == 4
+
+
 def test_a_refused_socket_count_is_unknown_and_not_zero(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:

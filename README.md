@@ -124,11 +124,17 @@ docker logs -f finiex-data-collector
 pip install -r requirements.txt
 
 # Start collector
-python python/main.py collect
+python -m python.main collect
 
 # Check status
-python python/main.py status
+python -m python.main status
+
+# Watch a collector running elsewhere, over its status API
+python -m python.main watch
 ```
+
+Run it as a module. The file-path form (`python python/main.py`) fails with
+`No module named 'python'` — the package root is not on `sys.path` that way.
 
 ---
 
@@ -201,7 +207,10 @@ every price written.
 
 ## Live Display
 
-FiniexDataCollector includes a rich terminal UI showing real-time status:
+FiniexDataCollector includes a rich terminal UI showing real-time status. The same screen is
+available from another machine with `python -m python.main watch`, which reads the status API
+over HTTP and cannot affect the collection — see
+[watching a collector](docs/operations/watching_a_collector.md):
 
 ```
 ╭────────────────────────────── 📡 FiniexDataCollector Live ──────────────────────────────╮

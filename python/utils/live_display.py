@@ -28,9 +28,8 @@ from rich.markup import escape
 from rich.text import Text
 from rich import box
 
-from python.types.broker_config_types import BrokerConfig
-from python.utils.collection_clock import CollectionClock
 from python.types.collector_stats import CollectorStats
+from python.types.feed_state import FeedState
 
 
 class LiveDisplay:
@@ -44,31 +43,60 @@ class LiveDisplay:
     def __init__(
         self,
         stats: CollectorStats,
-        streams: List[str] = None,
         update_interval: float = 1.0,
         max_log_lines: int = 5,
-        clock: Optional[CollectionClock] = None
+        feed: Optional[FeedState] = None
     ):
         """
         Initialize live display.
 
+        Everything it draws comes from the stats object and nothing else. That
+        is what makes the same renderer usable from another process, which is
+        the point of issue #15: the streams, the clock counters and each
+        symbol's decimal places used to be read off live objects only a program
+        inside the collector can reach.
+
         Args:
             stats: Shared CollectorStats object
-            streams: List of active streams (e.g., ["ticker"], ["trade"])
             update_interval: Display update interval in seconds
             max_log_lines: Maximum log lines to show
-            clock: Session clock, read live rather than copied - a mirrored
-                counter can disagree with the one that writes the files
+            feed: Where the statistics come from, when they arrive over a wire.
+                None means this display runs inside the collector, where every
+                number is current by construction
         """
         self._stats = stats
-        self._clock = clock
-        self._streams = streams if streams else ["ticker"]
         self._update_interval = update_interval
         self._max_log_lines = max_log_lines
+        self._feed = feed
         self._running = False
         self._console = Console()
         self._live: Optional[Live] = None
         self._task: Optional[asyncio.Task] = None
+
+    @property
+    def stats(self) -> CollectorStats:
+        """The statistics being drawn."""
+        return self._stats
+
+    @stats.setter
+    def stats(self, stats: CollectorStats) -> None:
+        """
+        Draw a different statistics object from the next frame onwards.
+
+        A viewer replaces the whole object per reading rather than merging into
+        the previous one: a merge would leave a field the collector stopped
+        sending standing at its last value, which is precisely what a remote
+        screen must not do.
+
+        Args:
+            stats: The statistics of the most recent reading
+        """
+        self._stats = stats
+
+    @property
+    def _streams(self) -> List[str]:
+        """The subscribed streams, as the collector reported them."""
+        return self._stats.streams
 
     async def start(self) -> None:
         """Start the live display."""
@@ -108,8 +136,14 @@ class LiveDisplay:
                     # numbers.
                     started = time.monotonic()
                     live.update(self._render())
-                    self._stats.record_render(
-                        (time.monotonic() - started) * 1000)
+                    if self._feed is None:
+                        # Only in-process: a viewer writing its own render cost
+                        # into statistics that describe the collector would put
+                        # a measurement from this machine under that machine's
+                        # name, which is exactly the kind of claim this project
+                        # refuses in its files.
+                        self._stats.record_render(
+                            (time.monotonic() - started) * 1000)
 
                     # Wait
                     await asyncio.sleep(self._update_interval)
@@ -145,12 +179,58 @@ class LiveDisplay:
             Layout(footer, name="footer", size=8)
         )
 
+        title, border = self._build_frame()
         return Panel(
             layout,
-            title="[bold cyan]📡 FiniexDataCollector Live[/bold cyan]",
-            border_style="cyan",
+            title=title,
+            border_style=border,
             box=box.ROUNDED
         )
+
+    def _build_frame(self) -> tuple:
+        """
+        The panel's title and border colour.
+
+        The whole frame turns red when the collector stops answering, rather than
+        one line somewhere inside it. A screen full of numbers that are quietly
+        half a minute old is read as current by anyone glancing at it, so the part
+        that changes has to be the part nobody can miss.
+
+        Returns:
+            (title markup, border style)
+        """
+        if self._feed is None:
+            return "[bold cyan]📡 FiniexDataCollector Live[/bold cyan]", "cyan"
+
+        if self._feed.connected:
+            return (f"[bold cyan]📡 FiniexDataCollector[/bold cyan] "
+                    f"[dim]← {self._feed.source}[/dim]", "cyan")
+
+        age = self._feed.age_seconds
+        since = ("never answered" if self._feed.last_success is None else
+                 f"no answer since "
+                 f"{self._feed.last_success.strftime('%H:%M:%S')} UTC "
+                 f"({self._format_age(age)} ago)")
+        return f"[bold red]⛔ {since}[/bold red]", "red"
+
+    @staticmethod
+    def _format_age(seconds: Optional[float]) -> str:
+        """
+        A duration a glance can read.
+
+        Args:
+            seconds: Age in seconds, or None
+
+        Returns:
+            Short human form
+        """
+        if seconds is None:
+            return "—"
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        if seconds < 3600:
+            return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+        return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
 
     def _get_local_tz_label(self) -> str:
         """Get local timezone label like 'GMT+1' or 'GMT-5'."""
@@ -176,7 +256,7 @@ class LiveDisplay:
             ws_display = "[red]○ disconnected[/red]"
 
         # Streams display
-        streams_str = ", ".join(self._streams)
+        streams_str = ", ".join(self._streams) or "none yet"
 
         # Time displays
         now_utc = datetime.now(timezone.utc)
@@ -196,7 +276,46 @@ class LiveDisplay:
             f"[bold]🏠 Local:[/bold] [green]{now_local.strftime('%H:%M:%S')}[/green] [dim]({tz_label})[/dim]"
         )
 
-        return Text.from_markup(f"{line1}\n{line2}")
+        lines = [line1, line2]
+        feed_line = self._build_feed_line()
+        if feed_line:
+            lines.append(feed_line)
+
+        return Text.from_markup("\n".join(lines))
+
+    def _build_feed_line(self) -> str:
+        """
+        What the viewer knows about its own reading, or nothing in-process.
+
+        Two things belong here that nowhere else can state: how old the numbers
+        above are, and whether the two machines agree about the time. The second
+        is not cosmetic - uptime is computed from the collector's start time
+        against this machine's clock, so a skewed viewer prints an uptime that
+        never happened.
+
+        Returns:
+            Markup for one line, or an empty string when there is no feed
+        """
+        if self._feed is None:
+            return ""
+
+        if not self._feed.connected:
+            reason = self._feed.last_error or "unknown"
+            return (f"[bold red]⛔ the numbers below are not current[/bold red] │ "
+                    f"[red]{escape(reason)}[/red] │ "
+                    f"[dim]{escape(self._feed.source)}[/dim]")
+
+        parts = [
+            f"[dim]📡 {escape(self._feed.source)} │ "
+            f"read {self._format_age(self._feed.age_seconds)} ago, "
+            f"every {self._feed.interval_seconds:.0f}s[/dim]"
+        ]
+        if self._feed.clock_disagrees:
+            parts.append(
+                f"[yellow]⚠️ clock skew {self._feed.skew_seconds:+.0f}s - "
+                f"durations here are off by that much[/yellow]")
+
+        return " │ ".join(parts)
 
     def _build_monitoring_status(self) -> Text:
         """Build monitoring status line with disk space and last check."""
@@ -231,14 +350,14 @@ class LiveDisplay:
         # not: a clamped stamp is invisible in the data by design, so if it is
         # not shown here nobody learns the machine's clock is stepping. It fired
         # 14 times in one night on this host without anyone noticing.
-        if self._clock is not None:
-            if self._clock.resyncs == 0:
-                lines.append("[dim]🕐 Clock: steady[/dim]")
-            else:
-                lines.append(
-                    f"[bold]🕐 Clock:[/bold] [yellow]{self._clock.resyncs} "
-                    f"correction(s), max {self._clock.max_correction_ms} ms[/yellow]"
-                )
+        clock = self._stats.clock
+        if clock.resyncs == 0:
+            lines.append("[dim]🕐 Clock: steady[/dim]")
+        else:
+            lines.append(
+                f"[bold]🕐 Clock:[/bold] [yellow]{clock.resyncs} "
+                f"correction(s), max {clock.max_correction_ms} ms[/yellow]"
+            )
 
         # Last check time
         if disk.last_checked:
@@ -293,17 +412,20 @@ class LiveDisplay:
             # looked different from a busy one.
             status = self._format_last_tick(stats.last_tick_time)
 
-            # File progress
-            from python.utils.config_loader import load_config
-            try:
-                config = load_config()
-                max_ticks = config.kraken.max_ticks_per_file
-            except:
-                max_ticks = 50000
-
-            percent = (stats.current_file_ticks /
-                       max_ticks * 100) if max_ticks > 0 else 0
-            file_progress = f"{stats.current_file_ticks:,} / {max_ticks:,} ({percent:.0f}%)"
+            # File progress, against the limit the COLLECTOR was configured
+            # with. Reading it from a local config file was wrong twice over:
+            # once per symbol per frame off the disk, and - in a viewer - off
+            # the wrong machine, which rendered a production file of 12,737
+            # ticks as 1274 % of a limit that instance does not have.
+            max_ticks = self._stats.max_ticks_per_file
+            if max_ticks > 0:
+                percent = stats.current_file_ticks / max_ticks * 100
+                file_progress = (f"{stats.current_file_ticks:,} / "
+                                 f"{max_ticks:,} ({percent:.0f}%)")
+            else:
+                # An older collector does not report it. The count is a fact;
+                # a denominator would be invented.
+                file_progress = f"{stats.current_file_ticks:,}"
 
             # Folder files
             if stats.folder_file_count > 0:
@@ -320,7 +442,8 @@ class LiveDisplay:
             # Format based on stream type
             if "trade" in self._streams and "ticker" not in self._streams:
                 # Trade stream: show last price and volume
-                price_str = f"{stats.last_bid:,.2f}" if stats.last_bid > 0 else "-"
+                price_str = self._format_price(
+                    stats.last_bid, self._digits_for(symbol))
                 vol_str = f"{stats.last_volume:.4f}" if stats.last_volume > 0 else "-"
 
                 table.add_row(
@@ -335,10 +458,8 @@ class LiveDisplay:
             else:
                 # Ticker stream: show bid/ask/spread
                 digits = self._digits_for(symbol)
-                bid_str = (f"{stats.last_bid:,.{digits}f}"
-                           if stats.last_bid > 0 else "-")
-                ask_str = (f"{stats.last_ask:,.{digits}f}"
-                           if stats.last_ask > 0 else "-")
+                bid_str = self._format_price(stats.last_bid, digits)
+                ask_str = self._format_price(stats.last_ask, digits)
                 spread_str = f"{stats.last_spread_pct:.4f}" if stats.last_spread_pct > 0 else "-"
                 age_str = self._format_quote_age(stats.last_quote_age_ms)
 
@@ -497,24 +618,42 @@ class LiveDisplay:
             return f"[yellow]⸻ {secs / 60:.0f}m[/yellow]"
         return f"[red]⚠ {secs / 3600:.1f}h[/red]"
 
-    def _digits_for(self, symbol: str) -> int:
+    def _digits_for(self, symbol: str) -> Optional[int]:
         """
-        Decimal places for a symbol, from the broker specification.
+        Decimal places for a symbol, as the collector reported them.
 
         Two fixed places rendered ADAUSD's 0.2103 / 0.2104 as 0.21 and 0.21 -
         a display asserting bid == ask where the book has a spread. The same
-        mistake the data had in spread_points, one layer up.
+        mistake the data had in spread_points, one layer up. So an unknown
+        precision is `None` and not a default: rounding to a number nobody
+        stated is how the first version of this printed a spread of zero.
 
         Args:
             symbol: Normalized symbol
 
         Returns:
-            Digit count, 2 when the specification is unavailable
+            Digit count, or None when the collector did not state one
         """
-        try:
-            return BrokerConfig.get_digits(symbol)
-        except Exception:
-            return 2
+        stats = self._stats.symbols.get(symbol)
+        return stats.digits if stats is not None else None
+
+    @staticmethod
+    def _format_price(value: float, digits: Optional[int]) -> str:
+        """
+        Render a price at the instrument's precision, or exactly as measured.
+
+        Args:
+            value: The price
+            digits: Decimal places, or None when none was stated
+
+        Returns:
+            The formatted price, "-" when there is no price yet
+        """
+        if value <= 0:
+            return "-"
+        if digits is None:
+            return f"{value:,}"
+        return f"{value:,.{digits}f}"
 
     def _format_quote_age(self, age_ms: Optional[int]) -> str:
         """
