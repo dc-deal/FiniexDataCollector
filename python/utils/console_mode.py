@@ -14,8 +14,21 @@ why the write-ahead log cannot help here: the gap opens BEFORE the safety net,
 and a gap in a tick series is the same bytes as a quiet market. Nothing
 downstream can tell them apart.
 
-FiniexRAGEngine measured 13.5 hours of exactly this on this same host on
+FiniexRAGEngine measured 13 h 33 min of exactly this on this same host on
 2026-09-10, in a process whose entire job was to record what happened that night.
+Theirs was an INSTRUMENT outage, not a series one: their engine kept producing
+through it - 90 and 87 envelopes on either stream, largest gap 10.6 min against a
+10-minute cadence - and only the watcher's console froze. Here the instrument and
+the producer share a process, so the same freeze takes the ticks with it. That is
+the difference issue #15 removes, and it is why the number transfers but the
+severity does not.
+Their words, on the bus in `collector-test-instance-on-live-host`, message
+`20260917T090218-421__note__ragengine`: their connectivity watcher "froze at
+19:18 and resumed at 08:51 the next morning". The citation is here because on
+2026-09-22 they asked us to retract it as an event that never happened - it is
+easily confused with the 12 h 50 min host reset of 2026-09-20, which has almost
+the same shape and a different cause. A claim about another project is worth
+keeping only with the place it came from attached.
 
 Unchecking QuickEdit in a shortcut's properties works and does not survive the
 next person opening a fresh window. So the process turns it off for itself, every

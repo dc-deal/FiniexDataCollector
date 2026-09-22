@@ -150,7 +150,8 @@ A Windows console in QuickEdit mode suspends the next write while text is select
 display writes from the collector's only event loop — so one stray click stops the WebSocket
 reader and the writers with it. No tick arrives, which is the one gap the write-ahead log cannot
 close: it opens before the safety net, and a gap in a tick series is the same bytes as a quiet
-market. FiniexRAGEngine measured 13.5 hours of it on the same host.
+market. FiniexRAGEngine measured 13 h 33 min of it on the same host, in a watcher rather than
+in a producer - their series was unaffected, and ours would not be.
 
 Defends: the console call never raises, anywhere, and returns `None` where there is no console;
 `ENABLE_EXTENDED_FLAGS` is set alongside the cleared QuickEdit bit, without which the console

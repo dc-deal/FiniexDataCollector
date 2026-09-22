@@ -15,7 +15,7 @@ Two failures, both properties of one process doing both jobs:
 
 - **A console in QuickEdit mode suspends the next write while text is selected.** The live
   display writes from the collector's only event loop, so one stray click stops the WebSocket
-  reader. A sister project lost 13.5 hours to this on the same box; here it showed up on
+  reader. A sister project's watcher froze for 13 h 33 min on the same box; here it showed up on
   2026-09-18 as a 24-second stall, six seconds short of the lag window that costs a whole file.
 - **Drawing is expensive on that console.** Measured on the production box on 2026-09-21: one
   frame cost up to 3.9 s, and the loop stalled that long about once a minute. With the display

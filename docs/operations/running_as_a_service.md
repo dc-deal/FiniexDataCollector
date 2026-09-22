@@ -20,7 +20,10 @@ than a formality.
   reset cost 15 minutes; the missing restart cost **12 h 35 min** — 98 % of the outage.
 - **QuickEdit, repeatedly.** A console in QuickEdit mode suspends the next write while text is
   selected, and the display writes from the collector's only event loop. One stray click stops the
-  WebSocket reader. A sister project lost 13.5 hours to this on the same box.
+  WebSocket reader. A sister project's connectivity watcher froze for 13 h 33 min to this on
+  the same box — and their data series was untouched, because the frozen process was their
+  INSTRUMENT. Here the instrument and the producer are the same process, so the same freeze
+  takes the ticks with it. That difference is the whole argument for the split.
 
 A service has no interactive console, so neither failure has anywhere to happen.
 
@@ -45,7 +48,46 @@ $python  = "$root\.venv\Scripts\python.exe"
 & $nssm set FiniexDataCollector AppEnvironmentExtra 'PYTHONUTF8=1'
 ```
 
-Then the four settings that are not defaults, each for a measured reason:
+### Two things to check before installing, not after
+
+Both come from FiniexRAGEngine's install on this same machine, and both are invisible until a
+service is the thing running.
+
+**A service has no shell, so measure where the variables actually live.** Theirs found
+`DATABASE_URL` persisted *nowhere* - it had been typed into whichever shell started the engine,
+which is why the console worked for months and a service could not have.
+
+```powershell
+'PYTHONUTF8','FINIEX_COLLECTOR_TOKENS' | ForEach-Object {
+  "{0}  Machine={1}  User={2}" -f $_,
+    [bool][Environment]::GetEnvironmentVariable($_,'Machine'),
+    [bool][Environment]::GetEnvironmentVariable($_,'User')
+}
+```
+
+This collector reads exactly one environment variable, `FINIEX_COLLECTOR_TOKENS`, and falls back
+to `api.tokens` in the overlay when it is absent - so as long as the tokens live in
+`user_configs/app_config.json`, nothing is lost. `PYTHONUTF8` is the one that would be: it is
+typed into the shell for a hand start, and under the service it has to come from
+`AppEnvironmentExtra` above.
+
+**`git` refuses a repository owned by somebody else, and `/v1/build` goes quiet about it.** The
+commit is read with `git rev-parse` at startup; the helper returns `None` on any failure, so the
+route answers `"commit": null` rather than erroring - silent, and it removes the one field that
+says which code is running. FiniexRAGEngine saw exactly that under `LocalSystem`. Running as
+`.\Administrator` should match the checkout's owner, but the guard is one line, system-wide, and
+free:
+
+```powershell
+git config --system --add safe.directory "C:/Users/Administrator/Documents/code/FiniexDataColl_v12"
+```
+
+It is a **per-path** refusal, so it returns the moment the checkout moves or the service account
+changes. Check `/v1/build` under the service, not by hand - a hand check runs as you.
+
+### The settings that are not defaults
+
+The settings that are not defaults, each for a measured reason:
 
 ```powershell
 # A graceful stop took 0.15 s in one run and 5.1 s in another, depending on what the
@@ -60,9 +102,13 @@ Then the four settings that are not defaults, each for a measured reason:
 & $nssm set FiniexDataCollector AppExit Default Restart
 & $nssm set FiniexDataCollector AppExit 2 Exit
 
-# Whatever escapes before logging is initialised has nowhere else to go.
-& $nssm set FiniexDataCollector AppStdout "$root\logs\service_stdout.log"
-& $nssm set FiniexDataCollector AppStderr "$root\logs\service_stderr.log"
+# Whatever escapes before logging is initialised has nowhere else to go - and the
+# message explaining an exit 2 is exactly that: it goes to stderr before the log file
+# exists, so without this the operator gets an event-log line saying the process ended
+# and nothing about why. FiniexRAGEngine hit that on their first install. The file names
+# match theirs on purpose, so "where is the output" has one answer on this box.
+& $nssm set FiniexDataCollector AppStdout "$root\logs\service.out.log"
+& $nssm set FiniexDataCollector AppStderr "$root\logs\service.err.log"
 & $nssm set FiniexDataCollector AppRotateFiles 1
 
 Start-Service FiniexDataCollector
@@ -119,6 +165,25 @@ sudo systemctl enable --now finiex-collector
 journalctl -u finiex-collector -f
 ```
 
+## After a reboot, on a box with three services
+
+Three Finiex services share this machine on 4 vCPU and 8 GB, all on delayed auto start. Two
+things are worth knowing before somebody debugs a non-defect:
+
+**FiniexRAGEngine's first start after a reboot may fail on purpose.** It needs PostgreSQL; if the
+database is not up yet its schema guard raises, the process exits 1 and NSSM restarts it until it
+succeeds. That is correct by design, and the failed start in the event log is expected rather
+than a fault.
+
+**This collector has no such dependency and does not use that pattern.** A failed first
+connection is caught inside the process and retried with backoff - it waits for the network
+rather than exiting, so a reboot produces no restart cycle here. If you ever see this service
+restart at boot, that is a real failure and not the normal shape.
+
+**Exit 2 means the same thing in all three projects**: do not retry. A stale configuration, a
+missing identity, an output directory another live instance owns. Agreed with FiniexRAGEngine on
+2026-09-22 so that a service definition reads the same way without reading anyone's source.
+
 ## Stopping, and what a stop is worth
 
 A stop sends a console Ctrl+C on Windows and SIGINT on Linux; both reach the same handler, which
@@ -152,6 +217,8 @@ over, so a service can always start after an unclean stop.
 A service definition is proven by a reboot and by nothing else. In order:
 
 1. `Start-Service` / `systemctl start`, then `/v1/build` answers with the expected commit.
+   **`"commit": null` is the failure to look for**, not an error page: it means git refused the
+   repository to the service account, and the route said nothing about it.
 2. Stop it. The log ends with `Shutdown complete`, and `data/raw/kraken/*.jsonl.part` is empty.
 3. Start it again, and start a console instance too. The console one must refuse with exit 2 and
    the service must be undisturbed.

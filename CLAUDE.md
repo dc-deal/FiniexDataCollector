@@ -54,6 +54,15 @@ Every line is reviewed by the operator before it is committed. The assistant nev
   `/v1/status` carries what was measured in its own window and says `unknown` rather than
   guessing, and **the thing that draws the screen must not share the loop that stamps the
   ticks** — issue #15.
+- **An instrument outage is not a series outage**, and until issue #15 this project could not
+  tell them apart because it had no separate instrument. FiniexRAGEngine's watcher froze for
+  13 h 33 min on 2026-09-10 while their engine produced through it untouched — 90 and 87
+  envelopes, largest gap 10.6 min against a 10-minute cadence. They lost **observation**, not
+  data. Here the screen and the producer shared a process, so the same freeze would have taken
+  the ticks with it. Now that `watch` is a second program, the distinction exists on our side
+  too: a frozen viewer costs nothing and a frozen collector costs an archive, and a report that
+  says "we lost X hours" has to say which. Established on the bus 2026-09-22 by two projects
+  each getting it wrong once.
 
 ## Architecture planning
 

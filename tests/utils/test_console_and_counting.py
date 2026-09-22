@@ -8,7 +8,8 @@ QuickEdit suspends a Windows console's next write while text is selected. The
 live display writes from the collector's only event loop, so a stray click stops
 the WebSocket reader and the writers with it - and no tick arrives, which is the
 one gap the write-ahead log cannot close, because it opens before the safety net.
-The sister project measured 13.5 hours of it on the same host.
+The sister project measured 13 h 33 min of it on the same host - in a watcher,
+whose data series survived. Ours would not.
 
 The folder count is smaller but the same shape: it said "files" and counted the
 open write-ahead logs among them.
