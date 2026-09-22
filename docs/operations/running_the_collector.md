@@ -24,6 +24,10 @@ emoji; a cp1252 console truncates the display and kills a piped run outright.
 route and draws the screen, loads none of this configuration, and writes to no log file.
 See [watching a collector](watching_a_collector.md).
 
+**On the production box it runs as a service**, with no console at all — see
+[running as a service](running_as_a_service.md). The commands above are how it is run by hand,
+which is development and the occasional deliberate check.
+
 **Use a virtualenv**, matching the sister projects:
 
     python -m venv .venv
