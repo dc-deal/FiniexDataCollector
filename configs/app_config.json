@@ -56,7 +56,9 @@
   "monitoring": {
     "disk_space_check_interval_seconds": 60,
     "folder_scan_interval_seconds": 60,
-    "reconnect_alert_cooldown_minutes": 30
+    "reconnect_alert_cooldown_minutes": 30,
+    "reconnect_alert_min_seconds": 30.0,
+    "reconnect_alert_cluster": 4
   },
   "api": {
     "enabled": false,

@@ -353,6 +353,21 @@ without a token names the entry; the refresh rate follows from where the collect
 parse error is reported **without the file's contents**, because the token sits three lines from
 whatever the error is.
 
+### `tests/utils/test_alert_policy.py`
+
+When a restored connection is worth interrupting somebody. Measured over the night of
+2026-09-21: seven reconnects, each 1.3 to 7.2 s, 19.9 s of downtime in fifteen hours — about 22
+ticks, and not one of them among the eight longest gaps in the file it fell into, which were all
+quiet market. Six alerts arrived on a phone for something that cannot be found in the data
+afterwards.
+
+Defends: a short self-healed reconnect stays in the log and off the phone; an outage past the
+consumer's lag window still reaches it, and carries its length; the threshold includes its own
+value; a cluster inside one hour is worth saying even when each was short, because a host that
+blips every two hours is weather and one that blips four times an hour is degrading; and the
+duration is never rendered as whole minutes — that turned a 7.22 s outage into "0m downtime", a
+field asserting less than the code knew, printed on a phone.
+
 ## What is not covered
 
 The **live display's** remaining formatters (`_format_quote_age`, `_format_last_tick`) are pure

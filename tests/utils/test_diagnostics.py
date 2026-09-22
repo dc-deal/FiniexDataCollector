@@ -26,6 +26,12 @@ from python.types.collector_stats import CollectorStats
 from python.utils.config_loader import ConfigLoader
 from python.utils.logging_setup import remove_log_listener
 
+from tests.conftest import build_ticks
+
+# Any fixed instant inside one UTC day: the tick contents are irrelevant
+# here, only that handling them costs measurable time.
+MIDNIGHT = 1789948800000
+
 
 class FakeUsage:
     """What psutil.disk_usage returns, as much of it as the monitor reads."""
@@ -292,3 +298,254 @@ def test_nothing_in_flight_can_go_below_zero() -> None:
     stats.record_export_failed("orphan.json")
 
     assert stats.exports.in_flight == 0
+
+
+# =============================================================================
+# WHAT THE TICK HANDLER COSTS THE LOOP (Befund 28)
+# =============================================================================
+
+def test_handling_ticks_is_named_when_it_accounts_for_the_stall() -> None:
+    """
+    The arm that was missing while ten production stalls said `unknown`.
+
+    Measured 2026-09-21: the loop stalled up to 738 ms with the display off, no
+    export running, and garbage collection accounting for under a tenth of it.
+    Everything the attribution could name had been ruled out, which left a
+    consumer nobody was measuring.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=50.0, gc_generation=1, render_ms=0.0,
+                       exports_in_flight=0, tick_ms=600.0, ticks=412)
+
+    assert stats.stalls[-1].cause == "handling 412 ticks"
+    assert stats.stalls[-1].tick_ms == 600.0
+    assert stats.stalls[-1].ticks == 412
+
+
+def test_a_measured_arm_outranks_the_presence_of_an_export() -> None:
+    """
+    `exports_in_flight` is a count of things running, not a duration.
+
+    It is the weakest evidence in the record, and it must never outrank
+    something that was actually timed - otherwise a stall that happens to
+    coincide with a handover is attributed to the handover, which is how the
+    folder scan was blamed and then measured at 15 ms.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=0.0, gc_generation=-1, render_ms=0.0,
+                       exports_in_flight=3, tick_ms=600.0, ticks=88)
+
+    assert stats.stalls[-1].cause == "handling 88 ticks"
+
+
+def test_nothing_measured_still_says_unknown() -> None:
+    """
+    A new arm must not turn `unknown` into a guess.
+
+    The word is what made the previous attribution believable when it finally
+    named the display: a cause is stated only when something accounts for half
+    of the stall, and a tiny amount of tick work is not an explanation.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=5.0, gc_generation=1, render_ms=0.0,
+                       exports_in_flight=0, tick_ms=12.0, ticks=4)
+
+    assert stats.stalls[-1].cause == "unknown"
+
+
+def test_the_handler_is_timed_where_the_ticks_actually_arrive() -> None:
+    """
+    A measurement nobody takes explains nothing.
+
+    The accumulator lives on the statistics and could be perfectly correct while
+    no call site fills it, so this drives the real entry point rather than the
+    recorder - which is the failure being guarded against.
+    """
+    collector = build_collector()
+    try:
+        for tick in build_ticks(count=3, start_msc=MIDNIGHT):
+            collector._on_tick_received(tick)
+
+        assert collector._stats.tick_work.ticks == 3, (
+            "nothing measures what handling a tick costs")
+        assert collector._stats.tick_work.total_ms > 0
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+
+def test_the_window_is_a_difference_and_not_a_running_total() -> None:
+    """
+    A stall must be explained by work done INSIDE it, not since startup.
+
+    Taking the accumulator's total would blame the handler for every tick of the
+    session the first time the loop hiccuped - a cause that is always true and
+    therefore says nothing. The monitor reads before waiting and subtracts
+    after; this drives that loop with work happening only before its window.
+    """
+    collector = build_collector()
+
+    async def stall_after_the_work_is_done() -> None:
+        # Work the handler did long before the window being measured.
+        for tick in build_ticks(count=40, start_msc=MIDNIGHT):
+            collector._on_tick_received(tick)
+
+        collector._is_running = True
+        task = asyncio.create_task(collector._monitor_loop_lag())
+        await asyncio.sleep(0.05)
+        time.sleep(0.4)                      # the stall, with no ticks in it
+        await asyncio.sleep(0.3)
+        collector._is_running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(stall_after_the_work_is_done())
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+    assert collector._stats.stalls, "the stall was not recorded at all"
+    stall = collector._stats.stalls[-1]
+    assert stall.ticks == 0, (
+        f"the window claimed {stall.ticks} ticks that arrived before it")
+    assert stall.cause != "handling 0 ticks"
+
+
+def test_when_two_measurements_overlap_the_more_specific_one_wins() -> None:
+    """
+    A collection triggered inside the tick handler is counted in both arms.
+
+    That overlap is real and unavoidable: the allocation that tripped the
+    collector happened while handling a tick, so the handler's elapsed time
+    contains the pause. Both then exceed half the stall, and the answer has to
+    be the one that sends somebody somewhere useful - "garbage collection,
+    generation 2" names a thing to tune, "handling 412 ticks" names the normal
+    work it happened during.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=600.0, gc_generation=2, render_ms=0.0,
+                       exports_in_flight=0, tick_ms=650.0, ticks=412)
+
+    assert stats.stalls[-1].cause == "garbage collection, generation 2"
+    assert stats.stalls[-1].tick_ms == 650.0, (
+        "the overlapping measurement is still recorded, only not named")
+
+
+def test_a_reconnect_inside_the_window_is_named() -> None:
+    """
+    Two stalls on 2026-09-22 said `unknown` because nothing connected them.
+
+    The reconnect at 02:43:50 completed at 02:43:52 and produced stalls of
+    252 ms and 271 ms in those two seconds. Everything the record could name had
+    been ruled out, and the cause was sitting in the reconnect list the whole
+    time with nothing joining the two.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(260.0, gc_ms=0.0, gc_generation=-1, render_ms=0.0,
+                       exports_in_flight=0, reconnected=True)
+
+    assert stats.stalls[-1].cause == "the websocket reconnected"
+    assert stats.stalls[-1].reconnected is True
+
+
+def test_a_measured_cause_still_outranks_a_reconnect() -> None:
+    """
+    `reconnected` is presence, like `exports_in_flight`, and ranks with it.
+
+    A collection that happens to land in the same second as a reconnect is
+    explained by the collection; naming the socket there would send somebody to
+    the network over something that was timed.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=600.0, gc_generation=1, render_ms=0.0,
+                       exports_in_flight=0, reconnected=True)
+
+    assert stats.stalls[-1].cause == "garbage collection, generation 1"
+
+
+def test_the_monitor_asks_whether_the_socket_came_back(monkeypatch) -> None:
+    """
+    The correlation lives at a call site, so the call site is what runs here.
+
+    It is also the one place two clocks could be mixed: the reconnect list
+    carries wall-clock stamps a human reads, and comparing a stall against those
+    would mean subtracting two readings a clock correction can sit between.
+    """
+    collector = build_collector()
+    asked = []
+    collector._reconnected_between = lambda since: asked.append(since) or True
+
+    async def one_stall() -> None:
+        collector._is_running = True
+        task = asyncio.create_task(collector._monitor_loop_lag())
+        await asyncio.sleep(0.05)
+        time.sleep(0.4)
+        await asyncio.sleep(0.3)
+        collector._is_running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(one_stall())
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+    assert asked, "the stall record never asked about the socket"
+    assert collector._stats.stalls[-1].reconnected is True
+
+
+def test_a_reconnect_only_counts_for_the_window_it_happened_in() -> None:
+    """
+    Otherwise every stall for the rest of the session blames one reconnect.
+
+    A cause that is always true says nothing, which is the failure mode of every
+    attribution that is not bounded by its own window.
+    """
+    collector = build_collector()
+    try:
+        collector._last_reconnect_monotonic = time.monotonic()
+        window_start = time.monotonic() + 1.0
+
+        assert collector._reconnected_between(window_start) is False, (
+            "a reconnect from before the window was counted inside it")
+        assert collector._reconnected_between(window_start - 5.0) is True
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+
+def test_the_worst_collection_records_what_was_live_at_the_time() -> None:
+    """
+    The measurement that decides between a smaller archive and a smaller buffer.
+
+    A single collection took 882 ms on production while every open file had been
+    growing since midnight. Whether the pause TRACKS that number or merely
+    happened near it is the whole question - and a running total cannot answer
+    it, because it does not say what was live when the worst one hit.
+    """
+    stats = CollectorStats()
+    stats.record_tick("BTCUSD", 1.0, 1.1, 0.1, 1.0)
+    stats.symbols["BTCUSD"].current_file_ticks = 31000
+    stats.record_tick("ETHUSD", 1.0, 1.1, 0.1, 1.0)
+    stats.symbols["ETHUSD"].current_file_ticks = 12000
+
+    stats.record_gc_pause(1, 882.2)
+
+    assert stats.gc.live_ticks_at_max == 43000
+
+    # A smaller pause must not overwrite the reading that belongs to the worst.
+    stats.symbols["BTCUSD"].current_file_ticks = 1
+    stats.record_gc_pause(1, 5.0)
+
+    assert stats.gc.live_ticks_at_max == 43000, (
+        "a later, shorter collection replaced the pairing that mattered")

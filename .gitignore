@@ -77,6 +77,11 @@ Thumbs.db
 INTERNAL_*.md
 ISSUE_*.md
 HANDOFF_*.md
+# Drafts of bus messages, named for the peer they are addressed to:
+# BUS_IDE_*, BUS_RAG_*, BUS_VIEWER_*. The prefix is the point - a file in the
+# project root that is addressed to somebody else should say so at a glance,
+# so it is never mistaken for a note to ourselves and never sent by accident.
+BUS_*.md
 
 
 # GitHub issues export (local reference only)

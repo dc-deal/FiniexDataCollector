@@ -198,10 +198,23 @@ class MonitoringConfig(BaseModel):
         disk_space_check_interval_seconds: Disk space check interval
         folder_scan_interval_seconds: Folder file count scan interval
         reconnect_alert_cooldown_minutes: Minutes to wait before next reconnect alert
+        reconnect_alert_min_seconds: Below this, a reconnect is logged and not
+            alerted. Measured 2026-09-21/22: seven reconnects in fifteen hours,
+            each 1.3 to 7.2 s, costing about 22 ticks in total and not appearing
+            among the eight longest gaps in the file they fell into - six phone
+            alerts for something invisible in the data. The default is the lag
+            window that costs a whole file, which is the point where an outage
+            stops being cosmetic.
+        reconnect_alert_cluster: How many reconnects inside one hour are worth
+            an alert whatever their length. A host that blips every two hours is
+            weather; one that blips four times an hour is degrading, and that
+            distinction is the only thing a short reconnect can still tell you.
     """
     disk_space_check_interval_seconds: int = Field(default=60, ge=10, le=600)
     folder_scan_interval_seconds: int = Field(default=60, ge=10, le=600)
     reconnect_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
+    reconnect_alert_min_seconds: float = Field(default=30.0, ge=0.0, le=3600.0)
+    reconnect_alert_cluster: int = Field(default=4, ge=2, le=100)
 
 
 class AppConfig(BaseModel):

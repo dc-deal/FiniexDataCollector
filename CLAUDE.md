@@ -443,6 +443,14 @@ with it, because the bus has no locking and no read receipts:
 - **Name your session in the first line of every message**: `[chat: <first 8 of the session
   id> · <what this chat is working on>]`, then a blank line, then the message.
 
+**A draft bus message is named for the peer it is addressed to**: `BUS_IDE_*.md`,
+`BUS_RAG_*.md`, `BUS_VIEWER_*.md` in the project root, gitignored through `BUS_*.md`. The prefix
+carries the audience, which `HANDOFF_*` and `INTERNAL_*` do not: those are notes to our own next
+session, and a file that will leave the building must not look like one that will not. It also
+makes "what is waiting to be sent" a directory listing instead of something somebody remembers.
+The same rules apply as to any other private draft - English, no credentials, and **the operator
+sends it, never the assistant**.
+
 **Never name a commit hash before it is on the remote.** A local hash is invisible to the
 recipient and can be rewritten under them by an amend — which is exactly what happened to the
 1.6.0 announcement. Announce the version, and send the hash when it is pushed.

@@ -80,6 +80,49 @@ def is_reconnect(old_status: str, new_status: str) -> bool:
     return new_status == "connected" and old_status in RECONNECT_FROM
 
 
+def reconnect_alert_text(duration_seconds: float, recent_within_hour: int,
+                         min_seconds: float, cluster_size: int) -> Optional[str]:
+    """
+    Decide whether a restored connection is worth a phone alert, and say what.
+
+    Measured over the night of 2026-09-21: seven reconnects, each between 1.3
+    and 7.2 s, adding up to 19.9 s of downtime in fifteen hours. That is about
+    22 ticks, and none of the seven appeared among the eight longest gaps in the
+    file they fell into - those were all quiet market. Six alerts arrived on the
+    operator's phone for something that cannot be found in the data afterwards.
+
+    An alert nobody can act on is not free: it trains its reader to swipe, and
+    the next one that mattered is swiped with it. So a short, self-healed
+    reconnect stays in the log and on `/v1/status`, where it is already
+    complete, and two things still reach the phone:
+
+    - **A long outage**, because past the consumer's lag window a whole file is
+      refused rather than shortened.
+    - **A cluster**, because a host that blips every two hours is weather and one
+      that blips four times an hour is degrading - and that difference is the
+      only thing a short reconnect can still tell anybody.
+
+    Args:
+        duration_seconds: How long the connection was gone
+        recent_within_hour: Reconnects in the last hour, this one included
+        min_seconds: Outage length that is worth an alert on its own
+        cluster_size: Reconnects per hour that are worth one regardless
+
+    Returns:
+        The message body, or None when this one belongs in the log alone
+    """
+    if duration_seconds >= min_seconds:
+        return (f"WebSocket reconnected after {duration_seconds:.1f}s down - "
+                f"past the {min_seconds:.0f}s mark where a file is at risk")
+
+    if recent_within_hour >= cluster_size:
+        return (f"{recent_within_hour} reconnects in the last hour, the latest "
+                f"after {duration_seconds:.1f}s. Short ones are normal on this "
+                f"host; this many in an hour is not")
+
+    return None
+
+
 def validate_symbols(symbols: List[str]) -> None:
     """
     Validate symbols list for duplicates.
@@ -278,6 +321,7 @@ class FiniexDataCollector:
         self._clock: Optional[CollectionClock] = None
         self._telegram: Optional[TelegramAlertProvider] = None
         self._instance_lock: Optional[InstanceLock] = None
+        self._last_reconnect_monotonic: Optional[float] = None
         self._origin: Optional[OriginBlock] = None
         self._show_display = show_display
         self._api_server = None
@@ -630,6 +674,13 @@ class FiniexDataCollector:
         """
         while self._is_running:
             asked_at = time.monotonic()
+
+            # Read before the wait, subtract after: the difference is what the
+            # tick handler cost inside THIS window and nothing else. A rate held
+            # anywhere else would describe a window somebody else chose.
+            work_before = self._stats.tick_work.total_ms
+            ticks_before = self._stats.tick_work.ticks
+
             await asyncio.sleep(LOOP_LAG_INTERVAL_SECONDS)
             lateness = time.monotonic() - asked_at - LOOP_LAG_INTERVAL_SECONDS
             lateness_ms = lateness * 1000
@@ -638,7 +689,8 @@ class FiniexDataCollector:
             # A stall worth explaining is asked what else happened in its own
             # window, rather than attributed afterwards from reasoning. The
             # first such attribution was wrong: the folder scan was blamed and
-            # then measured at 15 ms.
+            # then measured at 15 ms. The second left ten stalls saying
+            # `unknown` because nothing was measuring the tick handler.
             if lateness_ms >= STALL_ATTRIBUTION_MS:
                 gc_ms, generation = self._gc_watcher.time_spent_since(asked_at)
                 self._stats.record_stall(
@@ -646,7 +698,29 @@ class FiniexDataCollector:
                     gc_ms=gc_ms,
                     gc_generation=generation,
                     render_ms=self._stats.scans.render_last_ms,
-                    exports_in_flight=self._stats.exports.in_flight)
+                    exports_in_flight=self._stats.exports.in_flight,
+                    tick_ms=self._stats.tick_work.total_ms - work_before,
+                    ticks=self._stats.tick_work.ticks - ticks_before,
+                    reconnected=self._reconnected_between(asked_at))
+
+    def _reconnected_between(self, since: float) -> bool:
+        """
+        Whether the socket came back inside the window that just ended.
+
+        Compared on the MONOTONIC clock, not the wall clock. The reconnect
+        events carry wall-clock stamps because a human reads them; correlating
+        a stall against those would mean subtracting two readings that a clock
+        correction can sit between, which this project treats as a defect rather
+        than a style question.
+
+        Args:
+            since: The monotonic reading the window started at
+
+        Returns:
+            True when a reconnect completed inside it
+        """
+        last = self._last_reconnect_monotonic
+        return last is not None and last >= since
 
     async def _monitor_disk_space(self) -> None:
         """Monitor disk space usage."""
@@ -1022,6 +1096,11 @@ class FiniexDataCollector:
 
         # Track reconnects
         if is_reconnect(old_status, status):
+            # Stamped on the monotonic clock, for the stall attribution. The
+            # event list below carries the wall-clock time a human reads; a
+            # duration must never come from subtracting two of those.
+            self._last_reconnect_monotonic = time.monotonic()
+
             if self._disconnect_time:
                 duration = (datetime.now(timezone.utc) -
                             self._disconnect_time).total_seconds()
@@ -1044,6 +1123,24 @@ class FiniexDataCollector:
                     f"[RECONNECT] Connected but no disconnect_time tracked "
                     f"(old_status={old_status}) - possible initial connection"
                 )
+
+    def _reconnects_within_the_hour(self, now: datetime) -> int:
+        """
+        How many reconnects have happened in the last hour, this one included.
+
+        Read off the event list the statistics already keep, so there is no
+        second counter to drift from it - the drift between two counters for one
+        number is a defect this project has already paid for once.
+
+        Args:
+            now: The moment being judged
+
+        Returns:
+            Count of reconnect events within the last hour
+        """
+        cutoff = now - timedelta(hours=1)
+        return sum(1 for event in self._stats.reconnect_events
+                   if event.timestamp >= cutoff)
 
     async def _send_reconnect_alert(self, duration_seconds: float) -> None:
         """
@@ -1073,17 +1170,25 @@ class FiniexDataCollector:
                 )
                 return  # Still in cooldown
 
-        # Send alert
-        duration_minutes = int(duration_seconds / 60)
+        # Whole minutes rendered every one of these as "0m downtime", including
+        # a 7.2 s outage that was three times the others - a number that told
+        # the reader nothing it did not already assume.
+        recent = self._reconnects_within_the_hour(now)
+        body = reconnect_alert_text(
+            duration_seconds,
+            recent_within_hour=recent,
+            min_seconds=self._config.monitoring.reconnect_alert_min_seconds,
+            cluster_size=self._config.monitoring.reconnect_alert_cluster)
 
-        self._logger.debug(
-            f"[RECONNECT_ALERT] Sending alert: duration={duration_minutes}m"
-        )
+        if body is None:
+            self._logger.info(
+                f"Reconnected after {duration_seconds:.1f}s - below the alert "
+                f"threshold, {recent} in the last hour. On /v1/status either way.")
+            return
 
-        await self._telegram.send_warning(
-            "🔌 Connection Restored",
-            f"WebSocket reconnected after {duration_minutes}m downtime"
-        )
+        self._logger.debug(f"[RECONNECT_ALERT] Sending alert: {body}")
+
+        await self._telegram.send_warning("🔌 Connection Restored", body)
 
         self._last_reconnect_alert = now
 
@@ -1111,7 +1216,30 @@ class FiniexDataCollector:
 
     def _on_tick_received(self, tick) -> None:
         """
-        Handle incoming tick from collector.
+        Handle incoming tick, and measure what handling it costs the loop.
+
+        The timing exists because of Befund 28: on 2026-09-21 the loop stalled
+        up to 738 ms with the display off, no export running and garbage
+        collection accounting for under a tenth of it. Everything the stall
+        attribution could name had been ruled out, which left a consumer nobody
+        was measuring - and this handler, running nine symbols with a flushed
+        write-ahead append per tick, is the largest candidate left.
+
+        Naming it required measuring it. Two `time.monotonic()` reads per tick
+        cost a fraction of the 66 microseconds the handler already spends.
+
+        Args:
+            tick: TickData instance
+        """
+        started = time.monotonic()
+        try:
+            self._handle_tick(tick)
+        finally:
+            self._stats.record_tick_work((time.monotonic() - started) * 1000)
+
+    def _handle_tick(self, tick) -> None:
+        """
+        Everything that happens to one arriving tick.
 
         Args:
             tick: TickData instance

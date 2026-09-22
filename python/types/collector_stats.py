@@ -249,6 +249,32 @@ class GcPauses:
     last_generation: int = -1
     total_ms: float = 0.0
 
+    # How many ticks were sitting in the open files when the worst pause
+    # happened. The collector holds every tick of an open file in memory AND in
+    # its write-ahead log, so a collection walks all of them - and whether the
+    # pause tracks that number is the question that decides between a smaller
+    # archive boundary and dropping the in-memory copy. One number, recorded at
+    # the moment it matters, answers it in a night.
+    live_ticks_at_max: int = 0
+
+
+@dataclass
+class TickWork:
+    """
+    How much of the loop's time the tick handler itself has consumed.
+
+    A running total rather than a rate, because the reader is the stall
+    attribution: it takes a snapshot before waiting and another after, and the
+    difference is what the handler cost inside that one window. A rate computed
+    here would have to guess the window somebody else is measuring.
+
+    Attributes:
+        ticks: Ticks handled since the session started
+        total_ms: Milliseconds spent inside the handler, cumulative
+    """
+    ticks: int = 0
+    total_ms: float = 0.0
+
 
 @dataclass
 class StallEvent:
@@ -277,6 +303,20 @@ class StallEvent:
     render_ms: float
     exports_in_flight: int
     cause: str
+
+    # Defaulted rather than required, and that is a decision rather than a
+    # convenience: a viewer runs against whatever build the box happens to
+    # carry, and a required field missing from an older payload would make the
+    # reading unreadable as a whole. A stall from before this existed reports
+    # zero work measured, which is true - nobody measured it.
+    tick_ms: float = 0.0
+    ticks: int = 0
+
+    # Presence, not duration - a reconnect either happened inside this window or
+    # it did not. Measured 2026-09-22: the reconnect at 02:43:50 produced two
+    # stalls, 252 ms and 271 ms, and both said `unknown` because nothing
+    # connected the socket to the loop that noticed.
+    reconnected: bool = False
 
 
 @dataclass
@@ -403,6 +443,7 @@ class CollectorStats:
         self.counter_check: CounterCheck = CounterCheck()
         self.scans: ScanTimings = ScanTimings()
         self.gc: GcPauses = GcPauses()
+        self.tick_work: TickWork = TickWork()
         self.stalls: List[StallEvent] = []
 
         # What a screen needs and the statistics did not carry: which streams
@@ -610,8 +651,13 @@ class CollectorStats:
 
         if 0 <= generation < len(self.gc.collections):
             self.gc.collections[generation] += 1
-            self.gc.max_ms[generation] = max(
-                self.gc.max_ms[generation], round(duration_ms, 1))
+            if duration_ms > self.gc.max_ms[generation]:
+                self.gc.max_ms[generation] = round(duration_ms, 1)
+                # Only on a new worst: the question is whether the pause tracks
+                # the buffer, and one paired reading answers that where a total
+                # cannot. Nine entries to add up, a few hundred times a day.
+                self.gc.live_ticks_at_max = sum(
+                    entry.current_file_ticks for entry in self.symbols.values())
 
     def record_render(self, duration_ms: float) -> None:
         """
@@ -624,9 +670,23 @@ class CollectorStats:
         self.scans.render_max_ms = max(
             self.scans.render_max_ms, round(duration_ms, 1))
 
+    def record_tick_work(self, duration_ms: float) -> None:
+        """
+        Add what handling one tick cost.
+
+        Called for every tick, so it does two additions and nothing else. Any
+        derived figure is computed by whoever reads it over a window they chose.
+
+        Args:
+            duration_ms: Milliseconds spent inside the tick handler
+        """
+        self.tick_work.ticks += 1
+        self.tick_work.total_ms += duration_ms
+
     def record_stall(self, duration_ms: float, gc_ms: float,
                      gc_generation: int, render_ms: float,
-                     exports_in_flight: int) -> None:
+                     exports_in_flight: int, tick_ms: float = 0.0,
+                     ticks: int = 0, reconnected: bool = False) -> None:
         """
         Record a moment the event loop stood still, with what explains it.
 
@@ -640,15 +700,28 @@ class CollectorStats:
             gc_generation: Highest generation collected, -1 for none
             render_ms: The display's most recent redraw
             exports_in_flight: Archive writers running at that moment
+            tick_ms: Time the tick handler spent inside this window
+            ticks: Ticks it handled in that time
+            reconnected: Whether the socket was re-established inside it
         """
         half = duration_ms / 2
 
+        # Measured arms first, in order of how specific they are. They overlap
+        # on purpose: a collection triggered by an allocation inside the tick
+        # handler counts in both, and naming garbage collection is the more
+        # useful answer of the two. `exports_in_flight` comes last because it is
+        # a presence check rather than a duration - the weakest evidence here,
+        # and it must never outrank something that was actually timed.
         if gc_ms >= half:
             cause = f"garbage collection, generation {gc_generation}"
         elif render_ms >= half:
             cause = "the live display"
+        elif tick_ms >= half:
+            cause = f"handling {ticks} ticks"
         elif exports_in_flight:
             cause = "an archive export was handed over"
+        elif reconnected:
+            cause = "the websocket reconnected"
         else:
             cause = "unknown"
 
@@ -659,7 +732,10 @@ class CollectorStats:
             gc_generation=gc_generation,
             render_ms=round(render_ms, 1),
             exports_in_flight=exports_in_flight,
-            cause=cause))
+            cause=cause,
+            tick_ms=round(tick_ms, 1),
+            ticks=ticks,
+            reconnected=reconnected))
 
         if len(self.stalls) > self.max_stalls:
             self.stalls = self.stalls[-self.max_stalls:]

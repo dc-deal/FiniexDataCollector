@@ -39,7 +39,8 @@ Starting a second one against the same `raw_data_dir` is **refused**, and the re
 first thing that happens — before Telegram, before the scheduler, before the status port. The
 message names the pid that holds it:
 
-    Another collector is already writing to dataaw (pid 4892).
+    Another collector is already writing to data
+aw (pid 4892).
 
 This is not about duplicate work. Startup recovery cannot tell a crashed run's write-ahead log
 from a running instance's: on Windows removing a live log fails and aborts the start, and on
@@ -57,6 +58,29 @@ third start took over and recovered the log the kill left behind.
 | 0 | stopped cleanly | nothing |
 | 1 | crashed | restart |
 | 2 | bad configuration, or the directory is taken | **stay stopped** — a retry produces the same failure |
+
+## What reaches the phone, and what does not
+
+Telegram carries the things somebody would act on, and deliberately not the rest.
+
+**A reconnect is normally silent.** Measured over the night of 2026-09-21: seven of them, each
+1.3 to 7.2 s, 19.9 s in total — about 22 ticks, and not one appeared among the eight longest gaps
+in the file it fell into, which were all quiet market. This host loses outbound connectivity
+several times a day; FiniexRAGEngine measured that from five sides, and nothing on our side
+prevents it. Six alerts for an event invisible in the data trains the reader to swipe, and the
+next one that mattered is swiped with it.
+
+Two still arrive:
+
+| | Why |
+|---|---|
+| downtime past `reconnect_alert_min_seconds` (30 s) | past the consumer's lag window a whole file is refused, not shortened |
+| `reconnect_alert_cluster` (4) inside one hour | blips every two hours are weather; four in an hour is a machine degrading |
+
+Both carry the real length in seconds. Whole minutes rendered every reconnect that night as
+"0m downtime", including the 7.22 s one that was three times the others.
+
+Everything else stays in the log and on `/v1/status`, where `reconnect_events` is complete.
 
 ## Stopping
 

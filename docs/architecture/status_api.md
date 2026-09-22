@@ -173,7 +173,17 @@ field a freshly built object leaves empty, and a test names it rather than a scr
 250 ms is written down with what was measured in its own window: how much of it was garbage
 collection and of which generation, how long the display's last redraw took, and how many archive
 writers were starting. The cause is stated only when one of those accounts for at least half of
-it — otherwise the entry says `unknown`, because an attribution made from reasoning rather than
+it — including, since 2026-09-21, what the tick handler itself cost inside that window and how
+many ticks it handled. That arm was added because ten production stalls said `unknown` with the
+display off, no export running and garbage collection accounting for under a tenth of them: every
+candidate the record could name had been ruled out, which left a consumer nobody was measuring.
+`tick_work` carries the running total those windows are differenced from.
+
+The arms are checked most-specific first and they overlap on purpose — a collection triggered by
+an allocation inside the handler counts in both, and naming the collection is the more useful of
+the two answers. `exports_in_flight` is checked last because it is a presence count rather than a
+duration, and the weakest evidence must never outrank something that was timed. Otherwise the entry
+says `unknown`, because an attribution made from reasoning rather than
 measurement was wrong once already: the folder scan was blamed for 4.3 s stalls and then measured
 at 15 ms. `gc` carries the collections and worst pause per generation; the collector holds every
 tick of an open file in memory, which is what a generation-2 walk has to traverse.
