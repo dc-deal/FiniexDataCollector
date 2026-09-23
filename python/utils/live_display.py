@@ -196,6 +196,12 @@ class LiveDisplay:
         half a minute old is read as current by anyone glancing at it, so the part
         that changes has to be the part nobody can miss.
 
+        Which is why the first second must NOT be red. A viewer that has just
+        started has asked nothing and been told nothing, and painting that as an
+        outage spends the one signal the screen has on a state that resolves
+        itself - after which a red frame is something the eye has learned to wait
+        out.
+
         Returns:
             (title markup, border style)
         """
@@ -205,6 +211,11 @@ class LiveDisplay:
         if self._feed.connected:
             return (f"[bold cyan]📡 FiniexDataCollector[/bold cyan] "
                     f"[dim]← {self._feed.source}[/dim]", "cyan")
+
+        if self._feed.awaiting_first_answer:
+            waited = self._format_age(self._feed.waiting_seconds)
+            return (f"[bold yellow]⏳ waiting for the first answer[/bold yellow] "
+                    f"[dim]← {self._feed.source} ({waited})[/dim]", "yellow")
 
         age = self._feed.age_seconds
         since = ("never answered" if self._feed.last_success is None else
@@ -298,6 +309,16 @@ class LiveDisplay:
         """
         if self._feed is None:
             return ""
+
+        if self._feed.awaiting_first_answer:
+            # Not "the numbers below are not current": there are no numbers
+            # below, only the defaults of an empty statistics object. And not a
+            # reason either - `last_error` is None here, which printed the word
+            # "unknown" and read as a failure nobody could diagnose.
+            return (f"[yellow]⏳ no reading yet - first request in flight"
+                    f"[/yellow] │ "
+                    f"[dim]{escape(self._feed.source)}, "
+                    f"every {self._feed.interval_seconds:.0f}s[/dim]")
 
         if not self._feed.connected:
             reason = self._feed.last_error or "unknown"

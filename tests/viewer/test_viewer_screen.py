@@ -89,16 +89,62 @@ def test_a_silent_collector_is_unmistakable_and_dated() -> None:
 
 def test_a_collector_that_never_answered_does_not_claim_an_outage_time() -> None:
     """
-    Nothing has been read, so there is no "since" to state.
+    An attempt has failed and none ever succeeded, so there is no "since".
 
-    The first seconds after the viewer starts are exactly this state, and a
-    fabricated timestamp there would be the same invention the output contract
-    forbids.
+    A fabricated timestamp here would be the same invention the output contract
+    forbids. Note what this test now sets up: a FAILURE. It used to pass a
+    freshly built feed and describe it as "the first seconds after the viewer
+    starts", which blurred the two states the next two tests separate.
     """
-    screen = drawn(LiveDisplay(CollectorStats(), feed=a_feed()))
+    feed = a_feed()
+    feed.record_failure("unreachable: connection refused")
+
+    screen = drawn(LiveDisplay(CollectorStats(), feed=feed))
 
     assert "never answered" in screen
     assert "no answer since" not in screen
+
+
+def test_a_viewer_that_has_just_started_is_not_drawn_as_an_outage() -> None:
+    """
+    Nothing asked, nothing answered - which is not the same as no answer.
+
+    Seen on the operator's first run against production: for the second before
+    the first reading the frame went fully red and said "the numbers below are
+    not current | unknown". Both halves were untrue. There were no numbers below
+    - the table said "Waiting..." - and there was no failure, so the reason
+    printed was the word standing in for a `last_error` of None.
+
+    It lasted a second there. It lasts the whole request timeout against a host
+    that swallows packets instead of refusing them, and a red frame that is
+    routinely wrong is a red frame nobody reads.
+    """
+    screen = drawn(LiveDisplay(CollectorStats(), feed=a_feed()))
+
+    assert "waiting for the first answer" in screen
+    assert "no reading yet" in screen
+    assert "not current" not in screen
+    assert "never answered" not in screen
+
+
+def test_the_grace_ends_at_the_first_attempt_not_the_first_success() -> None:
+    """
+    A collector that is simply not running must go red at once.
+
+    The startup state is bounded by the first COMPLETED attempt either way. Were
+    it bounded by the first successful one, an unreachable collector would be
+    drawn as "still connecting" for as long as the viewer is left open - which is
+    the original defect with the colours swapped.
+    """
+    feed = a_feed()
+    feed.record_failure("unreachable: connection refused")
+
+    screen = drawn(LiveDisplay(CollectorStats(), feed=feed))
+
+    assert "waiting for the first answer" not in screen
+    assert "no reading yet" not in screen
+    assert "not current" in screen
+    assert "connection refused" in screen
 
 
 def test_a_connected_screen_names_the_machine_it_is_drawing() -> None:

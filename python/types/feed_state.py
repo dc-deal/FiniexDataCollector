@@ -16,7 +16,7 @@ frozen.
 Location: python/types/feed_state.py
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -40,6 +40,8 @@ class FeedState:
         readings: Successful readings this session
         failures: Consecutive failed attempts, reset by any success
         skew_seconds: Viewer clock minus collector clock, None until measured
+        started_at: When this viewer began, so the wait for the first answer can
+            be shown as a duration rather than as a silence
     """
     source: str
     interval_seconds: float
@@ -49,6 +51,8 @@ class FeedState:
     readings: int = 0
     failures: int = 0
     skew_seconds: Optional[float] = None
+    started_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc))
 
     def record_reading(self, skew_seconds: Optional[float] = None) -> None:
         """
@@ -90,6 +94,38 @@ class FeedState:
         if self.last_success is None:
             return None
         return (datetime.now(timezone.utc) - self.last_success).total_seconds()
+
+    @property
+    def awaiting_first_answer(self) -> bool:
+        """
+        Whether the viewer has started and nothing has come back yet.
+
+        Starting up and having lost contact look identical in `connected`, and
+        they are not the same thing: one resolves itself in a second, the other
+        wants somebody to look. Saying the second while the first is true is the
+        screen asserting what it does not know - the defect this project refuses
+        in its files. An attempt that FAILED is not this state: a failure is an
+        answer about the collector, and it belongs on a red frame.
+
+        Returns:
+            True while no attempt has completed, either way
+        """
+        return self.readings == 0 and self.failures == 0
+
+    @property
+    def waiting_seconds(self) -> float:
+        """
+        How long the first answer has been outstanding.
+
+        A refused connection reports in about two seconds, but a host that
+        swallows the packets takes the whole request timeout - and without a
+        number moving, a viewer waiting on one is indistinguishable from a
+        viewer that has hung.
+
+        Returns:
+            Seconds since this viewer started
+        """
+        return (datetime.now(timezone.utc) - self.started_at).total_seconds()
 
     @property
     def clock_disagrees(self) -> bool:

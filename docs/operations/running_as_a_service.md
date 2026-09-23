@@ -8,10 +8,15 @@ under NSSM, or as a systemd unit on Linux.
 [running the collector](running_the_collector.md)), or watching one that is already running (see
 [watching a collector](watching_a_collector.md)).
 
-**Status: written, not yet installed.** Everything below except the reboot itself has been
-measured; the numbers are named where they matter. A service definition is only proven by an
-actual reboot, and that has not happened. Treat the last section as the acceptance test rather
-than a formality.
+**Status: installed on the production box 2026-09-23, reboot not yet done.** Everything below
+except the reboot has been measured, and the numbers are named where they matter. Steps 1 to 3 of
+the acceptance test passed on installation day: the service starts, `/v1/build` answers with a
+real commit rather than `null`, and the narrow token reaches `/v1/status` and is refused **403**
+on `/v1/archive`, `/v1/logs` and `/v1/configs`.
+
+**The autostart is already armed**, which is worth separating from the test: a host reset before
+the scheduled reboot brings the collector back by itself. Step 4 verifies that rather than
+enabling it.
 
 ## Why, in two outages
 
@@ -44,7 +49,8 @@ $python  = "$root\.venv\Scripts\python.exe"
 & $nssm set FiniexDataCollector DisplayName   'FiniexDataCollector'
 & $nssm set FiniexDataCollector Description   'Kraken tick collection'
 & $nssm set FiniexDataCollector Start         SERVICE_DELAYED_AUTO_START
-& $nssm set FiniexDataCollector ObjectName    '.\Administrator' '<password>'
+# NOT in this block, and not from the command line at all - see below.
+# & $nssm set FiniexDataCollector ObjectName '.\Administrator' '<password>'
 & $nssm set FiniexDataCollector AppEnvironmentExtra 'PYTHONUTF8=1'
 ```
 
@@ -119,8 +125,43 @@ on this box on 2026-09-21: one display frame cost up to 3.9 s on the collector's
 and 21 stalls over 500 ms in eight minutes became zero with it off. Watch it with
 `python -m python.main watch` instead, from anywhere.
 
+## The account, and why it is not in the block above
+
 **`ObjectName` must be `.\Administrator`**: the virtualenv and the MT5 export directory live in
 that profile, and `LocalSystem` cannot see either.
+
+**Set it through NSSM's own dialog, not on the command line:**
+
+```powershell
+C:
+ssm
+ssm.exe edit FiniexDataCollector
+```
+
+Tab **Log on** → `.\Administrator` and the real password in the masked field → **Edit service**.
+
+Two reasons, and the first one cost an outage on 2026-09-23. **NSSM does not validate the
+password** - it stores whatever it is given and reports `Set parameter "ObjectName"`, so a
+placeholder pasted out of a document is accepted silently. Windows validates it at start, and
+answers `Cannot start service ... on computer '.'` with nothing else. The service looks broken
+and the credential is the only thing wrong. Whatever else happens, **never paste a line
+containing a placeholder password** - a value NSSM accepts and Windows rejects is the worst of
+both.
+
+The second reason is that PowerShell writes every command line to
+`$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt`, in plain text,
+and that file outlives the session.
+
+When a service will not start, the reason is in the event log rather than in the console:
+
+```powershell
+Get-EventLog -LogName System -Newest 20 |
+  Where-Object { $_.Message -like "*FiniexDataCollector*" } |
+  Format-List TimeGenerated, EntryType, EventID, Message
+```
+
+Event **7000** with "due to a logon failure", or **1069**, is the credential. A path or an access
+denial is something else, and the distinction is one query rather than a guess.
 
 ## Linux, under systemd
 
@@ -216,12 +257,18 @@ over, so a service can always start after an unclean stop.
 
 A service definition is proven by a reboot and by nothing else. In order:
 
-1. `Start-Service` / `systemctl start`, then `/v1/build` answers with the expected commit.
+1. **[passed 2026-09-23]** `Start-Service` / `systemctl start`, then `/v1/build` answers with
+   the expected commit.
    **`"commit": null` is the failure to look for**, not an error page: it means git refused the
    repository to the service account, and the route said nothing about it.
 2. Stop it. The log ends with `Shutdown complete`, and `data/raw/kraken/*.jsonl.part` is empty.
 3. Start it again, and start a console instance too. The console one must refuse with exit 2 and
    the service must be undisturbed.
+
+   Also, and this is the one that was nearly missed: **call every gated route with the narrow
+   token.** `/v1/status` must answer 200 and `/v1/archive`, `/v1/logs` and `/v1/configs` must
+   answer **403**. A grant is only narrow if something refuses; a token that is merely *named*
+   narrow reads identically until the day it does not. Passed 2026-09-23.
 4. **Reboot the machine.** The collector must be collecting before anyone logs in — check
    `/v1/build` for a `started_at` within a minute or two of boot, without opening a session.
 5. Leave it through one UTC day cut. Nine files close at once there, and the archive index should

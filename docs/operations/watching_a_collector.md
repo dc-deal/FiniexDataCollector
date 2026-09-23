@@ -93,9 +93,13 @@ Ctrl+C stops it. Killing it at any moment costs nothing — it holds no state.
 Everything on the screen was measured on another machine, so the viewer states its own condition
 as well as the collector's:
 
+- **The first seconds are yellow, not red** — `⏳ waiting for the first answer`, with how long the
+  request has been outstanding. A viewer that has just started has asked nothing and been told
+  nothing, which is not an outage. The yellow ends at the first *completed* attempt, either way:
+  an unreachable collector goes red immediately rather than sitting in `connecting` forever.
 - **The frame turns red** the moment a reading fails, with the clock time of the last successful
-  one and how long ago that was — `⛔ no answer since 11:56:12 UTC (2m 17s ago)`. Before any
-  reading has arrived it says `never answered` rather than inventing a time.
+  one and how long ago that was — `⛔ no answer since 11:56:12 UTC (2m 17s ago)`. When an attempt
+  has failed but none ever succeeded it says `never answered` rather than inventing a time.
 - **The reason is a sentence, not a code**, because the common failures send you to different
   places:
 
