@@ -126,3 +126,67 @@ def test_file_logging_is_not_debug_by_default() -> None:
     days, of which 99.96 % were DEBUG lines nothing reads afterwards.
     """
     assert tracked_config()["logging"]["file_level"] != "DEBUG"
+
+
+# =============================================================================
+# THE EXAMPLE FILES A NEW MACHINE IS SET UP FROM (Befund 32)
+# =============================================================================
+
+EXAMPLE_CONFIGS = sorted(Path("user_configs").glob("*.example.json"))
+
+
+def test_every_example_configuration_actually_parses() -> None:
+    """
+    An example nobody can copy is worse than no example.
+
+    Found 2026-09-23 while setting up a token on the production box:
+    `app_config.example.json` was truncated mid-file, ending after `monitoring`
+    with no closing brace. It had been tracked in that state, so anyone copying
+    it got a configuration the collector refuses to load - and the refusal
+    points at their copy rather than at the source.
+    """
+    assert EXAMPLE_CONFIGS, "no example configuration is tracked at all"
+
+    for path in EXAMPLE_CONFIGS:
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise AssertionError(f"{path} is not valid JSON: {error}") from error
+
+
+def test_no_configuration_file_is_named_with_stray_whitespace() -> None:
+    """
+    The same file was tracked as " app_config.example.json" - leading space.
+
+    `cp user_configs/app_config.example.json ...` then reports that the file does
+    not exist, which sends the reader looking for a missing file rather than a
+    misnamed one. Tab completion hides it, and git carries it happily.
+    """
+    for path in sorted(Path("user_configs").iterdir()):
+        assert path.name == path.name.strip(), (
+            f"{path.name!r} begins or ends with whitespace")
+
+
+def test_the_example_shows_how_a_consumer_is_granted_access() -> None:
+    """
+    The section that was missing on the day it was needed.
+
+    `api.tokens` is the only part of the configuration a new machine cannot
+    guess: a consumer name, a credential and the grants beside it. Without it in
+    the example, setting up the status shell means asking somebody - which is
+    exactly what happened on 2026-09-23.
+
+    The narrow entry is the one that has to be demonstrated. An example whose
+    only consumer holds every grant teaches the opposite of one token per
+    consumer.
+    """
+    example = json.loads(
+        Path("user_configs/app_config.example.json").read_text(encoding="utf-8"))
+    tokens = example.get("api", {}).get("tokens", {})
+
+    assert tokens, "the example shows no consumer at all"
+    narrow = [name for name, entry in tokens.items()
+              if entry.get("grants") == ["status:detail"]]
+    assert narrow, (
+        "no example consumer carries status:detail alone - the shape the status "
+        "shell needs is the one a reader has to be able to copy")

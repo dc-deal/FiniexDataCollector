@@ -1,0 +1,60 @@
+{
+  "_comment": "User configuration overrides - copy to user_configs/app_config.json (gitignored) and keep only what you change. The tracked baseline is configs/app_config.json, with every credential blank and disabled; this file is merged over it key by key.",
+  "_rules": "A live credential belongs here and never in the tracked baseline. Everything below is a placeholder.",
+
+  "kraken": {
+    "symbols": [
+      "BTC/USD",
+      "ETH/USD",
+      "SOL/USD"
+    ],
+    "max_ticks_per_file": 50000
+  },
+
+  "telegram": {
+    "enabled": true,
+    "bot_token": "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz",
+    "chat_id": "123456789",
+    "send_on_error": true,
+    "send_on_rotation": false,
+    "send_weekly_report": true
+  },
+
+  "mt5": {
+    "enabled": true,
+    "raw_data_path": "C:\\Users\\YourUser\\AppData\\Roaming\\MetaQuotes\\Terminal\\HASH\\MQL5\\Files"
+  },
+
+  "monitoring": {
+    "disk_space_check_interval_seconds": 60,
+    "folder_scan_interval_seconds": 60,
+    "reconnect_alert_cooldown_minutes": 30,
+    "reconnect_alert_min_seconds": 30.0,
+    "reconnect_alert_cluster": 4
+  },
+
+  "api": {
+    "_comment": "One entry per consumer, so revoking one does not disturb the others. A 403 from a route means the grant is missing; a 401 means the token itself is unknown here.",
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8110,
+    "tokens": {
+      "collector_watch": {
+        "token": "<40 hex characters - docs/operations/watching_a_collector.md says how to generate one>",
+        "grants": ["status:detail"],
+        "note": "python -m python.main watch - the status shell. One route and nothing else: it sits open on a desk all day."
+      },
+      "operator": {
+        "token": "<40 hex characters, a different one>",
+        "grants": [
+          "status:detail",
+          "archive:index",
+          "files:*",
+          "config:effective",
+          "logs:collector"
+        ],
+        "note": "Diagnostics from a session - archive listings, log excerpts, file transfers."
+      }
+    }
+  }
+}

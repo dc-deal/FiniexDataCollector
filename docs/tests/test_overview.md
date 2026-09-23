@@ -142,6 +142,10 @@ Also: the tracked config carries no live credentials; the reconnect rule recogni
 connection coming back (it reported zero for 173 of them); the dead-connection threshold stays
 short; file logging is not DEBUG by default.
 
+Also the example files a new machine is set up from. Found 2026-09-23 while adding a token on the production box: `app_config.example.json` was tracked **with a leading space in its name** and **truncated mid-file**, so `cp user_configs/app_config.example.json ...` reported a missing file and copying it by hand produced a configuration the collector refuses. It also carried no `api.tokens` section - the one part of the configuration a reader cannot guess, and the part that was needed that day.
+
+Defends: every tracked example parses; no file in `user_configs/` is named with stray whitespace; and the example demonstrates a consumer holding `status:detail` **alone**, because an example whose only consumer holds every grant teaches the opposite of one token per consumer.
+
 ### `tests/utils/test_console_and_counting.py`
 
 Two defences against a display saying something untrue, and one of them can stop the collection.
