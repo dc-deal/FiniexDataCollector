@@ -561,6 +561,16 @@ Four semantics that would cost a wrong number rather than an error, stated by th
   is the activity measure that exists on both sides. `limit` above 10,000 is refused with
   `400 invalid_limit` rather than clamped.
 
+**On live telemetry they are further along than a reading of their type packages suggests**, and
+we said otherwise on the bus once. `python/framework/utils/live_frame_serialization_utils.py`
+holds a structural outbound encoder - `serialize_value(asdict(frame))`, no field list, datetimes
+and enums converted at the leaves - built for a viewer push transport that does not exist yet. It
+is only searchable outside `types/`, which is why a first look missed it. What they lack is the
+way back and a wire, not the encoder. And on the envelope: they already consume the `origin` block
+our tick files carry, resolved at import against their own registry, so the ARCHIVE direction is
+settled between us and only the STATUS direction is open. Verified here 2026-09-22 after they
+corrected us.
+
 **Assume it is down more often than up.** Unreachable means "ask the operator to start it",
 never a fault: no retry loop, no health check, and nothing in the collector process may depend
 on it — a producer that needs its consumer to be up has the dependency backwards.

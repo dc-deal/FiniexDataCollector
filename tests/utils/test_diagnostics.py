@@ -20,6 +20,10 @@ import gc
 import threading
 import time
 
+from pathlib import Path
+
+import pytest
+
 from python.main import FiniexDataCollector
 from python.utils.gc_watcher import GcWatcher
 from python.types.collector_stats import CollectorStats
@@ -549,3 +553,185 @@ def test_the_worst_collection_records_what_was_live_at_the_time() -> None:
 
     assert stats.gc.live_ticks_at_max == 43000, (
         "a later, shorter collection replaced the pairing that mattered")
+
+
+def test_work_in_a_thread_still_gets_named() -> None:
+    """
+    `asyncio.to_thread` moves the system calls off the loop, not the Python.
+
+    Nine stalls on 2026-09-23 measured 285-395 ms with no ticks in the window,
+    no collection, no export and no reconnect - against a folder scan whose
+    worst reading that day was 335 ms. The scan was "off the loop" and still the
+    best candidate, because walking the results holds the interpreter lock.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=0.0, gc_generation=-1, render_ms=0.0,
+                       exports_in_flight=0, offloop_ms=400.0,
+                       offloop_what="folder scan")
+
+    assert stats.stalls[-1].cause == "the folder scan"
+    assert stats.stalls[-1].offloop_ms == 400.0
+
+
+def test_only_off_loop_work_from_inside_the_window_counts() -> None:
+    """
+    A scan that finished before the window explains nothing inside it.
+
+    The same rule the tick counter and the reconnect already follow: an
+    attribution bounded by nothing is true forever and therefore says nothing.
+    """
+    collector = build_collector()
+    try:
+        collector._note_offloop("folder scan", 400.0)
+        window_start = time.monotonic() + 1.0
+
+        assert collector._offloop_in_window(window_start) == (0.0, "")
+        assert collector._offloop_in_window(window_start - 5.0) == (
+            400.0, "folder scan")
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+
+def test_the_longest_of_several_is_the_one_named() -> None:
+    """Two tasks can finish in one window, and only one can be the cause."""
+    collector = build_collector()
+    try:
+        collector._note_offloop("disk check", 20.0)
+        collector._note_offloop("folder scan", 330.0)
+
+        assert collector._offloop_in_window(time.monotonic() - 5.0) == (
+            330.0, "folder scan")
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+
+def test_the_stall_record_asks_about_work_in_threads(monkeypatch) -> None:
+    """
+    A measurement nobody reads at the call site explains nothing.
+
+    The guard lives where the stall is written, so the test drives that loop
+    rather than the recorder - the failure being defended against is the call
+    site quietly disappearing while the helper stays correct.
+    """
+    collector = build_collector()
+    asked = []
+    collector._offloop_in_window = lambda since: asked.append(
+        since) or (900.0, "folder scan")
+
+    async def one_stall() -> None:
+        collector._is_running = True
+        task = asyncio.create_task(collector._monitor_loop_lag())
+        await asyncio.sleep(0.05)
+        time.sleep(0.4)
+        await asyncio.sleep(0.3)
+        collector._is_running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(one_stall())
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+    assert asked, "the stall record never asked what ran in a thread"
+    assert collector._stats.stalls[-1].offloop_what == "folder scan"
+
+
+def test_starting_an_archive_writer_is_timed_apart_from_running_one() -> None:
+    """
+    `communicate()` awaits and yields; `create_subprocess_exec` does not.
+
+    At the UTC day cut nine or ten children go out inside one second, and that
+    cut cost 3397 ms of loop lag on 2026-09-23 against 856 ms the night before.
+    A total over the whole export cannot say whether the loop paid for the
+    spawning or the writing; two readings can.
+    """
+    stats = CollectorStats()
+
+    stats.record_export_spawn(310.0)
+    stats.record_export_spawn(120.0)
+
+    assert stats.exports.spawn_last_ms == 120.0
+    assert stats.exports.spawn_max_ms == 310.0, (
+        "the worst spawn is the one the day cut is judged by")
+    assert stats.exports.spawn_total_ms == 430.0
+
+
+def test_the_folder_scan_actually_reports_what_it_cost() -> None:
+    """
+    The arm reads a record that something has to write, and this is the writer.
+
+    Mutating the note away left every test above green: the helper kept working,
+    the stall record kept asking, and the answer was always "nothing ran". A
+    measurement with no producer is an arm that can never fire.
+    """
+    collector = build_collector()
+    collector._is_running = True
+
+    async def one_round() -> None:
+        task = asyncio.create_task(collector._monitor_folders())
+        await asyncio.sleep(0.2)
+        collector._is_running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(one_round())
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+    assert "folder scan" in collector._offloop_work, (
+        "the folder scan never told the stall record it had run")
+    ended, duration_ms = collector._offloop_work["folder scan"]
+    assert duration_ms >= 0.0 and ended > 0.0
+
+
+def test_the_export_reports_what_starting_it_cost(tmp_path: Path) -> None:
+    """
+    The other producer, and the one that matters at the UTC day cut.
+
+    The real child is replaced here: what is being defended is that the call
+    site takes a reading at all, not that a subprocess runs - and a test that
+    needs nine real processes to prove one measurement would not be run twice.
+    """
+    import python.main as main_module
+
+    collector = build_collector()
+
+    class FinishedChild:
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"ok": true}', b""
+
+    async def fake_spawn(*args, **kwargs):
+        # A measurable moment, so the assertion below can be an inequality
+        # rather than the `>= 0` that is true whether or not anything was timed.
+        await asyncio.sleep(0.03)
+        return FinishedChild()
+
+    async def run_one() -> None:
+        await collector._run_export(tmp_path / "x.jsonl.part",
+                                    tmp_path / "x_ticks.json")
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(main_module.asyncio, "create_subprocess_exec",
+                          fake_spawn)
+            asyncio.run(run_one())
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+    spawned = collector._stats.exports.spawn_max_ms
+    assert spawned >= 20.0, (
+        f"the spawn was not timed at the call site (got {spawned} ms for a "
+        f"handover deliberately made to take 30)")
+    assert collector._stats.exports.spawn_total_ms == spawned
+    assert collector._stats.exports.spawn_last_ms == spawned

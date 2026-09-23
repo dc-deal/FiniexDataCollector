@@ -20,7 +20,7 @@ than a formality.
   reset cost 15 minutes; the missing restart cost **12 h 35 min** — 98 % of the outage.
 - **QuickEdit, repeatedly.** A console in QuickEdit mode suspends the next write while text is
   selected, and the display writes from the collector's only event loop. One stray click stops the
-  WebSocket reader. A sister project's connectivity watcher froze for 13 h 33 min to this on
+  WebSocket reader. A sister project's connectivity watcher froze for 13 h 33 min on
   the same box — and their data series was untouched, because the frozen process was their
   INSTRUMENT. Here the instrument and the producer are the same process, so the same freeze
   takes the ticks with it. That difference is the whole argument for the split.

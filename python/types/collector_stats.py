@@ -312,6 +312,15 @@ class StallEvent:
     tick_ms: float = 0.0
     ticks: int = 0
 
+    # Work that runs in a thread but still contends for the interpreter lock, so
+    # it delays the loop without appearing anywhere in the loop's own timings.
+    # Measured 2026-09-23: nine stalls of 285-395 ms with no ticks in the window,
+    # no collection and no export - against a folder scan whose worst reading
+    # that day was 335 ms. A duration, not a presence, so it ranks with the rest
+    # of the measured arms.
+    offloop_ms: float = 0.0
+    offloop_what: str = ""
+
     # Presence, not duration - a reconnect either happened inside this window or
     # it did not. Measured 2026-09-22: the reconnect at 02:43:50 produced two
     # stalls, 252 ms and 271 ms, and both said `unknown` because nothing
@@ -401,6 +410,15 @@ class ExportStats:
     max_ms: float = 0.0
     last_failed_file: Optional[str] = None
     last_failed_at: Optional[datetime] = None
+
+    # Spawning a child is not free and it happens ON the loop - `communicate()`
+    # awaits, but `create_subprocess_exec` itself does not. At the UTC day cut
+    # nine or ten go out within the same second, and on 2026-09-23 that cut cost
+    # 3397 ms of loop lag against 856 ms the night before. Whether the cost is
+    # the spawning or the writing is a question a total cannot answer.
+    spawn_last_ms: float = 0.0
+    spawn_max_ms: float = 0.0
+    spawn_total_ms: float = 0.0
 
 
 class CollectorStats:
@@ -686,7 +704,8 @@ class CollectorStats:
     def record_stall(self, duration_ms: float, gc_ms: float,
                      gc_generation: int, render_ms: float,
                      exports_in_flight: int, tick_ms: float = 0.0,
-                     ticks: int = 0, reconnected: bool = False) -> None:
+                     ticks: int = 0, reconnected: bool = False,
+                     offloop_ms: float = 0.0, offloop_what: str = "") -> None:
         """
         Record a moment the event loop stood still, with what explains it.
 
@@ -703,6 +722,8 @@ class CollectorStats:
             tick_ms: Time the tick handler spent inside this window
             ticks: Ticks it handled in that time
             reconnected: Whether the socket was re-established inside it
+            offloop_ms: Longest timed off-loop task that finished in the window
+            offloop_what: Which one that was
         """
         half = duration_ms / 2
 
@@ -718,6 +739,8 @@ class CollectorStats:
             cause = "the live display"
         elif tick_ms >= half:
             cause = f"handling {ticks} ticks"
+        elif offloop_ms >= half:
+            cause = f"the {offloop_what}"
         elif exports_in_flight:
             cause = "an archive export was handed over"
         elif reconnected:
@@ -735,7 +758,9 @@ class CollectorStats:
             cause=cause,
             tick_ms=round(tick_ms, 1),
             ticks=ticks,
-            reconnected=reconnected))
+            reconnected=reconnected,
+            offloop_ms=round(offloop_ms, 1),
+            offloop_what=offloop_what))
 
         if len(self.stalls) > self.max_stalls:
             self.stalls = self.stalls[-self.max_stalls:]
@@ -787,6 +812,19 @@ class CollectorStats:
         """A closed file was handed to an archive writer."""
         self.exports.started += 1
         self.exports.in_flight += 1
+
+    def record_export_spawn(self, duration_ms: float) -> None:
+        """
+        Record what starting one archive writer cost the event loop.
+
+        Args:
+            duration_ms: Milliseconds spent inside `create_subprocess_exec`
+        """
+        self.exports.spawn_last_ms = round(duration_ms, 1)
+        self.exports.spawn_max_ms = round(
+            max(self.exports.spawn_max_ms, duration_ms), 1)
+        self.exports.spawn_total_ms = round(
+            self.exports.spawn_total_ms + duration_ms, 1)
 
     def record_export_finished(self, filename: str, ticks: int,
                                duration_ms: float) -> None:

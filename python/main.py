@@ -322,6 +322,8 @@ class FiniexDataCollector:
         self._telegram: Optional[TelegramAlertProvider] = None
         self._instance_lock: Optional[InstanceLock] = None
         self._last_reconnect_monotonic: Optional[float] = None
+        # name -> (monotonic reading it finished at, milliseconds it took)
+        self._offloop_work: Dict[str, Tuple[float, float]] = {}
         self._origin: Optional[OriginBlock] = None
         self._show_display = show_display
         self._api_server = None
@@ -569,12 +571,19 @@ class FiniexDataCollector:
         name = archive_path.name
 
         try:
+            # `communicate()` below awaits and yields; this does not. Nine or
+            # ten of these go out within one second at the UTC day cut, so
+            # whether that cut costs the loop the spawning or the writing is a
+            # question only a separate reading answers.
+            spawn_started = time.monotonic()
             process = await asyncio.create_subprocess_exec(
                 sys.executable, "-m", "python.writers.wal_archive",
                 str(wal_path),
                 cwd=str(PROJECT_ROOT),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE)
+            self._stats.record_export_spawn(
+                (time.monotonic() - spawn_started) * 1000)
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=EXPORT_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
@@ -701,7 +710,38 @@ class FiniexDataCollector:
                     exports_in_flight=self._stats.exports.in_flight,
                     tick_ms=self._stats.tick_work.total_ms - work_before,
                     ticks=self._stats.tick_work.ticks - ticks_before,
-                    reconnected=self._reconnected_between(asked_at))
+                    reconnected=self._reconnected_between(asked_at),
+                    **dict(zip(("offloop_ms", "offloop_what"),
+                               self._offloop_in_window(asked_at))))
+
+    def _note_offloop(self, name: str, duration_ms: float) -> None:
+        """
+        Remember that a timed off-loop task just finished.
+
+        `asyncio.to_thread` moves the system calls off the loop; it does not move
+        the Python that walks their results, and that still holds the interpreter
+        lock. So a scan can be "off the loop" and delay it anyway - which is the
+        shape of nine stalls on 2026-09-23 that nothing could name.
+
+        Args:
+            name: What ran, as it should read in a stall record
+            duration_ms: How long it took
+        """
+        self._offloop_work[name] = (time.monotonic(), duration_ms)
+
+    def _offloop_in_window(self, since: float) -> Tuple[float, str]:
+        """
+        The longest timed off-loop task that finished inside a stall's window.
+
+        Args:
+            since: The monotonic reading the window started at
+
+        Returns:
+            (milliseconds, what it was), or (0.0, "") when none finished in it
+        """
+        inside = [(ms, name) for name, (ended, ms) in self._offloop_work.items()
+                  if ended >= since]
+        return max(inside) if inside else (0.0, "")
 
     def _reconnected_between(self, since: float) -> bool:
         """
@@ -738,6 +778,7 @@ class FiniexDataCollector:
                 usage, duration_ms = await asyncio.to_thread(
                     self._read_disk_usage)
                 self._stats.record_disk_check(duration_ms)
+                self._note_offloop("disk check", duration_ms)
 
                 self._stats.update_disk_space(
                     total=usage.total,
@@ -868,8 +909,9 @@ class FiniexDataCollector:
                 # touches no file.
                 self._reconcile_tick_counters()
 
-                self._stats.record_folder_scan(
-                    await asyncio.to_thread(self._scan_folders))
+                scan_ms = await asyncio.to_thread(self._scan_folders)
+                self._stats.record_folder_scan(scan_ms)
+                self._note_offloop("folder scan", scan_ms)
             except Exception as e:
                 self._logger.error(
                     f"Folder scan failed: {describe_exception(e)}")

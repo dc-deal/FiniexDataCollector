@@ -177,7 +177,17 @@ it — including, since 2026-09-21, what the tick handler itself cost inside tha
 many ticks it handled. That arm was added because ten production stalls said `unknown` with the
 display off, no export running and garbage collection accounting for under a tenth of them: every
 candidate the record could name had been ruled out, which left a consumer nobody was measuring.
-`tick_work` carries the running total those windows are differenced from.
+`tick_work` carries the running total those windows are differenced from, and since 2026-09-23
+also the longest **off-loop** task that finished inside the window. That arm exists because
+`asyncio.to_thread` moves the system calls off the loop and not the Python that walks their
+results: nine stalls of 285-395 ms carried no ticks, no collection, no export and no reconnect,
+against a folder scan whose worst reading the same day was 335 ms. Work can be off the loop and
+delay it anyway.
+
+**`exports` times the handover apart from the child.** `communicate()` awaits and yields;
+`create_subprocess_exec` does not, and nine or ten children go out inside one second at the UTC
+day cut. That cut cost 3397 ms of loop lag on 2026-09-23 against 856 ms the night before, and
+`spawn_max_ms` is what says whether the loop paid for the starting or the writing.
 
 The arms are checked most-specific first and they overlap on purpose — a collection triggered by
 an allocation inside the handler counts in both, and naming the collection is the more useful of

@@ -124,6 +124,14 @@ built on purpose. Control stays where it is: the Telegram commands, and the oper
 **Nothing in the collector depends on the viewer.** It can be absent, killed, or running twice at
 once, and the collector neither knows nor cares.
 
+**And nothing the screen shows may come from anywhere but the payload.** That rule cost us a
+number once: the renderer read the file limit from the *local* config, so drawing a remote
+machine it reported a production file as 1274 % of a boundary that instance does not have.
+FiniexTestingIDE found the sharper version of the same defect in their own display on
+2026-09-22 — a per-row `account_currency` read from a local object, which on a remote screen
+would print every figure correctly **with the wrong unit in front of it**. An absurd number gets
+questioned; a plausible one does not.
+
 ## When the two builds differ
 
 The collector is deployed to the box and the viewer usually runs from a checkout on a laptop, so
