@@ -43,6 +43,7 @@ CONTENT_TYPES: Dict[str, type] = {
     "recent_logs": LogEntry,
     "reconnect_events": ReconnectEvent,
     "stalls": StallEvent,
+    "worst_stalls": StallEvent,
     "last_file": FileInfo,
     "last_reconnect": ReconnectEvent,
     "streams": str,

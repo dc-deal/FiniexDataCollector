@@ -130,3 +130,37 @@ def test_the_shell_defaults_to_the_narrow_credential() -> None:
         "the status shell's example carries more than the one route it reads")
     assert "viewer" not in endpoints, (
         "'viewer' collides with the FiniexViewer project - use 'watch'")
+
+
+def test_a_missing_endpoint_names_the_command_and_not_only_the_entry(tmp_path) -> None:
+    """
+    The name alone sent the operator to a command that does not exist.
+
+    Measured 2026-09-24: on the box the file carries `watch_local` and the
+    default is `watch`. The message listed the entry, so the next attempt was
+    `python -m python.main watch_local` - the entry typed where the COMMAND
+    goes. The names it knows have to arrive attached to the flag they belong in.
+    """
+    config = tmp_path / "remote_endpoints.json"
+    config.write_text(json.dumps({"endpoints": {
+        "watch_local": {"base_url": "http://127.0.0.1:8110", "token": "x"}}}),
+        encoding="utf-8")
+
+    with pytest.raises(EndpointError) as raised:
+        load_endpoint("watch", config)
+
+    assert raised.value.alternatives == ["watch_local"], (
+        "the caller builds the command line, so it needs the names as data")
+
+
+def test_an_unreadable_file_offers_no_alternatives(tmp_path) -> None:
+    """
+    A missing file has no names to suggest, and inventing one would be worse.
+
+    Guards the default: every other failure path must leave the list empty
+    rather than carry whatever the previous call put there.
+    """
+    with pytest.raises(EndpointError) as raised:
+        load_endpoint("watch", tmp_path / "absent.json")
+
+    assert raised.value.alternatives == []

@@ -295,6 +295,9 @@ class StallEvent:
         render_ms: How long the live display's last redraw took
         exports_in_flight: Archive writers running at that moment
         cause: What the numbers above account for, or "unknown"
+        blocked_in: Where the loop's stack was while it stood still, when the
+            sampler caught it - an observation rather than a timing, so it ranks
+            below every arm that measured a duration
     """
     at: datetime
     ms: float
@@ -326,6 +329,12 @@ class StallEvent:
     # stalls, 252 ms and 271 ms, and both said `unknown` because nothing
     # connected the socket to the loop that noticed.
     reconnected: bool = False
+
+    # Where the loop actually was, read off its own stack while it was stuck.
+    # Every arm above answers for one candidate that somebody thought to
+    # instrument; twenty stalls across two nights said `unknown` with all of
+    # them reading zero. This one has no candidate list.
+    blocked_in: str = ""
 
 
 @dataclass
@@ -464,6 +473,11 @@ class CollectorStats:
         self.tick_work: TickWork = TickWork()
         self.stalls: List[StallEvent] = []
 
+        # The session's largest, kept apart from the latest. A ring of the most
+        # recent alone discards the biggest first, which is backwards: the rare
+        # stall is the one worth reading and the routine one is what evicts it.
+        self.worst_stalls: List[StallEvent] = []
+
         # What a screen needs and the statistics did not carry: which streams
         # are subscribed, what the clock has absorbed, and how many decimals a
         # price is worth printing to. A display inside this process could read
@@ -482,6 +496,7 @@ class CollectorStats:
 
         # Config
         self.max_stalls: int = 10
+        self.max_worst_stalls: int = 10
         self.max_recent_logs: int = 50
         self.max_reconnect_history: int = 100
 
@@ -705,7 +720,8 @@ class CollectorStats:
                      gc_generation: int, render_ms: float,
                      exports_in_flight: int, tick_ms: float = 0.0,
                      ticks: int = 0, reconnected: bool = False,
-                     offloop_ms: float = 0.0, offloop_what: str = "") -> None:
+                     offloop_ms: float = 0.0, offloop_what: str = "",
+                     blocked_in: str = "") -> None:
         """
         Record a moment the event loop stood still, with what explains it.
 
@@ -724,6 +740,7 @@ class CollectorStats:
             reconnected: Whether the socket was re-established inside it
             offloop_ms: Longest timed off-loop task that finished in the window
             offloop_what: Which one that was
+            blocked_in: The loop's own stack, sampled while it was stuck
         """
         half = duration_ms / 2
 
@@ -741,6 +758,13 @@ class CollectorStats:
             cause = f"handling {ticks} ticks"
         elif offloop_ms >= half:
             cause = f"the {offloop_what}"
+        elif blocked_in:
+            # Observed rather than timed: one sample says where the loop was at
+            # one moment inside the stall, which cannot be weighed against half
+            # of it. It outranks the two presence checks below because it is a
+            # reading of the loop itself rather than of something that happened
+            # to be nearby.
+            cause = f"the loop was in {blocked_in}"
         elif exports_in_flight:
             cause = "an archive export was handed over"
         elif reconnected:
@@ -748,7 +772,7 @@ class CollectorStats:
         else:
             cause = "unknown"
 
-        self.stalls.append(StallEvent(
+        event = StallEvent(
             at=datetime.now(timezone.utc),
             ms=round(duration_ms, 1),
             gc_ms=round(gc_ms, 1),
@@ -760,10 +784,23 @@ class CollectorStats:
             ticks=ticks,
             reconnected=reconnected,
             offloop_ms=round(offloop_ms, 1),
-            offloop_what=offloop_what))
+            offloop_what=offloop_what,
+            blocked_in=blocked_in)
 
+        self.stalls.append(event)
         if len(self.stalls) > self.max_stalls:
             self.stalls = self.stalls[-self.max_stalls:]
+
+        # The recent list alone loses the interesting one first. Measured
+        # 2026-09-24: the UTC day cut closed nine files at 00:00 and its stall
+        # was gone by 03:45, pushed out by ten routine 300 ms stalls - the one
+        # event of the night anybody wanted to read, overwritten by the ones
+        # nobody did. A session keeps its largest as well as its latest, and a
+        # stall is normally in both.
+        self.worst_stalls.append(event)
+        self.worst_stalls.sort(key=lambda stall: stall.ms, reverse=True)
+        if len(self.worst_stalls) > self.max_worst_stalls:
+            self.worst_stalls = self.worst_stalls[:self.max_worst_stalls]
 
     def record_folder_scan(self, duration_ms: float) -> None:
         """

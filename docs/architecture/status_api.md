@@ -198,6 +198,26 @@ measurement was wrong once already: the folder scan was blamed for 4.3 s stalls 
 at 15 ms. `gc` carries the collections and worst pause per generation; the collector holds every
 tick of an open file in memory, which is what a generation-2 walk has to traverse.
 
+**`blocked_in` is the arm with no candidate list**, and it exists because every arm above answers
+for one suspect somebody thought to instrument. Twenty stalls across two production nights said
+`unknown` with all of them reading zero. A watchdog thread notices when the loop stops checking in
+and reads the loop thread's own stack while it is still stuck, so the entry names the file, line
+and function it was actually in, plus the caller that led there:
+
+```
+"blocked_in": "ssl.py:975 do_handshake < client_proto.py:88 connection_made < base_events.py:2050 _run_once"
+```
+
+It ranks **below every timed arm and above the two presence checks**. One sample says where the
+loop was at one moment inside the stall, not for how long — a stall made of many short operations
+can be sampled anywhere in it — so it is the strongest available hint and never a measurement.
+
+**`worst_stalls` holds the session's largest, beside `stalls` which holds the latest.** A single
+recent-only ring discards the interesting entry first: measured 2026-09-24, the UTC day cut closed
+nine files at 00:00 and its stall was gone by 03:45, evicted by ten routine 300 ms stalls. The rare
+event is the one worth reading and the routine one is what overwrites it. Both lists are capped and
+a stall is normally in both.
+
 **`scans` says what the background work costs**, now that it no longer shows up as stamping
 lag: the folder walk and the disk reading run in a worker thread, and these are their last and
 worst durations. They were on the event loop until 2026-09-21, where they stalled it by up to

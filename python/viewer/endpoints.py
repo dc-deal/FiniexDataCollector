@@ -19,7 +19,7 @@ Location: python/viewer/endpoints.py
 
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 DEFAULT_CONFIG = Path("user_configs/remote_endpoints.json")
@@ -34,7 +34,27 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
 
 
 class EndpointError(ValueError):
-    """The endpoint a viewer was pointed at cannot be used."""
+    """
+    The endpoint a viewer was pointed at cannot be used.
+
+    Carries the names that DO exist, because the caller knows the command
+    they belong in and this module does not. Naming the entry without
+    naming the flag sent the operator to `python -m python.main watch_local`
+    on 2026-09-24, which is not a command.
+
+    Attributes:
+        alternatives: Endpoint names the file does carry
+    """
+
+    def __init__(self, message: str,
+                 alternatives: Optional[List[str]] = None):
+        """
+        Args:
+            message: What went wrong, naming the file and the entry
+            alternatives: Endpoint names that exist, when any do
+        """
+        super().__init__(message)
+        self.alternatives: List[str] = alternatives or []
 
 
 def load_endpoint(name: str, path: Path = DEFAULT_CONFIG) -> Tuple[str, str]:
@@ -69,7 +89,8 @@ def load_endpoint(name: str, path: Path = DEFAULT_CONFIG) -> Tuple[str, str]:
     if entry is None:
         known = ", ".join(sorted(endpoints)) or "none"
         raise EndpointError(
-            f"{path} has no endpoint '{name}' - it knows: {known}")
+            f"{path} has no endpoint '{name}' - it knows: {known}",
+            alternatives=sorted(endpoints))
 
     base_url = entry.get("base_url")
     token = entry.get("token")

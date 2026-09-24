@@ -42,6 +42,7 @@ from python.utils.console_mode import (disable_quick_edit, enable_ansi_colours,
 from python.viewer.endpoints import EndpointError, default_interval, load_endpoint
 from python.viewer.watch import run_viewer
 from python.utils.gc_watcher import GcWatcher
+from python.utils.stall_sampler import StallSampler
 from python.utils.live_display import LiveDisplay
 from python.types.collector_stats import CollectorStats
 from python.types.tick_types import OriginBlock
@@ -339,6 +340,11 @@ class FiniexDataCollector:
         # instead of being reasoned about afterwards.
         self._gc_watcher = GcWatcher(self._stats)
 
+        # Reads the loop's own stack when it stops checking in. Every other arm
+        # answers for a candidate somebody instrumented; twenty stalls across
+        # two nights said `unknown` with all of them at zero.
+        self._stall_sampler = StallSampler()
+
         # State
         self._is_running = False
         self._shutdown_event = asyncio.Event()
@@ -368,6 +374,10 @@ class FiniexDataCollector:
         # Setup signal handlers
         self._setup_signal_handlers()
         self._gc_watcher.start()
+        # From the loop's thread: the sampler records the caller as the
+        # thread whose stack it reads, and the wrong one answers about an
+        # idle thread with complete confidence.
+        self._stall_sampler.start()
         asyncio.get_running_loop().set_exception_handler(
             report_loop_exception(self._logger))
 
@@ -683,6 +693,7 @@ class FiniexDataCollector:
         """
         while self._is_running:
             asked_at = time.monotonic()
+            self._stall_sampler.note_alive()
 
             # Read before the wait, subtract after: the difference is what the
             # tick handler cost inside THIS window and nothing else. A rate held
@@ -711,6 +722,7 @@ class FiniexDataCollector:
                     tick_ms=self._stats.tick_work.total_ms - work_before,
                     ticks=self._stats.tick_work.ticks - ticks_before,
                     reconnected=self._reconnected_between(asked_at),
+                    blocked_in=self._stall_sampler.blocked_in(asked_at),
                     **dict(zip(("offloop_ms", "offloop_what"),
                                self._offloop_in_window(asked_at))))
 
@@ -1557,6 +1569,7 @@ class FiniexDataCollector:
         self._logger.info("Shutting down...")
 
         self._gc_watcher.stop()
+        self._stall_sampler.stop()
 
         # Stop live display first (so we can see logs)
         if self._live_display:
@@ -1686,6 +1699,10 @@ def cmd_watch(endpoint_name: str, interval: Optional[float]) -> int:
         base_url, token = load_endpoint(endpoint_name)
     except EndpointError as error:
         print(f"Cannot watch '{endpoint_name}': {error}")
+        # The name alone is not enough: it has to arrive behind --endpoint,
+        # and a name printed without its flag reads like a command.
+        for name in error.alternatives:
+            print(f"  try: python -m python.main watch --endpoint {name}")
         return 1
 
     seconds = interval if interval else default_interval(base_url)

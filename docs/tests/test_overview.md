@@ -226,6 +226,28 @@ Also, and this is the half that needed a thread to test: the folder scan and the
 they guard against is invisible in behaviour — the numbers come out the same either way, and the
 only trace is arrival lag in the tick data.
 
+And the two additions of 2026-09-24: a sampled stack names the cause when nothing else accounts
+for the stall, a **timed** arm still outranks it (one sample says where the loop was, not for how
+long), a sample outranks a mere presence, and the session keeps its largest stalls as well as its
+latest — the day cut's stall was evicted by ten routine ones before anybody read it.
+
+### `tests/utils/test_stall_sampler.py`
+
+The arm with no candidate list. Every other attribution answers for one suspect somebody thought
+to instrument, and twenty stalls across two production nights reported `unknown` with all of them
+at zero. This one reads the event loop's own stack while the loop is stuck.
+
+It is also the instrument here that can fail invisibly: a sampler that never captures returns an
+empty string, and an empty string reads exactly like "the loop was fine". So the tests drive a
+real blocked thread rather than calling the formatter.
+
+Defends: a thread that stops checking in gets its stack read and the blocking function is named;
+a thread that keeps checking in is **never** sampled, because a cause that is always present is
+worth nothing while looking like an answer; a stack captured in an earlier stall is not offered to
+a later window; one stall is sampled once however long it lasts; and a sampler that was never
+started answers nothing rather than raising — a diagnostic that takes the collector down is
+worse than the stall it explains.
+
 ### `tests/utils/test_error_counters.py`
 
 The error and warning counters were initialised and never raised — nothing called

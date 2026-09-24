@@ -735,3 +735,90 @@ def test_the_export_reports_what_starting_it_cost(tmp_path: Path) -> None:
         f"handover deliberately made to take 30)")
     assert collector._stats.exports.spawn_total_ms == spawned
     assert collector._stats.exports.spawn_last_ms == spawned
+
+
+def test_the_loops_own_stack_is_named_when_nothing_else_accounts_for_it() -> None:
+    """
+    The arm that exists because twenty stalls had no candidate at all.
+
+    Measured 2026-09-23 and 2026-09-24: ten stalls each night, every one
+    `unknown`, with garbage collection, the display, the tick handler and both
+    timed threads all reading zero. Whatever was blocking the loop was on
+    nobody's list, and no list would have helped - so the loop is read directly.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=0.0, gc_generation=-1, render_ms=0.0,
+                       exports_in_flight=0,
+                       blocked_in="ssl.py:975 do_handshake")
+
+    assert stats.stalls[-1].cause == "the loop was in ssl.py:975 do_handshake"
+    assert stats.stalls[-1].blocked_in == "ssl.py:975 do_handshake"
+
+
+def test_a_timed_arm_outranks_a_sampled_stack() -> None:
+    """
+    One sample says where the loop was at one moment, not for how long.
+
+    A stall made of many short operations can be sampled anywhere inside it, so
+    the observation must never displace an arm that measured a duration covering
+    half the stall - otherwise the most confident-sounding answer is the least
+    quantified one.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=600.0, gc_generation=2, render_ms=0.0,
+                       exports_in_flight=0,
+                       blocked_in="ssl.py:975 do_handshake")
+
+    assert stats.stalls[-1].cause == "garbage collection, generation 2"
+
+
+def test_a_sampled_stack_outranks_a_mere_presence() -> None:
+    """
+    Reading the loop beats noticing something nearby.
+
+    `exports_in_flight` says an archive writer existed at that moment, which is
+    the weakest evidence here. A stack is the loop itself.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(700.0, gc_ms=0.0, gc_generation=-1, render_ms=0.0,
+                       exports_in_flight=2,
+                       blocked_in="subprocess.py:1 _execute_child")
+
+    assert stats.stalls[-1].cause == (
+        "the loop was in subprocess.py:1 _execute_child")
+
+
+def test_the_session_keeps_its_largest_stalls_not_only_its_latest() -> None:
+    """
+    Befund 36: the recent list loses the interesting one first.
+
+    Measured 2026-09-24: the UTC day cut closed nine files at 00:00 and its
+    stall was gone by 03:45, evicted by ten routine 300 ms stalls. The rare
+    event is the one worth reading and the routine one is what overwrites it,
+    so a session keeps both lists.
+    """
+    stats = CollectorStats()
+
+    stats.record_stall(3397.0, 0.0, -1, 0.0, 0)
+    for _ in range(stats.max_stalls + 5):
+        stats.record_stall(300.0, 0.0, -1, 0.0, 0)
+
+    assert all(stall.ms == 300.0 for stall in stats.stalls), (
+        "the recent list has rolled over, which is what it is for")
+    assert stats.worst_stalls[0].ms == 3397.0, (
+        "the day cut survived the stalls that pushed it out of the recent list")
+
+
+def test_the_worst_list_stays_short_and_ordered() -> None:
+    """A second unbounded list would be the same defect twice."""
+    stats = CollectorStats()
+    for lateness in range(260, 260 + stats.max_worst_stalls + 5):
+        stats.record_stall(float(lateness), 0.0, -1, 0.0, 0)
+
+    kept = [stall.ms for stall in stats.worst_stalls]
+    assert len(kept) == stats.max_worst_stalls
+    assert kept == sorted(kept, reverse=True)
+    assert kept[0] == float(260 + stats.max_worst_stalls + 4)

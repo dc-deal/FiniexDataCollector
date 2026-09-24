@@ -54,6 +54,17 @@ Every line is reviewed by the operator before it is committed. The assistant nev
   `/v1/status` carries what was measured in its own window and says `unknown` rather than
   guessing, and **the thing that draws the screen must not share the loop that stamps the
   ticks** — issue #15.
+- **Build the diagnostic into the product, not into the session.** The box is remote, the
+  production platform cannot be exercised from here, and a question answered by an operator
+  running a command for us is answered once. A question answered by a field on `/v1/status` is
+  answered every time anybody asks, including at three in the morning by a session that was not
+  there when the decision was made. So when a session finds itself asking the operator to read
+  something off the machine, the first question is whether the collector should be reporting it.
+  Measured across 2026-09-21 to 09-24: every attribution that settled an argument — the render
+  cost, the tick handler, the off-loop threads, the spawn timing, and finally the loop's own stack
+  — became a field first and an answer second. The cost is a few lines each; the alternative is a
+  remote-desktop session per question. Operator's standing instruction, 2026-09-24: extending the
+  diagnostics is always worth proposing.
 - **An instrument outage is not a series outage**, and until issue #15 this project could not
   tell them apart because it had no separate instrument. FiniexRAGEngine's watcher froze for
   13 h 33 min on 2026-09-10 while their engine produced through it untouched — 90 and 87
