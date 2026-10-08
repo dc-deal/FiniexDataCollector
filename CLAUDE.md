@@ -455,6 +455,18 @@ with it, because the bus has no locking and no read receipts:
   mechanical gate: two were built on the existing peers, both worked, and both were removed,
   because a prompt standing behind the rule invites the discipline to be delegated to a
   dialog box.
+- **Noise is a cost, and a question is not by itself a reason to reply.** Every message spends
+  another project's attention. Before writing one, name what the recipient would do differently
+  because of it; if nothing, it belongs in this project's report, issues and docs instead.
+  Measured 2026-10-08: FiniexTestingIDE asked three questions about trades missing from our
+  files, and a reply was proposed because they had asked — while their own message said
+  *"Nothing is blocking on our side; this is a report"*, every gap was already visible to them in
+  the data, and silence led to the very outcome the reply would have argued for. What helps a
+  consumer arrives through the files. Writing is warranted when it changes what a peer does:
+  files their importer will reject, a field that now asserts something false, lost archive data,
+  and a `data_format_version` change, which `docs/architecture/output_contract.md` requires
+  announcing anyway — an open question that the change answers rides in that announcement rather
+  than in a message of its own.
 - **An empty inbox is not evidence that nothing arrived.** A `note` enters no inbox and an
   `answer` closes the item it answers, so both are invisible there. Pair `bus_inbox` with
   `bus_threads` and report "nothing" only when both are empty.
@@ -563,9 +575,12 @@ Four semantics that would cost a wrong number rather than an error, stated by th
 2026-09-21:
 
 - **A bar's timestamp is its OPEN**, left-labelled.
-- **OHLC is the MID of bid/ask, not a traded price.** Their close is not our `last`, and on a
-  wide spread the two separate — which is exactly when someone compares a bar against our tick
-  file for the same minute.
+- **The price basis depends on the broker, and the response says which.** Stated as "OHLC is
+  the MID" on 2026-09-21; measured 2026-10-08 through the `X-Bar-Price-Basis` header (contract
+  22): `kraken_spot` is `order_driven` — OHLC of the TRADED price, so a Kraken bar's close is
+  comparable with our trade prices — while `mt5` is `quote_driven`, OHLC of the midpoint, whose
+  close separates from a quote's bid and ask on a wide spread. Read the header rather than this
+  line: it is what changed under the line once already.
 - **Gaps are omitted, never zero-filled**, so a missing row is "nothing arrived" rather than a
   quiet minute at zero. A window they have not imported answers `200 []`.
 - **Forex volume is identically zero** (the MT5 CFD feed reports no size); `tc`, the tick count,

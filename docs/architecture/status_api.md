@@ -212,6 +212,14 @@ It ranks **below every timed arm and above the two presence checks**. One sample
 loop was at one moment inside the stall, not for how long — a stall made of many short operations
 can be sampled anywhere in it — so it is the strongest available hint and never a measurement.
 
+**And it is biased towards code that runs often.** Measured 2026-10-05: a 279 ms stall named
+`gc_watcher.py:106 time_spent_since`, which turned out to be a scan of a 64-entry deque - work that
+cannot take 279 ms. The lag monitor runs ten times a second, so when the cause is the process not
+being scheduled at all rather than one long operation, the sample lands on whatever runs most. Read
+a named frame as "the loop was here", not as "this is slow", and check the named code before
+believing it. The second reading of that week survived the check: `message_parser.is_heartbeat`
+really does decode every message a second time.
+
 **`worst_stalls` holds the session's largest, beside `stalls` which holds the latest.** A single
 recent-only ring discards the interesting entry first: measured 2026-09-24, the UTC day cut closed
 nine files at 00:00 and its stall was gone by 03:45, evicted by ten routine 300 ms stalls. The rare
