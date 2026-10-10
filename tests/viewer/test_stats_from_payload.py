@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 import pytest
 
 from python.api.stats_serializer import serialize_stats
-from python.types.collector_stats import CollectorStats, ReconnectEvent
+from python.types.collector_stats import (CollectorStats, ReconnectEvent,
+                                          TradeIdGap)
 from python.types.log_level import WARNING
 from python.viewer.stats_from_payload import (CONTENT_TYPES, PayloadMismatch,
                                               stats_from_payload,
@@ -53,11 +54,22 @@ def populated_stats() -> CollectorStats:
     stats.record_folder_scan(5.0)
     stats.record_disk_check(2.0)
 
-    event = ReconnectEvent(timestamp=datetime.now(timezone.utc),
-                           reconnected_at=None, duration_seconds=4.0,
-                           reason="socket closed")
-    stats.reconnect_events.append(event)
-    stats.last_reconnect = event
+    # A full outage record, through all three stages, and one still open: the
+    # nested per-symbol records, the per-stream dict and the totals all have to
+    # survive the wire.
+    now = datetime.now(timezone.utc)
+    event = ReconnectEvent(
+        timestamp=now, reconnected_at=now, duration_seconds=2.8,
+        reason="far_side_close", close_code=1001, close_reason="going away",
+        confirmed_after_ms={"trade": 2700.0, "ticker": 2800.0},
+        rejected=["trade XRPUSD: refused"], unconfirmed=["ticker DOTUSD"],
+        symbols={"ADAUSD": TradeIdGap(last_trade_id=100, first_trade_id=106,
+                                      missing_trade_ids=5)})
+    for stage in ("opened", "restored", "resolved"):
+        stats.record_outage(stage, event)
+    stats.record_outage("opened", ReconnectEvent(
+        timestamp=now, reconnected_at=None, duration_seconds=None,
+        reason="connection_lost", attempts=2))
     return stats
 
 
@@ -184,3 +196,28 @@ def test_something_that_is_not_a_status_payload_says_so() -> None:
     """A proxy answering HTML must not turn into a half-drawn screen."""
     with pytest.raises(PayloadMismatch):
         stats_from_payload(["not", "a", "collector"])
+
+
+def test_an_older_collectors_reconnect_record_still_draws() -> None:
+    """
+    A collector from before 2026-10-08 sends four fields per reconnect and no
+    totals.
+
+    The viewer runs against whatever build the box carries, so the record must
+    revive with its new fields at their defaults - and the totals must stay
+    absent rather than read as a count of zero nobody measured.
+    """
+    payload = over_the_wire(populated_stats())
+    old = {"timestamp": "2026-10-01T09:00:00+00:00",
+           "reconnected_at": "2026-10-01T09:00:02+00:00",
+           "duration_seconds": 2.2, "reason": "connection_restored"}
+    payload["reconnect_events"] = [old]
+    payload["last_reconnect"] = old
+    del payload["reconnect_totals"]
+    del payload["reconnect_in_progress"]
+
+    stats = stats_from_payload(payload)
+
+    assert stats.reconnect_events[0].reason == "connection_restored"
+    assert stats.reconnect_events[0].symbols == {}
+    assert stats.reconnect_totals is None

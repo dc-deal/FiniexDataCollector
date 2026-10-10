@@ -28,9 +28,14 @@ from python.types.collector_stats import CollectorStats
 NOT_METRICS = ("max_recent_logs", "max_reconnect_history")
 
 
-def _plain(value: Any) -> Any:
+def plain(value: Any) -> Any:
     """
     Convert one value into something json.dumps accepts.
+
+    Public because a second destination uses it: the '[OUTAGE]' log line writes
+    each outage record through this same function, so the line a session reads
+    months later has exactly the shape /v1/status served. A second converter
+    for the same record is how two shapes start to drift.
 
     Args:
         value: Any member of the stats tree
@@ -46,13 +51,13 @@ def _plain(value: Any) -> Any:
         return value.astimezone(timezone.utc).isoformat(timespec="seconds")
 
     if is_dataclass(value) and not isinstance(value, type):
-        return {key: _plain(inner) for key, inner in asdict(value).items()}
+        return {key: plain(inner) for key, inner in asdict(value).items()}
 
     if isinstance(value, dict):
-        return {str(key): _plain(inner) for key, inner in value.items()}
+        return {str(key): plain(inner) for key, inner in value.items()}
 
     if isinstance(value, (list, tuple)):
-        return [_plain(inner) for inner in value]
+        return [plain(inner) for inner in value]
 
     return value
 
@@ -68,7 +73,7 @@ def serialize_stats(stats: CollectorStats) -> Dict[str, Any]:
         JSON-native representation of every measurement it holds
     """
     payload = {
-        name: _plain(value)
+        name: plain(value)
         for name, value in vars(stats).items()
         if not name.startswith("_") and name not in NOT_METRICS
     }
@@ -179,5 +184,5 @@ def health_payload(stats: CollectorStats) -> Dict[str, Any]:
         "status": "ok" if stats.websocket_status == "connected" else "degraded",
         "websocket_status": stats.websocket_status,
         "uptime_seconds": uptime_seconds(stats),
-        "started_at": _plain(stats.start_time)
+        "started_at": plain(stats.start_time)
     }

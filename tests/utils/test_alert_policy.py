@@ -1,20 +1,22 @@
 """
 FiniexDataCollector - Tests for when a restored connection is worth a phone alert
 
-Measured over the night of 2026-09-21: seven reconnects, each between 1.3 and
-7.2 s, adding up to 19.9 s of downtime in fifteen hours. That is roughly 22
-ticks, and not one of the seven appeared among the eight longest gaps in the
-file it fell into - those were all quiet market. Six alerts reached the
-operator's phone for something that cannot be found in the data afterwards.
+Measured over the night of 2026-09-21: seven reconnects, recorded at 1.3 to
+7.2 s each - figures that ran from the moment a drop was noticed to the socket
+handshake, and so left out the 10-11 s of silence before each was noticed. Even
+counted in full they were not among the longest gaps of the files they fell
+into, and six alerts reached the operator's phone for them.
 
 An alert nobody can act on is not free. It trains its reader to swipe, and the
 next one that mattered is swiped with it. So the question this file defends is
 not "did something happen" but "would the reader do anything differently" - the
 same test the output contract applies to a field.
 
-Two things still reach the phone: an outage long enough to put a file at risk,
-and a cluster, because a host that blips every two hours is weather and one that
-blips four times an hour is degrading.
+Two things still reach the phone: an outage long enough to mean reconnecting
+itself is failing, and a cluster, because a host that blips every two hours is
+weather and one that blips four times an hour is degrading. Since 2026-10-08 the
+duration judged is the data gap - last message before the drop to the feed
+restored - not detection to handshake.
 
 Location: tests/utils/test_alert_policy.py
 """
@@ -36,13 +38,16 @@ def test_a_short_self_healed_reconnect_stays_off_the_phone() -> None:
     assert reconnect_alert_text(7.22, 2, MIN_SECONDS, CLUSTER) is None
 
 
-def test_an_outage_that_puts_a_file_at_risk_does_reach_it() -> None:
+def test_a_long_outage_does_reach_it() -> None:
     """
-    Thirty seconds is not a round number - it is the consumer's lag window.
+    Thirty seconds without data means the reconnect itself is in trouble.
 
-    Past it the importer refuses the whole file rather than shortening it, so
-    that is the point where an outage stops being cosmetic and starts costing
-    an archive.
+    A drop Kraken closes is noticed at once and costs a few seconds; a silent
+    link about fifteen. Past thirty, attempts are failing or the link stayed
+    dead - something an operator can look at. (Until 2026-10-08 this test said
+    a file would be refused past the consumer's lag window. It would not: an
+    outage shortens a file, and Kraken replays nothing after a reconnect, so the
+    ticks that follow are fresh.)
     """
     message = reconnect_alert_text(45.0, 1, MIN_SECONDS, CLUSTER)
 
@@ -66,7 +71,7 @@ def test_a_cluster_of_short_ones_is_worth_saying() -> None:
     message = reconnect_alert_text(2.19, 4, MIN_SECONDS, CLUSTER)
 
     assert message is not None
-    assert "4 reconnects" in message
+    assert "4 outages" in message
     assert "2.2s" in message, "the cluster message still carries the last length"
 
 

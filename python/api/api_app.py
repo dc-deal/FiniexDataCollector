@@ -124,6 +124,8 @@ def create_api(
             "commit": build.commit,
             "dirty": build.dirty,
             "python_version": build.python_version,
+            "websockets_version": build.websockets_version,
+            "websockets_client": build.websockets_client,
             "started_at": build.started_at
         }
 

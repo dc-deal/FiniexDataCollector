@@ -6,17 +6,30 @@ initialised and never raised: nothing called record_error or record_warning.
 The live display said "No errors or warnings", /v1/status said 0 and 0, and the
 weekly report agreed - while the production log carried forced reconnects. The
 counters now follow the log through a listener, so no error path can forget to
-report itself. These tests pin the listener, the wiring in the collector, and
-the display code that had never rendered a single entry before.
+report itself. These tests pin the listener, the wiring in the collector, the
+display code that had never rendered a single entry before - and, since the
+counters count lines, how many lines the Kraken client writes for one event: a
+drop is a warning, not an error, and a failed attempt is one error, not two.
 
 Location: tests/utils/test_error_counters.py
 """
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import List
 
+import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
+
+from python.collectors.kraken.outage_tracker import Detection
+from python.collectors.kraken.quote_cache import QuoteCache
+from python.collectors.kraken.websocket_client import KrakenWebSocketClient
+from python.exceptions.collector_exceptions import WebSocketSubscriptionError
 from python.main import FiniexDataCollector
 from python.types.collector_stats import CollectorStats, LogEntry
+from python.utils.collection_clock import CollectionClock
 from python.utils.config_loader import ConfigLoader
 from python.utils.live_display import LiveDisplay
 from python.utils.logging_setup import (add_log_listener, get_logger,
@@ -97,3 +110,122 @@ def test_the_display_renders_a_logged_message_as_text_not_markup() -> None:
     footer = LiveDisplay(stats)._build_footer()
 
     assert "weird [/red] closing tag" in footer.plain
+
+
+class SendRefused:
+    """A connection whose every send raises the given error."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def send(self, message: str) -> None:
+        raise self.error
+
+
+def kraken_client() -> KrakenWebSocketClient:
+    return KrakenWebSocketClient(
+        symbols=["BTC/USD"], clock=CollectionClock(), quote_cache=QuoteCache(),
+        streams=["trade"])
+
+
+def levels_logged(action) -> List[str]:
+    """The level of every WARNING-or-above line written while action ran."""
+    levels: List[str] = []
+
+    def listener(level, name, message) -> None:
+        levels.append(level.name)
+
+    add_log_listener(listener)
+    try:
+        action()
+    finally:
+        remove_log_listener(listener)
+    return levels
+
+
+@pytest.mark.parametrize("error, kind, errors", [
+    (ConnectionClosedError(Close(1011, "internal error"), None),
+     "far_side_close", 0),
+    (OSError("send buffer gone"), "subscribe_send_failed", 1),
+])
+def test_a_send_refused_by_a_closed_connection_is_a_drop_not_an_error(
+        error, kind, errors) -> None:
+    """
+    A subscription send refused because the connection ended is that drop,
+    reported by the 'Connection ended' warning with its code. Also logged as an
+    ERROR, every drop during a resubscription counted in total_errors; only a
+    send that failed on a live connection is an error of its own.
+    """
+    client = kraken_client()
+    client._websocket = SendRefused(error)
+    raised: List[Exception] = []
+
+    def subscribe() -> None:
+        try:
+            asyncio.run(client.subscribe())
+        except WebSocketSubscriptionError as failure:
+            raised.append(failure)
+
+    levels = levels_logged(subscribe)
+
+    assert raised[0].detection.kind == kind
+    assert levels.count("ERROR") == errors
+
+
+def test_a_failed_connection_attempt_is_one_error_line() -> None:
+    """
+    connect() reports the failure; the second ERROR for the same attempt that
+    the loop around it wrote counted every failed attempt twice.
+    """
+    client = kraken_client()
+
+    async def unreachable(*args, **kwargs):
+        raise OSError("network is unreachable")
+
+    client._open = unreachable
+
+    levels = levels_logged(lambda: asyncio.run(client._run_connection()))
+
+    assert levels == ["ERROR"]
+
+
+class ClosedByKraken:
+    """A connection on which Kraken's close frame had already arrived."""
+
+    def __init__(self) -> None:
+        self.close_rcvd = Close(1001, "going away")
+
+
+@pytest.mark.parametrize("detection, frame_arrived, level", [
+    (Detection("far_side_close", 1001, "going away"), False, "WARNING"),
+    (Detection("unexpected", exception="RuntimeError: detector broke"),
+     False, "ERROR"),
+    (Detection("unexpected", exception="RuntimeError: detector broke"),
+     True, "ERROR"),
+])
+def test_a_drop_is_a_warning_and_a_failure_of_our_own_an_error(
+        detection, frame_arrived, level) -> None:
+    """
+    A connection that ended is a drop and a warning. One the code ended itself
+    - a detector that raised - is an error, and counts as one: also when
+    Kraken's close frame had arrived meanwhile and names the end, which then
+    carries the fault in its line rather than losing it.
+    """
+    client = kraken_client()
+    if frame_arrived:
+        client._websocket = ClosedByKraken()
+    lines: List[str] = []
+
+    def listener(lvl, name, message) -> None:
+        lines.append(message)
+
+    add_log_listener(listener)
+    try:
+        levels = levels_logged(
+            lambda: client._end_connection(detection, client._monotonic()))
+    finally:
+        remove_log_listener(listener)
+
+    assert levels == [level]
+    if detection.kind == "unexpected":
+        assert "detector broke" in lines[0]

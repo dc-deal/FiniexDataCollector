@@ -147,7 +147,9 @@ def test_trade_without_a_quote_says_so_instead_of_guessing(
     parser_with_clock: ParserFixture
 ) -> None:
     """
-    The first trades after a start or reconnect have no quote yet.
+    The first trades after the process started have no quote yet. (After a
+    reconnect the cache still holds the quote from before the drop, and its age
+    spans the outage - which is honest, and not this case.)
 
     The old behaviour stands - the price fills both sides - because the importer
     rejects a file whose prices are not positive. What must not happen is a
@@ -304,3 +306,26 @@ def test_a_one_tick_spread_is_never_reported_as_zero(
 
     assert tick.spread_points == 1
     assert tick.ask > tick.bid
+
+
+def test_decoding_once_yields_the_same_ticks() -> None:
+    """
+    The receive loop decodes each message once and hands the dict over.
+
+    Until 2026-10-08 every message went through json.loads twice - once to ask
+    whether it was a heartbeat, once to parse it - on the loop that stamps the
+    ticks. The decoded path must produce exactly what the text path does.
+    """
+    def fresh() -> KrakenMessageParser:
+        return KrakenMessageParser(CollectionClock(), QuoteCache())
+
+    by_text, by_dict = fresh(), fresh()
+    for raw in (ticker_message(), trade_message()):
+        from_text = by_text.parse_message(raw)
+        from_dict = by_dict.parse_decoded(json.loads(raw))
+        assert (from_text is None) == (from_dict is None)
+
+    stamped = ("collected_msc", "quote_age_ms")
+    assert {k: v for k, v in vars(from_text[0]).items() if k not in stamped} == \
+        {k: v for k, v in vars(from_dict[0]).items() if k not in stamped}
+    assert from_dict[0].trade_id is not None

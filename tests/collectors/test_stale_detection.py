@@ -13,12 +13,22 @@ a short threshold would see a dead feed at every day cut and force a reconnect
 that costs real trades. These tests drive the time source and the sleep by hand
 to make both happen on demand.
 
+Since 2026-10-08 the watchdog REPORTS what it found and closes nothing: the end
+of a connection is torn down in exactly one place, in start(), whichever
+detector saw it first. So these tests read the detection the watchdog returns;
+the teardown has its own tests in test_drop_detection.py, except one that needs
+a frame no real far side here sends at that moment: a close frame without a
+code, found by the teardown after a detector that did not carry it.
+
 Location: tests/collectors/test_stale_detection.py
 """
 
 import asyncio
 from typing import Callable, List
 
+from websockets.frames import Close
+
+from python.collectors.kraken.outage_tracker import Detection
 from python.collectors.kraken.quote_cache import QuoteCache
 from python.collectors.kraken.websocket_client import KrakenWebSocketClient
 from python.utils.collection_clock import CollectionClock
@@ -28,13 +38,9 @@ STALE_AFTER = 10.0
 
 
 class FakeSocket:
-    """Records whether the client closed it."""
+    """A connection that never received a close frame."""
 
-    def __init__(self) -> None:
-        self.closed = False
-
-    async def close(self) -> None:
-        self.closed = True
+    close_rcvd = None
 
 
 def run_monitor(
@@ -48,7 +54,8 @@ def run_monitor(
             it advances the clock and decides what the feed did meanwhile
 
     Returns:
-        (client, socket, seconds elapsed on the driven clock)
+        (client, what the watchdog reported, seconds elapsed on the driven
+        clock)
     """
     now = [START]
     client = KrakenWebSocketClient(
@@ -66,8 +73,9 @@ def run_monitor(
     client._websocket = socket
     client._last_message_monotonic = START
 
-    asyncio.run(asyncio.wait_for(client._heartbeat_loop(), timeout=5))
-    return client, socket, now[0] - START
+    detection = asyncio.run(asyncio.wait_for(client._heartbeat_loop(),
+                                             timeout=5))
+    return client, detection, now[0] - START
 
 
 def stop_at(limit: float, now: List[float],
@@ -82,11 +90,10 @@ def test_a_silent_feed_is_reopened_on_the_first_check_past_the_threshold() -> No
     def silent(now, client, seconds) -> None:
         now[0] += seconds
 
-    client, socket, elapsed = run_monitor(silent)
+    _, detection, elapsed = run_monitor(silent)
 
-    assert socket.closed
+    assert detection.kind == "silence_watchdog"
     assert elapsed == STALE_AFTER + 1
-    assert client._connection_status == "reconnecting"
 
 
 def test_a_feed_that_sends_its_heartbeat_is_left_alone() -> None:
@@ -96,9 +103,9 @@ def test_a_feed_that_sends_its_heartbeat_is_left_alone() -> None:
         client._last_message_monotonic = now[0]
         stop_at(60, now, client)
 
-    _, socket, _ = run_monitor(heartbeating)
+    _, detection, _ = run_monitor(heartbeating)
 
-    assert not socket.closed
+    assert detection is None
 
 
 def test_a_blocked_event_loop_is_not_mistaken_for_a_dead_feed() -> None:
@@ -121,9 +128,9 @@ def test_a_blocked_event_loop_is_not_mistaken_for_a_dead_feed() -> None:
         client._last_message_monotonic = now[0]
         stop_at(40, now, client)
 
-    _, socket, _ = run_monitor(blocked_then_alive)
+    _, detection, _ = run_monitor(blocked_then_alive)
 
-    assert not socket.closed
+    assert detection is None
 
 
 def test_a_feed_that_died_during_a_block_is_still_reopened() -> None:
@@ -137,7 +144,36 @@ def test_a_feed_that_died_during_a_block_is_still_reopened() -> None:
             return
         now[0] += seconds
 
-    _, socket, elapsed = run_monitor(blocked_then_silent)
+    _, detection, elapsed = run_monitor(blocked_then_silent)
 
-    assert socket.closed
+    assert detection.kind == "silence_watchdog"
     assert elapsed == 18.0 + 1
+
+
+class ClosedWithoutCode:
+    """A connection whose far side sent a close frame that carried no code."""
+
+    def __init__(self) -> None:
+        self.close_rcvd = Close.parse(b"")
+
+
+def test_a_frame_a_detector_did_not_carry_is_read_without_its_stand_in_code(
+) -> None:
+    """
+    A detector without the frame - here the subscription deadline - fires
+    after a close frame did arrive; the teardown names the end from the
+    frame. That frame carried no code, which websockets reports as 1005, and
+    the record must not: the code is the library's, not Kraken's.
+    """
+    client = KrakenWebSocketClient(
+        symbols=["BTC/USD"], clock=CollectionClock(), quote_cache=QuoteCache(),
+        streams=["trade"])
+    client._websocket = ClosedWithoutCode()
+    seen: List[Detection] = []
+    client._tracker.connection_ended = (
+        lambda detection, mono: seen.append(detection))
+
+    client._end_connection(Detection("subscribe_unanswered"), 0.0)
+
+    assert seen[0].kind == "far_side_close"
+    assert seen[0].close_code is None

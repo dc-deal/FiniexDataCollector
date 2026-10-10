@@ -522,19 +522,36 @@ class LiveDisplay:
         else:
             parts.append("Logs: -")
 
-        # Reconnects
-        reconnect_count = len(self._stats.reconnect_events)
-        if self._stats.last_reconnect:
+        # Reconnects. The count comes from the totals: the detailed records are
+        # capped at twenty, so their length stops being a count the moment the
+        # ring fills. A collector too old to send totals is counted by its ring,
+        # which is what it holds - never by a zero nobody measured.
+        totals = self._stats.reconnect_totals
+        reconnect_count = (totals.count if totals is not None
+                           else len(self._stats.reconnect_events))
+        in_progress = self._stats.reconnect_in_progress
+        if in_progress is not None and in_progress.reconnected_at is None:
+            since = in_progress.timestamp.strftime("%H:%M:%S")
+            parts.append(
+                f"[red]Feed down since {since} ({in_progress.reason}, "
+                f"attempt {max(in_progress.attempts, 1)})[/red]")
+        elif self._stats.last_reconnect:
             last = self._stats.last_reconnect
             # Seconds below three minutes: whole minutes rendered a 105 s
             # outage as "1m" and a 45 s one as "0m", which is the range these
             # actually fall in.
             secs = last.duration_seconds
-            down = f"{secs:.0f}s" if secs < 180 else f"{secs / 60:.0f}m"
+            if secs is None:
+                down = "not restored"
+            else:
+                down = (f"{secs:.0f}s" if secs < 180 else f"{secs / 60:.0f}m")
+                down += " without data"
             time_str = last.reconnected_at.strftime(
                 "%a %d.%m %H:%M") if last.reconnected_at else "unknown"
+            reason = f", {last.reason}" if last.reason else ""
             parts.append(
-                f"Reconnects: {reconnect_count} (Last: {time_str}, {down} down)")
+                f"Reconnects: {reconnect_count} (Last: {time_str}, {down}"
+                f"{reason})")
         else:
             parts.append(f"Reconnects: {reconnect_count}")
 

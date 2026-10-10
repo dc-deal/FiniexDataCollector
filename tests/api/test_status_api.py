@@ -555,3 +555,44 @@ def test_the_interpreter_version_is_sampled_not_invented() -> None:
     sampled = sample_build_info("9.9.9", "9.9.9")
 
     assert sampled.python_version == platform.python_version()
+
+
+def test_build_names_the_websocket_library_and_its_client(
+        client: TestClient) -> None:
+    """
+    requirements.txt allows websockets>=12.0, and its two client
+    implementations end a connection differently - a close frame on an open
+    connection blocks recv() for 20 s in one and 10 s in the other. How the
+    collector classifies a drop depends on which one runs, so the route says.
+    """
+    payload = client.get("/v1/build").json()
+
+    assert "websockets_version" in payload
+    assert "websockets_client" in payload
+
+
+def test_the_websocket_library_is_sampled_not_invented(monkeypatch) -> None:
+    """Read from the package metadata and from what websockets.connect is."""
+    from python.api import build_info
+
+    monkeypatch.setattr(build_info, "package_version", lambda name: "9.9-test")
+
+    sampled = build_info.sample_build_info("9.9.9", "9.9.9")
+
+    assert sampled.websockets_version == "9.9-test"
+    assert sampled.websockets_client in ("websockets.asyncio.client",
+                                         "websockets.legacy.client")
+
+
+def test_missing_package_metadata_is_absent_not_guessed(monkeypatch) -> None:
+    """Like the commit: a fabricated version is worse than a missing one."""
+    from importlib.metadata import PackageNotFoundError
+
+    from python.api import build_info
+
+    def missing(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(build_info, "package_version", missing)
+
+    assert build_info.sample_build_info("x", "y").websockets_version is None

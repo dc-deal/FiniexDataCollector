@@ -66,6 +66,8 @@ asserts the absence rather than trusting the intent.
   "data_format_version": "<format version, from python/types/tick_types.py>",
   "commit": "0c2f88e",
   "python_version": "3.12.4",
+  "websockets_version": "16.0",
+  "websockets_client": "websockets.asyncio.client",
   "dirty": false,
   "started_at": "2026-09-15T10:00:00+00:00"
 }
@@ -91,6 +93,14 @@ this route is the first thing to gate.
 Dockerfile pinned 3.12, CI ran 3.13, the development laptop had 3.13.7, and the server's was
 unknowable from anywhere, because no surface reported it. A suite green on a version
 production does not run proves less than it looks like.
+
+`websockets_version` and `websockets_client` say which websocket library answers the feed and
+which of its two client implementations `websockets.connect` resolves to. `requirements.txt`
+allows `websockets>=12.0`, and the two implementations end a connection differently where the
+drop detection lives - measured 2026-10-08, a close frame on a connection left open blocks
+`recv()` for 20 s in one and 10 s in the other, and a dead link's close takes 5 s or 15 s. How a
+drop is classified depends on which one runs; until these fields nothing said. A missing package
+metadata is reported as `null`, like a missing commit.
 
 Note `version` and `data_format_version` are different numbers and move for different
 reasons: the first is what this program is, the second is what its output files promise.
@@ -218,7 +228,8 @@ cannot take 279 ms. The lag monitor runs ten times a second, so when the cause i
 being scheduled at all rather than one long operation, the sample lands on whatever runs most. Read
 a named frame as "the loop was here", not as "this is slow", and check the named code before
 believing it. The second reading of that week survived the check: `message_parser.is_heartbeat`
-really does decode every message a second time.
+really did decode every message a second time - removed 2026-10-08, when the receive loop began
+decoding each message once and dispatching on the result.
 
 **`worst_stalls` holds the session's largest, beside `stalls` which holds the latest.** A single
 recent-only ring discards the interesting entry first: measured 2026-09-24, the UTC day cut closed
@@ -246,8 +257,91 @@ ERROR or CRITICAL counts as an error, every WARNING as a warning, since the proc
 `recent_logs` holds the most recent of them, as many as the display keeps. They are derived through a listener on the logger
 rather than raised by each error path, because the error paths never raised them: until
 2026-09-19 all three were constants — 0, 0 and empty — in every payload ever served, while the
-production log carried forced reconnects. A forced reconnect is an ERROR line and counts; the
-reconnects themselves are in `reconnect_events`.
+production log carried forced reconnects. Since 2026-10-08 a connection that ended is one
+WARNING line, `Connection ended: <how>` - except a silent link, whose only line is the silence
+watchdog's ERROR, `No messages for Ns`, and an end the code caused itself (`unexpected`, a
+detector that raised), which is that line at ERROR. Beyond that the Kraken client writes an ERROR
+for a subscription Kraken refused or left unanswered past 10 s, a stream that produced nothing at
+all (reconnected), a send that failed on a live connection, a failed connection attempt - one line
+per attempt, `Connection failed: <why>`, and none for an attempt a stop overtook - a failing tick
+handler, or the catch-all's `Unexpected error`. Until then every drop was the watchdog's ERROR and
+every failed attempt two, so `total_errors` counted reconnects and little else. Count drops from
+`reconnect_events` and the `[OUTAGE]` lines, not from log levels.
+
+**`reconnect_events` holds one record per interruption of the Kraken feed**, from the last message
+before it to the moment every subscription was answered again - or the 10 s deadline gave up on
+the stragglers - and on to the first trade per symbol. Until 2026-10-08 a record ran from the moment a drop was NOTICED to the socket handshake,
+by subtracting two wall-clock readings, with a reason that was always `connection_restored`: a drop
+recorded as 2.2 s had cost about 12 s of trades. In 136 of 137 drops between 2026-09-20 and
+2026-10-08 the socket was already closing when the 10 s silence watchdog found it. The four fields
+kept their names and got back the meaning their documentation always claimed:
+
+| Field | Meaning |
+|---|---|
+| `timestamp` | wall clock at the last message received before the drop |
+| `reconnected_at` | wall clock when every (stream, symbol) pair was settled again - acknowledged, refused, or delivering data - or when the 10 s subscription deadline gave up on the stragglers listed in `unconfirmed`; `null` while in progress |
+| `duration_seconds` | the data gap, last message to restored, on the monotonic clock; at a give-up it includes the wait for the deadline, while most pairs may have been back long before - `first_trade_after_ms` per symbol says when each was; `null` while in progress |
+| `reason` | how the drop was detected: `far_side_close`, `connection_lost`, `keepalive_timeout`, `library_failure`, `silence_watchdog`, `subscribe_unanswered`, `subscribe_send_failed` or `unexpected` |
+
+Beside them, every one defaulted so a viewer reading an older collector still draws:
+
+- `close_code`, `close_reason` - the frame Kraken sent; `null` when none arrived or it carried no
+  code, and `reason` `far_side_close` says a frame came. Never the 1006 the library reports for a
+  connection that ended without a frame, nor the 1005 it reports for a frame without a code: both
+  codes are the library's, and RFC 6455 forbids either on the wire.
+- `exception`, `cause` - what ended the connection and the error chained under it.
+- `detected_after_ms`, `handshake_after_ms`, `confirmed_after_ms` (per stream: the latest pair
+  acknowledged or confirmed by its data; a stream Kraken refused outright is absent) and
+  `first_trade_after_ms` - the timeline, each measured from the last message. `teardown_ms` is
+  the time spent dropping the old socket, about 0: a connection given up on is aborted rather
+  than closed politely for its 5 s timeout.
+- `attempts`, `backoff_s`, `last_failure` - one outage is one record however many attempts it
+  takes.
+- `rejected` - pairs Kraken refused; `unconfirmed` - pairs that neither answered nor delivered
+  data within 10 s and were listed rather than waited for.
+- `connection_age_s` - how long the dropped connection had been fully subscribed;
+  `kraken_connection_id` and `kraken_system` - from Kraken's status message on it.
+- `symbols[SYMBOL]` - `last_trade_id` before the drop, `first_trade_id` the first trade on the
+  connection that restored the feed, and `missing_trade_ids` - the ids in between that never
+  arrived: first - last - 1, less any trades an attempt that failed before the restoration
+  delivered in between (only possible with `attempts` above 1, in this outage or - with
+  `spans_previous_outage` - in the one before). Measured live and across file
+  boundaries. An **upper bound**: Kraken may allocate ids it never publishes as trades. `null`,
+  never 0, when an end is unknown - including a first trade that only came from an attempt that
+  never restored the feed. `ids_not_increasing` flags a replay anywhere in the outage, which
+  leaves the count unknown; `spans_previous_outage` flags a symbol whose first trade after the
+  previous outage was still unknown when that record closed - by the next drop, the deadline or a
+  refusal - and that did not trade before this drop: its gap starts at its last trade before that
+  outage and keeps what a failed attempt of it counted, so it covers both.
+- `resolved_by` - `all_symbols_traded`, `deadline` (15 minutes after restoration), `next_drop` or
+  `shutdown`; `''` while the record is still open.
+
+**`reconnect_in_progress`** is the outage whose feed is still down, until every subscription is
+answered again or the deadline gives up on the stragglers. A restored record still waiting for its
+first trades is already the newest entry in `reconnect_events`, with `resolved_by` `''`.
+**`reconnect_totals`** counts every outage since the process started - `count`, `by_reason`,
+`by_day` for the fourteen most recent UTC dates on which an outage occurred (not a calendar window:
+after a quiet stretch the oldest key can be weeks back, and the keys say how far),
+`gap_seconds_total`, `gap_seconds_max`, `missing_trade_ids_total`. The last adds what the records
+came to: a symbol whose first trade after an outage arrived only after its record had closed, with
+no new outage before it, adds nothing, and neither does what a failed attempt counted for a symbol
+whose first trade had not come when the process stopped - so on thin pairs it is lower than the
+ids actually missed.
+`reconnect_events` keeps only the latest twenty, because one record with
+nine symbols is about 3 KB and this payload is served every second while a viewer is open; its
+length stops being a count once it fills. `reconnect_totals` is `null` until the first outage -
+never a zero nobody measured. Nothing empties the history any more; until 2026-10-08 the weekly
+report and every Telegram `/report` did.
+
+**Every outage is also an `[OUTAGE]` line in the log, at INFO**: when the feed is restored
+(`"stage": "restored"`) and again when the record is resolved (`"stage": "resolved"`), through the
+same converter this route uses and with `"schema": 1`. The restored line survives a kill before the
+slowest symbol trades again; the resolved one is complete. An outage still open at a stop writes
+only the resolved line, with `reconnected_at` `null` and `resolved_by` `shutdown`. So an outage is
+counted by its resolved line, plus any restored line no resolved line followed - a kill. INFO
+means a file level of WARNING or above leaves the line out; the shipped level is INFO. History
+beyond what the process holds is `/v1/logs?day=...&contains=[OUTAGE]` - and a drop shortly before
+00:00 UTC can sit in the next day's file.
 
 Alongside the stats, the payload carries **`origin`** — the same block a tick file
 carries, field for field, so a consumer parses one structure and not two:

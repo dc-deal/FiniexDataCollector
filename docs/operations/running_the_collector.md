@@ -67,24 +67,33 @@ third start took over and recovered the log the kill left behind.
 
 Telegram carries the things somebody would act on, and deliberately not the rest.
 
-**A reconnect is normally silent.** Measured over the night of 2026-09-21: seven of them, each
-1.3 to 7.2 s, 19.9 s in total — about 22 ticks, and not one appeared among the eight longest gaps
-in the file it fell into, which were all quiet market. This host loses outbound connectivity
-several times a day; FiniexRAGEngine measured that from five sides, and nothing on our side
-prevents it. Six alerts for an event invisible in the data trains the reader to swipe, and the
-next one that mattered is swiped with it.
+**A reconnect is normally silent.** Measured over the night of 2026-09-21: seven of them,
+recorded at 1.3 to 7.2 s each. Those figures ran from the moment a drop was noticed to the socket
+handshake and so left out the 10-11 s of silence before it was noticed - the record was corrected
+on 2026-10-08 - but even counted in full the drops were not among the longest gaps of the files
+they fell into. This host loses outbound connectivity several times a day; FiniexRAGEngine
+measured that from five sides, and nothing on our side prevents it. Six alerts for an event
+invisible in the data trains the reader to swipe, and the next one that mattered is swiped with
+it.
 
 Two still arrive:
 
 | | Why |
 |---|---|
-| downtime past `reconnect_alert_min_seconds` (30 s) | past the consumer's lag window a whole file is refused, not shortened |
+| a data gap past `reconnect_alert_min_seconds` (30 s) | a normal drop costs a few seconds and a silent link about fifteen, so thirty means reconnecting itself is failing or the link stayed dead |
 | `reconnect_alert_cluster` (4) inside one hour | blips every two hours are weather; four in an hour is a machine degrading |
 
-Both carry the real length in seconds. Whole minutes rendered every reconnect that night as
-"0m downtime", including the 7.22 s one that was three times the others.
+Both carry the length in seconds, how the drop was detected and how many attempts it took.
+Whole minutes rendered every reconnect that night as "0m downtime", including the 7.22 s one
+that was three times the others. The length is the data gap - last message before the drop to
+the feed restored - not the window from noticing the drop to the handshake, which is what the
+alert judged until 2026-10-08. (The threshold's old justification, that past the consumer's lag
+window a whole file is refused, was wrong: an outage shortens a file. Kraken replays nothing after
+a reconnect, so the ticks that follow are fresh.)
 
-Everything else stays in the log and on `/v1/status`, where `reconnect_events` is complete.
+Everything else stays on `/v1/status` - the latest twenty outage records, and totals that count
+every one - and in the log, as one `[OUTAGE]` line per outage when the feed is restored and
+another when the record is complete.
 
 ## Stopping
 
@@ -146,17 +155,54 @@ apart.
 
 ## When a connection drops
 
-The collector closes and reopens a connection that has been silent for `stale_after_seconds`
-and resubscribes both channels. Silence counts every message, heartbeats included, and Kraken
-sends one every second on a live connection — measured at a largest gap of 1.03 s on a quiet
-pair — so the check runs every second. Kraken sends a ticker snapshot on subscribe, so the
-quote cache is refreshed before the first trade arrives — measured at 235 ms after a reconnect
-rather than the length of the outage.
+A drop costs the trades Kraken makes while nobody is listening, so the first thing that matters
+is noticing it. Three things end a connection, whichever comes first:
 
-Each drop costs the market data of its detection window plus about 6 s to reconnect and
-resubscribe. At the shipped 10 s that is roughly 11 s of noticing. Before 2026-09-19 the check
-ran every 10 s and reconnected at three times that: 41–51 s of silence per drop on the liquid
-pairs, measured by `trade_id` gaps on production — 537 trades in four drops in one evening.
+- **The receive loop ends** - Kraken closed the socket, or the connection was reset or lost.
+  Noticed at once. Until 2026-10-08 this end was handed back by `asyncio.gather(...,
+  return_exceptions=True)` and ignored, and in 136 of 137 drops between 2026-09-20 and 2026-10-08
+  the socket was already closing when the silence watchdog found it, 10-11 s later.
+- **A close frame on a connection left open.** Kraken can send its close frame and keep the TCP
+  connection open; `recv()` then waits for the next keepalive ping, 20 s later. The watchdog reads
+  the connection's state every second and takes the frame as the end.
+- **Silence** for `stale_after_seconds` - a link that stopped answering without ending. Silence
+  counts every message, heartbeats included, and Kraken sends one every second on a live
+  connection, measured at a largest gap of 1.03 s on a quiet pair.
+
+A connection given up on is dropped at once rather than closed politely, which on a dead link used
+to wait out the 5 s close timeout. Then both channels are subscribed again. Their answers are read
+by the receive loop and matched to their stream by `req_id`: until 2026-10-08 `subscribe()` read
+one message per stream and kept it if it looked like an answer, so Kraken's status message - its
+first on every connection - was discarded unseen and the first trade answer was logged as the
+ticker's, in 169 of 169 subscription cycles on production. A pair that neither answers nor
+delivers data within 10 s is listed in the record and the feed carries on; only a stream that
+produced nothing at all is reconnected, and a refusal that arrives after those 10 s still counts
+as a refusal. A single message that cannot be handled - a format Kraken changed - costs that
+message and a WARNING, never the connection. Kraken sends a ticker snapshot on subscribe, so the quote
+cache is refreshed before the first trade arrives - measured at 235 ms after a reconnect rather
+than the length of the outage.
+
+**What a drop costs now.** Measured 2026-10-08 against a local far side, both websockets
+implementations: a closed or reset connection is noticed after about 0.1 s and the feed is back
+after about 1.1 s; a close frame on an open connection after about 1.1 and 2.1 s; a silent link
+after 10.2 and 11.2 s. Against the real Kraken from the development laptop, a connection cut
+locally was noticed after 15 ms and restored after 3.4 s - 1 s of backoff and 2.3 s of handshake
+and subscription. Before 2026-09-19 the check ran every 10 s and reconnected at three times that:
+41-51 s of silence per drop on the liquid pairs, measured by `trade_id` gaps on production - 537
+trades in four drops in one evening.
+
+**The backoff starts over only after a restored connection has stayed up for 10 s.** It used to
+start over at every handshake, which with drops noticed at once would dial a far side that
+accepts and closes again every few seconds - about 150 attempts in ten minutes in a simulation
+with the 2.3 s handshake measured against Kraken, the limit Kraken documents per IP, with a
+ten-minute ban beyond it. The 10 s watchdog used to hide this by accident. Ten seconds keeps even a
+far side that closes just past the window at 45 attempts. A longer window costs data instead: when
+a degraded Kraken drops connections every 20-50 s, a 60 s window held the delay at its 60 s
+maximum - 62 % offline in the same simulation (2026-10-09), against 9 % with ten seconds.
+
+Every drop is one record on `/v1/status` and an `[OUTAGE]` line in the log when the feed is
+restored and again when the record is complete, with what it cost per symbol in trade ids - see
+[the status API](../architecture/status_api.md).
 
 ## Reading a rotation in the log
 

@@ -31,9 +31,13 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 - **Kraken WebSocket v2** - trade stream for the ticks, ticker stream for the quote each
   trade executed against
 - **Multi-Symbol Support** - every symbol in `kraken.symbols` collected in parallel
-- **Automatic Reconnection** - Exponential backoff (1s → 60s max) with tracking
-- **Heartbeat Monitoring** - Detects stale connections and forces reconnect
-- **Reconnect Tracking** - Records all reconnect events with duration
+- **Automatic Reconnection** - Exponential backoff (1s → 60s max), starting over only
+  after a restored connection has stayed up for ten seconds
+- **Drop Detection** - a closed or reset connection is noticed at once, a close frame on a
+  connection left open within a second, a silent link after `stale_after_seconds`
+- **Outage Records** - one record per interruption: how it was detected, the real data gap,
+  and the trade ids missed per symbol - on `/v1/status` and as `[OUTAGE]` log lines, one when
+  the feed is restored and one when the record is complete
 
 ### Output Format
 - **MT5-Compatible JSON** - Identical structure to TickCollector.mq5 output
@@ -302,8 +306,10 @@ over HTTP and cannot affect the collection — see
   spread of zero. A backtest that pays no spread produces a curve that is too
   favourable, and a parameter sweep then optimises against a cost that does not exist.
 - `quote_age_ms`: How old the quote was when the trade arrived. `null` means no quote
-  had been observed yet - the first trades after a start or reconnect - and the trade
-  price fills both sides, as it did before 1.6.0. Never `0` in that case: zero would
+  had been observed yet - the first trades after the process started - and the trade
+  price fills both sides, as it did before 1.6.0. After a reconnect the last quote from
+  before the drop stands until the new ticker snapshot arrives, and its age spans the
+  outage. Never `0` in that case: zero would
   claim a quote seen in the same millisecond. This field is what separates a measured
   spread from a stale one.
 - `trade_id`: Kraken's own identifier for the execution, carried through from 1.7.0.
@@ -454,24 +460,25 @@ Ticks: 50,000
 ### Reconnect Warning
 ```
 🔌 Connection Restored
-WebSocket reconnected after 3m downtime
+Feed restored after 35.2s without data (connection_lost, 3 attempts) - past the 30s mark,
+so reconnecting itself was failing or the link stayed dead
 ```
 
 ### Weekly Report
 ```
 📊 Weekly Collection Report
-Sunday, 08.02.2026 08:00 UTC
+Saturday, 10.10.2026 06:00 UTC
 
 ⏱️ Uptime
-• Runtime: 167.5 hours
+• Runtime: 412.3 hours
 • Files Created: 248
-• Errors: 0 | Warnings: 2
+• Errors: 1 | Warnings: 2
 
 📁 Data Storage
 • Kraken: 2.45 GB (248 files)
 • MT5: 0.00 GB (0 files)
-• Logs: 0.15 GB (7 files)
-• Total Data: 2.60 GB
+• Logs: 0.38 GB (18 files)
+• Total Data: 2.83 GB
 
 💾 Disk Space
 • Total: 952.6 GB
@@ -480,6 +487,9 @@ Sunday, 08.02.2026 08:00 UTC
 
 🔌 Connection Health
 • Reconnects This Week: 3
+  - Thu 08.10 07:14 (2.8s without data, far_side_close)
+  - Thu 08.10 16:22 (16.9s without data, silence_watchdog)
+  - Fri 09.10 02:05 (1.9s without data, far_side_close)
 • Current Status: connected
 
 📈 Per Symbol
@@ -487,6 +497,9 @@ Sunday, 08.02.2026 08:00 UTC
 • ETHUSD: 38 files created
 • ...
 ```
+
+The counts cover what the running process saw: within a week of a start the line reads
+`Reconnects Since Start (52 h)` instead. Older outages are in the log as `[OUTAGE]` lines.
 
 ## Vision & Roadmap
 
@@ -503,35 +516,39 @@ FiniexDataCollector outputs JSON tick files that can be processed for use with F
 
 ## Debug Mode
 
-The default logging config writes DEBUG to file only, keeping the console clean for the Live Display:
+The default logging config writes INFO and above, to the console and to the file:
 
 ```json
 {
   "logging": {
     "console_level": "INFO",
-    "file_level": "DEBUG"
+    "file_level": "INFO"
   }
 }
 ```
 
-For troubleshooting, temporarily set `console_level` to `"DEBUG"` (note: this will cause flickering with the Live Display).
+For troubleshooting, set `file_level` to `"DEBUG"` in `user_configs/app_config.json`; setting
+`console_level` to `"DEBUG"` as well makes the in-process Live Display flicker.
 
 Debug logs include structured markers for filtering:
 - `[TICK]` - Tick processing
 - `[ROTATION]` - File rotation events
-- `[STATUS]` - WebSocket status changes
-- `[RECONNECT]` - Reconnect tracking
+- `[RECONNECT_ALERT]` - Whether a restored outage alerts, and the cooldown
 - `[FOLDER_SCAN]` - Folder monitoring
 - `[DISK_MONITOR]` - Disk space checks
 - `[TELEGRAM]` - Telegram operations
 
+Every interruption of the feed is an INFO line `[OUTAGE] {json}` when the feed is restored and
+another when its record is complete - the same record `/v1/status` serves, with `"schema": 1`.
+It is written at the shipped file level of INFO and left out at WARNING or above.
+
 **Filter logs:**
 ```bash
 # Live filtering
-tail -f logs/collector_*.log | grep "\[ROTATION\]\|\[RECONNECT\]"
+tail -f logs/finiexdatacollector_*.log | grep "\[ROTATION\]\|\[OUTAGE\]"
 
-# Search for specific events
-grep "\[RECONNECT\]" logs/collector_20260208.log
+# Every outage of one day, one JSON record per line
+grep -h "\[OUTAGE\]" logs/finiexdatacollector_2026-10-08.log | sed 's/^.*\[OUTAGE\] //'
 ```
 
 ---

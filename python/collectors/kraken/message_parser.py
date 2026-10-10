@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
-from python.types.tick_types import TickData, KrakenTickerMessage
+from python.types.tick_types import TickData
 from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import MessageParseError
 from python.collectors.kraken.quote_cache import QuoteCache
@@ -62,6 +62,24 @@ class KrakenMessageParser:
                 raw_message=raw_message
             )
 
+        return self.parse_decoded(data)
+
+    def parse_decoded(self, data: Any) -> Optional[List[TickData]]:
+        """
+        Parse a message that has already been decoded.
+
+        The receive loop decodes every message once and dispatches on the dict:
+        heartbeats, Kraken's status message and subscription answers are
+        handled there, market data comes here. Until 2026-10-08 every message
+        went through json.loads twice - once to ask whether it was a heartbeat,
+        once to parse it - on the loop that stamps the ticks.
+
+        Args:
+            data: The decoded JSON value
+
+        Returns:
+            List of TickData if ticker/trade message, None for other messages
+        """
         # Skip non-dict messages
         if not isinstance(data, dict):
             return None
@@ -203,9 +221,11 @@ class KrakenMessageParser:
 
             # The execution happened at one price; the quote it executed against
             # comes from the ticker channel. Without one - the first trades after
-            # a start or reconnect - the trade price stands in for both sides, as
+            # the process started - the trade price stands in for both sides, as
             # it always did, and quote_age_ms stays None to say so. Zero would
-            # claim a quote observed in the same millisecond.
+            # claim a quote observed in the same millisecond. A reconnect does not
+            # empty the cache: a trade arriving before the new ticker snapshot
+            # carries the last quote from before the drop, and its age says so.
             quote = self._quote_cache.get(symbol)
 
             if quote:
@@ -259,106 +279,3 @@ class KrakenMessageParser:
                 raw_message=str(trade),
                 symbol=trade.get("symbol")
             )
-
-    def parse_kraken_ticker(
-        self,
-        ticker: Dict[str, Any],
-        receive_time_msc: int
-    ) -> Optional[KrakenTickerMessage]:
-        """
-        Parse to intermediate KrakenTickerMessage format.
-
-        Args:
-            ticker: Raw ticker dict
-            receive_time_msc: Local receive time
-
-        Returns:
-            KrakenTickerMessage or None
-        """
-        try:
-            return KrakenTickerMessage(
-                symbol=ticker.get("symbol", ""),
-                bid=float(ticker.get("bid", 0)),
-                bid_qty=float(ticker.get("bid_qty", 0)),
-                ask=float(ticker.get("ask", 0)),
-                ask_qty=float(ticker.get("ask_qty", 0)),
-                last=float(ticker.get("last", 0)),
-                volume=float(ticker.get("volume", 0)),
-                vwap=float(ticker.get("vwap", 0)),
-                low=float(ticker.get("low", 0)),
-                high=float(ticker.get("high", 0)),
-                change=float(ticker.get("change", 0)),
-                change_pct=float(ticker.get("change_pct", 0)),
-                received_at_msc=receive_time_msc
-            )
-        except (KeyError, ValueError, TypeError):
-            return None
-
-    def reset_tick_counter(self, symbol: Optional[str] = None) -> None:
-        """
-        Reset tick counter (e.g., on minute boundary).
-
-        Args:
-            symbol: Specific symbol to reset, or all if None
-        """
-        if symbol:
-            self._tick_counter[symbol] = 0
-        else:
-            self._tick_counter.clear()
-
-    def is_subscription_confirmation(self, raw_message: str) -> bool:
-        """
-        Check if message is subscription confirmation.
-
-        Args:
-            raw_message: JSON string
-
-        Returns:
-            True if subscription confirmation
-        """
-        try:
-            data = json.loads(raw_message)
-            return (
-                isinstance(data, dict) and
-                data.get("method") == "subscribe" and
-                data.get("success") is True
-            )
-        except json.JSONDecodeError:
-            return False
-
-    def is_error_message(self, raw_message: str) -> Optional[str]:
-        """
-        Check if message is error and extract error text.
-
-        Args:
-            raw_message: JSON string
-
-        Returns:
-            Error message string or None if not error
-        """
-        try:
-            data = json.loads(raw_message)
-            if isinstance(data, dict) and data.get("success") is False:
-                return data.get("error", "Unknown error")
-            return None
-        except json.JSONDecodeError:
-            return None
-
-    def is_heartbeat(self, raw_message: str) -> bool:
-        """
-        Check if message is heartbeat.
-
-        Args:
-            raw_message: JSON string
-
-        Returns:
-            True if heartbeat message
-        """
-        try:
-            data = json.loads(raw_message)
-            return (
-                isinstance(data, dict) and
-                data.get("channel") == "heartbeat"
-            )
-        except json.JSONDecodeError:
-            return False

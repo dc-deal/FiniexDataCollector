@@ -6,10 +6,18 @@ Location: python/types/collector_stats.py
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict
 
 from python.types.log_level import ERROR, LogLevel
+
+# Dates the per-day outage count keeps - the most recent dates that had an
+# outage, which on a feed dropping several times a day is two weeks.
+RECONNECT_DAYS_KEPT = 14
+
+# How far back the uncapped outage times reach: the week a report counts, and a
+# day of margin for a report that runs late.
+OUTAGE_TIMES_KEPT = timedelta(days=8)
 
 
 @dataclass
@@ -60,20 +68,179 @@ class SymbolStats:
 
 
 @dataclass
-class ReconnectEvent:
+class TradeIdGap:
     """
-    Single reconnect event.
+    What one symbol's trade ids say about one interruption of the feed.
+
+    Kraken numbers trades per pair, and in this collector's 1.7.0 files those
+    numbers have been dense: no gap outside a drop, consecutive files joining at
+    last + 1. So the first id after a drop minus the last one before it says how
+    many trades went by unseen - as an UPPER bound, because the venue may
+    allocate ids it never publishes. Measured here, live, it does not depend on
+    which file either trade ended up in.
 
     Attributes:
-        timestamp: When disconnect occurred
-        reconnected_at: When reconnection succeeded
-        duration_seconds: Downtime duration
-        reason: Disconnect reason
+        last_trade_id: The symbol's last trade received before the drop - with
+            spans_previous_outage, before the earliest outage the gap covers;
+            None if there was none
+        last_trade_time_msc: That trade's exchange time
+        first_trade_id: The first trade after the drop on the connection that
+            restored the feed; None until it arrives, and for good if the record
+            was resolved before it did
+        first_trade_time_msc: That trade's exchange time
+        first_trade_after_ms: Offset of its arrival from the outage's last
+            message, on the monotonic clock
+        missing_trade_ids: Ids after the last trade before the drop and before
+            the first one after it that never arrived - first - last - 1, less
+            any trades an attempt that failed before the restoration delivered
+            in between. An upper bound on trades missed; None when an end is
+            unknown or the ids did not increase - never 0 by default, because 0
+            would claim nothing was missed
+        ids_not_increasing: Somewhere in this outage a first trade - on the
+            restoring connection or on an attempt that failed - was not above
+            the highest id received before it: a replay or a reordering,
+            flagged rather than counted, and the count stays unknown
+        spans_previous_outage: The symbol's first trade after the previous
+            outage was still unknown when that record closed - by the next
+            drop, the deadline, or a refusal - and it did not trade before
+            this drop. This gap starts at its last trade before that outage
+            and keeps whatever a failed attempt of it counted, so it covers
+            both: the total stays right, the attribution to this one outage
+            does not
+    """
+    last_trade_id: Optional[int] = None
+    last_trade_time_msc: Optional[int] = None
+    first_trade_id: Optional[int] = None
+    first_trade_time_msc: Optional[int] = None
+    first_trade_after_ms: Optional[float] = None
+    missing_trade_ids: Optional[int] = None
+    ids_not_increasing: bool = False
+    spans_previous_outage: bool = False
+
+
+@dataclass
+class ReconnectEvent:
+    """
+    One interruption of the Kraken feed, from the last message before it to the
+    moment every subscription was answered again.
+
+    The four leading fields kept their names through 2026-10-08 and got back the
+    meaning their documentation always claimed. Until then `timestamp` was the
+    moment the drop was NOTICED - 10-11 s after the data stopped, because a
+    socket Kraken had closed was only found by the silence watchdog - the event
+    ended at the socket handshake, before anything was subscribed again, the
+    duration was two wall-clock readings subtracted, and `reason` was the
+    constant 'connection_restored'. A reconnect recorded as 2.2 s had cost about
+    12 s of trades.
+
+    Durations are measured on the monotonic clock; the two datetimes are wall
+    clock readings for a human and are never subtracted from each other.
+
+    Attributes:
+        timestamp: Wall clock at the last message received before the drop -
+            when data stopped, as far as this process can know
+        reconnected_at: Wall clock when every (stream, symbol) subscription had
+            been answered again - or when the 10 s subscription deadline gave
+            up on the stragglers listed in `unconfirmed`; None while the
+            outage is in progress
+        duration_seconds: The data gap - last message to feed restored,
+            monotonic; at a give-up it includes the wait for the deadline,
+            while most pairs may have been back long before. None while in
+            progress
+        reason: How the drop was detected - far_side_close, connection_lost,
+            keepalive_timeout, library_failure, silence_watchdog,
+            subscribe_unanswered, subscribe_send_failed or unexpected
+        close_code: Code of the close frame Kraken sent; None when no frame
+            arrived or it carried no code - reason far_side_close says a frame
+            came. Never 0, and never the 1006 or 1005 the library reports for a
+            missing frame or a missing code
+        close_reason: Text of that frame
+        exception: What ended the connection, as text
+        cause: The error chained under it (a reset, a DNS failure), as text
+        detected_after_ms: Last message to detection
+        teardown_ms: Time spent dropping the old socket: about 0, because a
+            connection given up on is aborted rather than closed politely for
+            its close timeout - it does not tell a closed link from a dead one
+        attempts: Connection attempts in this outage, the successful one included
+        backoff_s: Seconds slept between attempts in this outage
+        last_failure: The most recent failed attempt, as text
+        handshake_after_ms: Last message to the handshake that succeeded
+        confirmed_after_ms: Per stream, last message to the latest moment a
+            pair of it was acknowledged or confirmed by its data; a stream
+            Kraken refused outright was confirmed at no time and is absent
+        rejected: Pairs Kraken refused to subscribe, as 'stream SYMBOL: error'
+        unconfirmed: Pairs that neither answered nor delivered data within the
+            subscription deadline; the feed was taken as restored without them
+        first_trade_after_ms: Last message to the first trade on any symbol
+        connection_age_s: How long the dropped connection had been fully
+            subscribed - the same anchor the backoff reset is measured from
+        kraken_connection_id: Kraken's id for the dropped connection, a string
+            because it is a 63-bit integer a JavaScript reader would round
+        kraken_system: The last system state Kraken announced on it
+        resolved_by: What closed the record - all_symbols_traded, deadline,
+            next_drop or shutdown; '' while open
+        symbols: Per symbol, what its trade ids say about this interruption
     """
     timestamp: datetime
     reconnected_at: Optional[datetime]
-    duration_seconds: float
+    duration_seconds: Optional[float]
     reason: str
+
+    # Defaulted rather than required, as on StallEvent: a viewer runs against
+    # whatever build the box carries, and an older collector sends only the four
+    # fields above.
+    close_code: Optional[int] = None
+    close_reason: str = ""
+    exception: str = ""
+    cause: str = ""
+    detected_after_ms: Optional[float] = None
+    teardown_ms: Optional[float] = None
+    attempts: int = 0
+    backoff_s: float = 0.0
+    last_failure: str = ""
+    handshake_after_ms: Optional[float] = None
+    confirmed_after_ms: Dict[str, float] = field(default_factory=dict)
+    rejected: List[str] = field(default_factory=list)
+    unconfirmed: List[str] = field(default_factory=list)
+    first_trade_after_ms: Optional[float] = None
+    connection_age_s: Optional[float] = None
+    kraken_connection_id: str = ""
+    kraken_system: str = ""
+    resolved_by: str = ""
+    symbols: Dict[str, TradeIdGap] = field(default_factory=dict)
+
+
+@dataclass
+class ReconnectTotals:
+    """
+    Every outage since the process started, beyond what the ring keeps.
+
+    The detailed records are capped, because each one carries nine symbols and
+    the status payload is serialised every second while a viewer is open. The
+    totals are what a count or an average is computed from - the length of a
+    capped list stops being a count the moment it fills.
+
+    Attributes:
+        count: Outages restored (or ended by a shutdown) since start
+        by_reason: Count per detection kind
+        by_day: Count per UTC date, for the fourteen most recent dates on which
+            an outage occurred - not a calendar window: after a quiet stretch
+            the oldest key can be weeks back, and the keys say how far
+        gap_seconds_total: Sum of the data gaps
+        gap_seconds_max: The longest data gap
+        missing_trade_ids_total: Sum of the per-symbol counts the records came
+            to. A symbol whose first trade after an outage arrived only after
+            its record had closed, with no new outage before it, adds nothing,
+            and neither does what a failed attempt counted for a symbol whose
+            first trade had not come when the process stopped: those ids are
+            counted in no record
+    """
+    count: int = 0
+    by_reason: Dict[str, int] = field(default_factory=dict)
+    by_day: Dict[str, int] = field(default_factory=dict)
+    gap_seconds_total: float = 0.0
+    gap_seconds_max: float = 0.0
+    missing_trade_ids_total: int = 0
 
 
 @dataclass
@@ -463,6 +630,21 @@ class CollectorStats:
         self.last_file: Optional[FileInfo] = None
         self.reconnect_events: List[ReconnectEvent] = []
         self.last_reconnect: Optional[ReconnectEvent] = None
+
+        # The outage whose feed is still down, until every subscription is
+        # answered again or the deadline gave up on the stragglers. On
+        # /v1/status this is the answer to 'is the feed down right now, and why'. A restored record still waiting for its first
+        # trade per symbol is already the newest entry in reconnect_events,
+        # with resolved_by '' until it is complete.
+        self.reconnect_in_progress: Optional[ReconnectEvent] = None
+        # None until the first outage, not a zero: a viewer reading a build
+        # that does not send totals must not show a count nobody measured.
+        self.reconnect_totals: Optional[ReconnectTotals] = None
+        # When each outage of the last OUTAGE_TIMES_KEPT began, uncapped: an
+        # hour's or a week's count read off the twenty-record ring stops at
+        # twenty. Private, so /v1/status does not serialise it; the event loop
+        # is its only reader and writer.
+        self._outage_times: List[datetime] = []
         self.disk_space: DiskSpaceStats = DiskSpaceStats()
         self.folders: Dict[str, FolderStats] = {}
         self.loop_lag: LoopLag = LoopLag()
@@ -498,7 +680,10 @@ class CollectorStats:
         self.max_stalls: int = 10
         self.max_worst_stalls: int = 10
         self.max_recent_logs: int = 50
-        self.max_reconnect_history: int = 100
+        # Twenty detailed records, with the totals carrying everything older:
+        # one record with nine symbols is about 3 KB, and the payload is
+        # serialised every second while a viewer is open.
+        self.max_reconnect_history: int = 20
 
     def get_symbol_stats(self, symbol: str) -> SymbolStats:
         """
@@ -559,67 +744,100 @@ class CollectorStats:
             created_at=datetime.now(timezone.utc)
         )
 
-    def record_reconnect(self, reason: str, duration_seconds: float = 0.0) -> None:
+    def record_outage(self, stage: str, event: ReconnectEvent) -> None:
         """
-        Record a reconnect event.
+        Follow one outage through its three stages.
+
+        The record is the same object in every stage and on every list it is
+        on, so what arrives later - the first trade per symbol - shows up on the
+        status route without being copied anywhere.
 
         Args:
-            reason: Disconnect reason
-            duration_seconds: Downtime duration
+            stage: 'opened' when the drop is detected, 'restored' when every
+                subscription is answered again, 'resolved' when nothing more
+                will be added (all symbols traded, a deadline, the next drop,
+                or a shutdown)
+            event: The record
         """
-        now = datetime.now(timezone.utc)
-        disconnect_time = datetime.fromtimestamp(
-            now.timestamp() - duration_seconds,
-            tz=timezone.utc
-        )
+        if stage == "opened":
+            self.reconnect_in_progress = event
+            return
 
-        event = ReconnectEvent(
-            timestamp=disconnect_time,
-            reconnected_at=now,
-            duration_seconds=duration_seconds,
-            reason=reason
-        )
+        if stage == "restored":
+            self._settle_outage(event)
+            return
+
+        if stage == "resolved":
+            # A record a shutdown resolved was never restored; it is still an
+            # outage the process saw, so it is counted once, here.
+            never_restored = (event.reconnected_at is None
+                              and self.reconnect_in_progress is event)
+            if never_restored:
+                self._settle_outage(event)
+            if self.reconnect_totals is None:
+                self.reconnect_totals = ReconnectTotals()
+            self.reconnect_totals.missing_trade_ids_total += sum(
+                gap.missing_trade_ids for gap in event.symbols.values()
+                if gap.missing_trade_ids is not None)
+
+    def _settle_outage(self, event: ReconnectEvent) -> None:
+        """
+        Move an outage from 'in progress' into the history and the totals.
+
+        Args:
+            event: The record, restored or ended by a shutdown
+        """
+        if self.reconnect_in_progress is event:
+            self.reconnect_in_progress = None
 
         self.reconnect_events.append(event)
         self.last_reconnect = event
+        history = self.max_reconnect_history
+        if len(self.reconnect_events) > history:
+            self.reconnect_events = self.reconnect_events[-history:]
 
-        # Trim history
-        if len(self.reconnect_events) > self.max_reconnect_history:
-            self.reconnect_events = self.reconnect_events[-self.max_reconnect_history:]
+        times = self._outage_times + [event.timestamp]
+        newest = max(times)
+        self._outage_times = [at for at in times
+                              if at >= newest - OUTAGE_TIMES_KEPT]
 
-        # Log for debugging
-        from python.utils.logging_setup import get_logger
-        logger = get_logger("FiniexDataCollector.stats")
-        logger.debug(
-            f"[STATS] Reconnect recorded: reason={reason}, "
-            f"duration={duration_seconds:.1f}s, "
-            f"disconnect_time={disconnect_time}, "
-            f"reconnected_at={now}, "
-            f"total_events={len(self.reconnect_events)}"
-        )
+        if self.reconnect_totals is None:
+            self.reconnect_totals = ReconnectTotals()
+        totals = self.reconnect_totals
+        totals.count += 1
 
-    def get_reconnects_this_week(self) -> List[ReconnectEvent]:
+        # Rebound, never mutated: /v1/status serialises in a worker thread while
+        # this runs on the event loop, and a dict gaining a key mid-iteration
+        # raises 'dictionary changed size during iteration' - a sporadic 500.
+        reason_count = totals.by_reason.get(event.reason, 0) + 1
+        totals.by_reason = {**totals.by_reason, event.reason: reason_count}
+
+        day = event.timestamp.astimezone(timezone.utc).date().isoformat()
+        by_day = {**totals.by_day, day: totals.by_day.get(day, 0) + 1}
+        kept = sorted(by_day)[-RECONNECT_DAYS_KEPT:]
+        totals.by_day = {key: by_day[key] for key in kept}
+
+        if event.duration_seconds is not None:
+            totals.gap_seconds_total += event.duration_seconds
+            totals.gap_seconds_max = max(totals.gap_seconds_max,
+                                         event.duration_seconds)
+
+    def outages_since(self, cutoff: datetime) -> int:
         """
-        Get reconnect events from last 7 days.
+        How many outages began at or after a moment, counted without a cap.
+
+        Not off the ring, which holds the latest twenty: a cluster threshold
+        above twenty could never fire, and a busy week read twenty. Not off
+        by_day either, whose whole dates made a weekly count and the weekly
+        list disagree about the part of a day seven days back.
+
+        Args:
+            cutoff: The earliest moment counted; at most OUTAGE_TIMES_KEPT back
 
         Returns:
-            List of recent reconnect events
+            Outages whose last message before the drop came at or after cutoff
         """
-        now = datetime.now(timezone.utc)
-        week_ago = datetime.fromtimestamp(
-            now.timestamp() - (7 * 24 * 3600),
-            tz=timezone.utc
-        )
-
-        return [
-            event for event in self.reconnect_events
-            if event.timestamp >= week_ago
-        ]
-
-    def reset_weekly_reconnects(self) -> None:
-        """Reset reconnect history (called after weekly report)."""
-        self.reconnect_events = []
-        self.last_reconnect = None
+        return sum(1 for at in self._outage_times if at >= cutoff)
 
     def record_error(self, message: str) -> None:
         """

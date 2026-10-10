@@ -24,7 +24,7 @@ import psutil
 
 from python.api.api_app import create_api
 from python.api.build_info import sample_build_info
-from python.api.stats_serializer import health_payload, serialize_stats
+from python.api.stats_serializer import health_payload, plain, serialize_stats
 from python.api.token_loader import load_token_registry
 from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
@@ -44,7 +44,7 @@ from python.viewer.watch import run_viewer
 from python.utils.gc_watcher import GcWatcher
 from python.utils.stall_sampler import StallSampler
 from python.utils.live_display import LiveDisplay
-from python.types.collector_stats import CollectorStats
+from python.types.collector_stats import CollectorStats, ReconnectEvent
 from python.types.tick_types import OriginBlock
 from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import ConfigurationError
@@ -82,44 +82,57 @@ def is_reconnect(old_status: str, new_status: str) -> bool:
 
 
 def reconnect_alert_text(duration_seconds: float, recent_within_hour: int,
-                         min_seconds: float, cluster_size: int) -> Optional[str]:
+                         min_seconds: float, cluster_size: int,
+                         reason: str = "", attempts: int = 1) -> Optional[str]:
     """
-    Decide whether a restored connection is worth a phone alert, and say what.
+    Decide whether a restored feed is worth a phone alert, and say what.
 
-    Measured over the night of 2026-09-21: seven reconnects, each between 1.3
-    and 7.2 s, adding up to 19.9 s of downtime in fifteen hours. That is about
-    22 ticks, and none of the seven appeared among the eight longest gaps in the
-    file they fell into - those were all quiet market. Six alerts arrived on the
-    operator's phone for something that cannot be found in the data afterwards.
+    Measured over the night of 2026-09-21: seven reconnects, recorded at 1.3 to
+    7.2 s each and 19.9 s in total - figures that ran from the moment a drop was
+    noticed to the socket handshake, and so left out the 10-11 s of silence
+    before each was noticed. Even with that added the drops were not visible
+    among the longest gaps of the files they fell into, and six alerts reached
+    the operator's phone for them.
 
     An alert nobody can act on is not free: it trains its reader to swipe, and
-    the next one that mattered is swiped with it. So a short, self-healed
-    reconnect stays in the log and on `/v1/status`, where it is already
-    complete, and two things still reach the phone:
+    the next one that mattered is swiped with it. So a short, self-healed drop
+    stays in the log and on `/v1/status`, where its whole record is, and two
+    things still reach the phone:
 
-    - **A long outage**, because past the consumer's lag window a whole file is
-      refused rather than shortened.
+    - **A long outage**, measured as the data gap - last message before the drop
+      to the feed restored. Since 2026-10-08 a closed socket is noticed at once
+      and a normal drop costs a few seconds, so 30 s means reconnecting itself
+      is failing or the link stayed dead: something an operator can look at.
+      (An outage shortens a file; it does not get the file refused. Kraken
+      replays nothing after a reconnect, so the ticks that follow are fresh.)
     - **A cluster**, because a host that blips every two hours is weather and one
       that blips four times an hour is degrading - and that difference is the
-      only thing a short reconnect can still tell anybody.
+      only thing a short drop can still tell anybody.
 
     Args:
-        duration_seconds: How long the connection was gone
-        recent_within_hour: Reconnects in the last hour, this one included
-        min_seconds: Outage length that is worth an alert on its own
-        cluster_size: Reconnects per hour that are worth one regardless
+        duration_seconds: The data gap
+        recent_within_hour: Outages in the last hour, this one included
+        min_seconds: Gap that is worth an alert on its own
+        cluster_size: Outages per hour that are worth one regardless
+        reason: How the drop was detected, named in the text
+        attempts: Connection attempts the outage took
 
     Returns:
         The message body, or None when this one belongs in the log alone
     """
+    how = ""
+    if reason:
+        how = f" ({reason}, {attempts} attempt{'' if attempts == 1 else 's'})"
+
     if duration_seconds >= min_seconds:
-        return (f"WebSocket reconnected after {duration_seconds:.1f}s down - "
-                f"past the {min_seconds:.0f}s mark where a file is at risk")
+        return (f"Feed restored after {duration_seconds:.1f}s without data{how} "
+                f"- past the {min_seconds:.0f}s mark, so reconnecting itself "
+                f"was failing or the link stayed dead")
 
     if recent_within_hour >= cluster_size:
-        return (f"{recent_within_hour} reconnects in the last hour, the latest "
-                f"after {duration_seconds:.1f}s. Short ones are normal on this "
-                f"host; this many in an hour is not")
+        return (f"{recent_within_hour} outages in the last hour, the latest "
+                f"{duration_seconds:.1f}s without data{how}. Short ones are "
+                f"normal on this host; this many in an hour is not")
 
     return None
 
@@ -362,7 +375,6 @@ class FiniexDataCollector:
         self._export_tasks: set = set()
 
         # Reconnect tracking
-        self._disconnect_time: Optional[datetime] = None
         self._last_reconnect_alert: Optional[datetime] = None
 
     async def start_collection(self) -> None:
@@ -1120,6 +1132,7 @@ class FiniexDataCollector:
         # Set callbacks
         collector.set_tick_callback(self._on_tick_received)
         collector.set_status_callback(self._on_status_changed)
+        collector.set_outage_callback(self._on_outage)
 
         self._collectors.append(collector)
 
@@ -1130,61 +1143,57 @@ class FiniexDataCollector:
         """
         Handle WebSocket connection status change.
 
+        The status is what the screens show; the outage itself is recorded by
+        _on_outage from the client's own timeline. Until 2026-10-08 this handler
+        built the reconnect record from two wall-clock readings - the status
+        turning 'reconnecting' and turning 'connected' again - which measured
+        from the moment a drop was noticed to the handshake, and missed the
+        10-11 s before the drop was noticed.
+
         Args:
             status: New status (connected, disconnected, reconnecting, failed)
         """
         old_status = self._stats.websocket_status
         self._stats.set_websocket_status(status)
 
-        self._logger.debug(
-            f"[STATUS] WebSocket status changed: {old_status} → {status}, "
-            f"disconnect_time={self._disconnect_time}"
-        )
-
-        # Track disconnects (including 'reconnecting' which means connection was lost)
-        if status in ["disconnected", "reconnecting"] and old_status == "connected":
-            self._disconnect_time = datetime.now(timezone.utc)
-            self._logger.debug(
-                f"[DISCONNECT] Tracked disconnect at {self._disconnect_time} (status={status})"
-            )
-
-        # Track reconnects
         if is_reconnect(old_status, status):
-            # Stamped on the monotonic clock, for the stall attribution. The
-            # event list below carries the wall-clock time a human reads; a
-            # duration must never come from subtracting two of those.
+            # Stamped on the monotonic clock for the stall attribution, which
+            # asks whether a socket came back inside a stall's window.
             self._last_reconnect_monotonic = time.monotonic()
 
-            if self._disconnect_time:
-                duration = (datetime.now(timezone.utc) -
-                            self._disconnect_time).total_seconds()
+    def _on_outage(self, stage: str, event: ReconnectEvent) -> None:
+        """
+        Follow one outage record through its stages.
 
-                self._logger.debug(
-                    f"[RECONNECT] Recording reconnect event: "
-                    f"duration={duration:.1f}s, "
-                    f"disconnect_time={self._disconnect_time}, "
-                    f"old_status={old_status}"
-                )
+        The record goes to /v1/status at every stage, and to the log as one
+        '[OUTAGE]' line when the feed is restored and again when the record is
+        resolved - so a kill in between still leaves the restored line. Both
+        are written through the converter /v1/status uses, so a session reading
+        either months later gets the same shape.
 
-                self._stats.record_reconnect("connection_restored", duration)
+        Args:
+            stage: 'opened', 'restored' or 'resolved'
+            event: The record
+        """
+        self._stats.record_outage(stage, event)
 
-                # Send alert if cooldown passed
-                asyncio.create_task(self._send_reconnect_alert(duration))
+        if stage in ("restored", "resolved"):
+            # default=str: a value the converter passes through unchanged must
+            # never cost the durable line, the one that outlives the process.
+            self._logger.info("[OUTAGE] " + json.dumps(
+                {"schema": 1, "stage": stage, **plain(event)}, default=str))
 
-                self._disconnect_time = None
-            else:
-                self._logger.debug(
-                    f"[RECONNECT] Connected but no disconnect_time tracked "
-                    f"(old_status={old_status}) - possible initial connection"
-                )
+        if stage == "restored":
+            asyncio.create_task(self._send_reconnect_alert(event))
 
     def _reconnects_within_the_hour(self, now: datetime) -> int:
         """
         How many reconnects have happened in the last hour, this one included.
 
-        Read off the event list the statistics already keep, so there is no
-        second counter to drift from it - the drift between two counters for one
-        number is a defect this project has already paid for once.
+        Read off the outage times the statistics keep for exactly this, so
+        there is no second counter to drift from them - and not off the ring of
+        detailed records, which holds twenty: a cluster threshold above twenty
+        could never fire, and 'N outages in the last hour' stopped at 20.
 
         Args:
             now: The moment being judged
@@ -1192,17 +1201,17 @@ class FiniexDataCollector:
         Returns:
             Count of reconnect events within the last hour
         """
-        cutoff = now - timedelta(hours=1)
-        return sum(1 for event in self._stats.reconnect_events
-                   if event.timestamp >= cutoff)
+        return self._stats.outages_since(now - timedelta(hours=1))
 
-    async def _send_reconnect_alert(self, duration_seconds: float) -> None:
+    async def _send_reconnect_alert(self, event: ReconnectEvent) -> None:
         """
-        Send reconnect alert if cooldown allows.
+        Send an alert for a restored outage if it is worth one and the cooldown
+        allows.
 
         Args:
-            duration_seconds: Downtime duration
+            event: The outage record, restored; its duration is the data gap
         """
+        duration_seconds = event.duration_seconds or 0.0
         if not self._telegram:
             self._logger.debug(
                 "[RECONNECT_ALERT] No Telegram configured, skipping")
@@ -1232,12 +1241,15 @@ class FiniexDataCollector:
             duration_seconds,
             recent_within_hour=recent,
             min_seconds=self._config.monitoring.reconnect_alert_min_seconds,
-            cluster_size=self._config.monitoring.reconnect_alert_cluster)
+            cluster_size=self._config.monitoring.reconnect_alert_cluster,
+            reason=event.reason,
+            attempts=event.attempts)
 
         if body is None:
             self._logger.info(
-                f"Reconnected after {duration_seconds:.1f}s - below the alert "
-                f"threshold, {recent} in the last hour. On /v1/status either way.")
+                f"No alert: data resumed {duration_seconds:.1f}s after the last "
+                f"message ({event.reason}), {recent} in the last hour. On "
+                f"/v1/status either way.")
             return
 
         self._logger.debug(f"[RECONNECT_ALERT] Sending alert: {body}")
@@ -1462,12 +1474,25 @@ class FiniexDataCollector:
         mt5_stats = self._stats.folders.get("mt5")
         logs_stats = self._stats.folders.get("logs")
 
-        # Reconnects this week
-        reconnects = self._stats.get_reconnects_this_week()
+        # Outages in the last seven days - one window for the count and the
+        # list. The count comes from the uncapped outage times: the detailed
+        # records are capped at twenty and would undercount a busy week, and
+        # whole UTC dates left the part of a day seven days back to no report.
+        now = datetime.now(timezone.utc)
+        week_ago = now - timedelta(days=7)
+        reconnect_count = self._stats.outages_since(week_ago)
+        recent_outages = [event for event in self._stats.reconnect_events
+                          if event.timestamp >= week_ago]
 
         # Build report
         uptime_hours = self._stats.get_uptime_hours()
         disk = self._stats.disk_space
+
+        # The counts cover what this process saw. A deploy or a restart during
+        # the week starts them over, and 'This Week' above two days of counting
+        # would state a week's count the process does not hold.
+        window = ("This Week" if uptime_hours >= 7 * 24
+                  else f"Since Start ({uptime_hours:.0f} h)")
 
         if disk.status == "OK":
             disk_status = "✅"
@@ -1497,15 +1522,16 @@ class FiniexDataCollector:
             f"• Free: {disk.free_gb:.1f} GB ({disk.percent_free:.0f}%) {disk_status}",
             "",
             "🔌 *Connection Health*",
-            f"• Reconnects This Week: {len(reconnects)}",
+            f"• Reconnects {window}: {reconnect_count}",
         ]
 
-        # Add reconnect details
-        if reconnects:
-            for event in reconnects[-3:]:  # Last 3
-                time_str = event.timestamp.strftime("%a %d.%m %H:%M")
-                duration = int(event.duration_seconds / 60)
-                report_lines.append(f"  - {time_str} ({duration}m downtime)")
+        # The latest three, in seconds: whole minutes rendered every drop as
+        # '0m downtime'.
+        for event in recent_outages[-3:]:
+            time_str = event.timestamp.strftime("%a %d.%m %H:%M")
+            gap = (f"{event.duration_seconds:.1f}s without data"
+                   if event.duration_seconds is not None else "not restored")
+            report_lines.append(f"  - {time_str} ({gap}, {event.reason})")
 
         report_lines.extend([
             f"• Current Status: {self._stats.websocket_status}",
@@ -1520,13 +1546,11 @@ class FiniexDataCollector:
 
         report_text = "\n".join(report_lines)
 
-        success = await self._telegram.send_info("Weekly Report", report_text)
-
-        # Reset weekly reconnects after report
-        if success:
-            self._stats.reset_weekly_reconnects()
-
-        return success
+        # Nothing is reset after sending. The history used to be emptied here,
+        # which wiped the live record on /v1/status every Saturday and at every
+        # Telegram /report - on 2026-09-26 and 2026-10-03 among others - while
+        # the report only ever needed the last seven days, which it filters.
+        return await self._telegram.send_info("Weekly Report", report_text)
 
     def _setup_signal_handlers(self) -> None:
         """Setup graceful shutdown handlers (cross-platform)."""

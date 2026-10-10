@@ -221,8 +221,15 @@ contract defect** — worth having where it is cheap, not worth a field in every
 The residue worth keeping: whoever interprets a *window* rather than handling a gap — a coverage
 figure, a parity measurement — is comparing conditions, and 16.9 % lost to our socket is not the
 same condition as a thin market. That judgement belongs to the party carrying the risk, which is
-corollary 2 again: we report what we have, they decide what it means. What we have already
-travels — `/v1/status` carries the reconnect events and the log carries the rest.
+corollary 2 again: we report what we have, they decide what it means. What we have travels on
+two surfaces since 2026-10-08: each interruption of the feed is one record on `/v1/status` - how
+it was detected, the data gap from the last message to the restored feed, and the trade ids
+missed per symbol - and `[OUTAGE]` lines in the log. Until that date this sentence was not true:
+the reconnect events ran from noticing a drop to the socket handshake, by wall clock, with a
+constant reason, and the weekly report emptied them. Whether the windows also belong IN the file
+is an open decision (format 1.8.0), weighed in the 2026-10-08 report - and if they go in, this
+paragraph is amended in the same change, or a later session will read the field as a violation
+of it.
 
 ### The invariants an import enforces
 
@@ -381,7 +388,13 @@ suite gets an entry in `docs/tests/test_overview.md` in the same change.
   `tests/conftest.py` builds tick series and a broker config through the real loading path.
 - **Time is driven, not waited for.** The `steerable_clock` fixture patches the clock's time
   source so a backwards NTP step is provoked deterministically. Waiting for a real one is
-  not a test strategy.
+  not a test strategy. **One documented exception:** `tests/collectors/test_drop_detection.py`
+  runs the real client against a real loopback socket (`tests/collectors/far_side.py`, written
+  frame by frame), with the check interval shortened. The defect it guards lived in the
+  websocket library's semantics - which ending raises what, when `recv()` returns, that only
+  one coroutine may read - and a fake reproduces those only as well as its author's
+  assumptions; the review of that change found exactly such an assumption. Both websockets
+  client implementations run, because they differ exactly there.
 - **Mutation-check new tests, every time.** After writing a test for a guard, break the guard
   and confirm the test fails. This has caught four tests that were green against a broken
   implementation, two of them written the same hour: one collected its samples only *after*
@@ -523,7 +536,7 @@ bus_mcp"` from its `client/` directory), which writes the same files through the
 
 ```
 python/
-  collectors/kraken/    websocket_client, message_parser, quote_cache
+  collectors/kraken/    websocket_client, message_parser, quote_cache, outage_tracker
   writers/              base, json_tick_writer
   types/                tick_types (incl. the format constants), broker_config_types
   utils/                collection_clock, config_loader, logging_setup, live_display
@@ -576,8 +589,9 @@ Four semantics that would cost a wrong number rather than an error, stated by th
 
 - **A bar's timestamp is its OPEN**, left-labelled.
 - **The price basis depends on the broker, and the response says which.** Stated as "OHLC is
-  the MID" on 2026-09-21; measured 2026-10-08 through the `X-Bar-Price-Basis` header (contract
-  22): `kraken_spot` is `order_driven` — OHLC of the TRADED price, so a Kraken bar's close is
+  the MID" on 2026-09-21; measured 2026-10-08 through the `X-Bar-Price-Basis` header (served
+  before contract 22, which only published it cross-origin; measured under contract 23):
+  `kraken_spot` is `order_driven` — OHLC of the TRADED price, so a Kraken bar's close is
   comparable with our trade prices — while `mt5` is `quote_driven`, OHLC of the midpoint, whose
   close separates from a quote's bid and ask on a wide spread. Read the header rather than this
   line: it is what changed under the line once already.

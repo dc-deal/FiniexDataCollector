@@ -29,8 +29,8 @@ from typing import (Any, Dict, List, Type, Union, get_args, get_origin,
 
 from python.types.collector_stats import (CollectorStats, FileInfo,
                                           FolderStats, LogEntry,
-                                          ReconnectEvent, StallEvent,
-                                          SymbolStats)
+                                          ReconnectEvent, ReconnectTotals,
+                                          StallEvent, SymbolStats)
 
 # The fields a freshly constructed CollectorStats leaves as `[]`, `{}` or `None`.
 # The object carries no type there, so the mapping has to be stated. Everything
@@ -43,6 +43,8 @@ CONTENT_TYPES: Dict[str, type] = {
     "recent_logs": LogEntry,
     "reconnect_events": ReconnectEvent,
     "stalls": StallEvent,
+    "reconnect_in_progress": ReconnectEvent,
+    "reconnect_totals": ReconnectTotals,
     "worst_stalls": StallEvent,
     "last_file": FileInfo,
     "last_reconnect": ReconnectEvent,

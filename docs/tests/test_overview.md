@@ -38,6 +38,10 @@ reverses arrival times; a one-tick spread is never reported as zero.
 That last one came from live data, not review: `int(spread_raw / tick_size)` truncated
 `0.00999999999999801` to 0, and 59 % of LTCUSD ticks claimed no spread.
 
+And since 2026-10-08: the decoded path the receive loop uses produces exactly the ticks the text
+path does. Every message used to go through `json.loads` twice - once to ask whether it was a
+heartbeat - on the loop that stamps the ticks.
+
 ### `tests/collectors/test_stale_detection.py`
 
 A dropped connection costs the trades made while the dead socket is still believed alive, and on
@@ -50,6 +54,84 @@ for a dead feed. The midnight cut blocks the loop for 17.85 s while the socket h
 messages, so a short threshold without that exemption would force a reconnect at every day cut.
 A feed that really died during a block is still reopened on the next check. The time source and
 the sleep are driven by hand; waiting for a real outage is not a test strategy.
+
+Since 2026-10-08 the watchdog reports the end it found and closes nothing - a connection is torn
+down in one place, whichever detector saw the end first - so these tests read the detection it
+returns. The other two detectors are in `test_drop_detection.py`. One test here drives the
+teardown instead: a close frame without a code that arrived before a detector without the frame
+fired is named from the frame - with no code, never the library's 1005.
+
+### `tests/collectors/test_drop_detection.py`
+
+The other ways a connection ends, run against a REAL socket. Measured on production over 19 days
+to 2026-10-08: 137 forced reconnects, and in 136 the socket was already closing when the 10 s
+watchdog found it - the receive loop's end was handed back by `gather(..., return_exceptions=True)`
+and ignored, and a close frame on a connection left open does not end `recv()` until the next
+keepalive ping, 20 s later. Each drop cost about 12 s of trades, about 10 of them spent not
+knowing.
+
+**Why a real socket, against this project's rule of driven time:** the defect lived in the
+library's semantics - which ending raises what, when `recv()` returns, that only one coroutine may
+call `recv()` - and a fake reproduces those only as well as its author's assumptions; the review of
+this change found such an assumption. `far_side.py` is a Kraken-like endpoint written frame by
+frame on a raw TCP server, so it can produce endings no websocket library would: a close frame
+without a TCP close, a FIN without a frame, a reset, a peer that stops answering pings. Every
+library-dependent case runs against both client implementations of websockets, because they differ
+exactly here and `websockets>=12.0` allows either; the check interval is shortened so the file runs
+in seconds.
+
+Defends: a reset, a FIN and a clean close are noticed at once and named with the frame's code or
+none; a close frame on an open connection is a far-side close within a second, not the watchdog's
+silence; a close frame without a code records no code rather than the library's 1005, whether
+the TCP connection closes behind it or stays open; a silent link is still the watchdog's, and
+dropped rather than closed for its timeout; the missing trade ids in the record equal exactly what
+the far side produced and never sent; Kraken's status message is read rather than discarded; a
+refusal - which names no channel, so only its `req_id` ties it to a stream - is matched and named,
+and a stream with a refused pair and a silent one has answered at the deadline - the silent pair
+is listed - rather than being reconnected as dead; a pair that answers slowly but delivers is
+confirmed by its data, one silent pair is listed rather than costing the connection, and a stream
+that produced nothing at all is reconnected; a drop during resubscription is one outage with two attempts; a far side that keeps
+closing is backed off (0.02, 0.04, 0.08, 0.16 s - never 1, 1, 1, which Kraken would ban), and a
+connection stable for 10 s - not 60, which held a degraded Kraken at the maximum delay - starts
+the backoff over; nothing but a stop ends collection, not even a failure in the teardown; a
+message that cannot be handled costs that message, not the connection; a stop during the backoff
+hands the open outage over itself, because start() is not awaited at shutdown; a stop while a
+send waits on a closing connection opens no new record; and a handshake that opens or fails after
+a stop leaves neither a socket nor a 'failed' status nor an ERROR line behind. Every wait in these
+tests has a deadline - the polling loops, every stop and every awaited task - so a regression
+fails instead of holding CI until its six-hour limit.
+
+### `tests/collectors/test_outage_tracker.py`
+
+The record each interruption leaves, driven with plain numbers: the tracker holds no socket and no
+event loop. Until 2026-10-08 a reconnect was recorded from the moment it was noticed to the socket
+handshake by subtracting two wall-clock readings, with a constant reason and no word on what was
+missed.
+
+Defends: a close is classified by the frames exchanged and never by the exception class (Kraken's
+close arrives as either), with a code only when a frame carried one - never the 1005 the library
+reports for a frame without a code - and no 'NoneType: None' cause; the gap runs from the last
+message on the monotonic clock, untouched by a wall-clock step; missing trade ids are
+first - last - 1 per symbol with the ids from before the drop, from the highest id seen rather than
+the last received, unknown rather than zero when an id is missing, and flagged rather than counted
+when they do not increase; trades an attempt delivered before it failed do not end the count - the
+ids between the highest of them and the restoring connection are counted too, the first trade is
+the restored feed's, a replay on such an attempt leaves the count unknown and flagged, and the
+next outage counts from its own last trade; a stop during an attempt that never restored names no
+first trade; a quiet symbol is closed by the 15-minute deadline, and a symbol whose first trade was
+still unknown when its record closed - by the next drop, the deadline or a refusal - is flagged in
+the next one, whose gap keeps what a failed attempt of the first had counted, while a symbol that
+traded in between is not flagged; a stop resolves whatever is open, once; a connection that ends
+before restoration is the same outage; a process that never got going records none; data confirms
+a pair, stragglers are listed not waited for, a stream with nothing at all is dead; a refused pair
+and a ticker-only feed hold nothing open - and a ticker-only feed carries nothing into the next
+record - a refusal after the deadline is still recorded as one and only once, but only for a pair
+the deadline listed that has neither delivered data nor been acknowledged since, and a refusal
+for an acknowledged pair changes nothing; a replay's flag travels with the unknown count it
+explains; a spanning gap is counted from before both drops; a stream refused outright was confirmed at no time; the
+confirmation line counts a refused pair as refused, not as confirmed, and gives the last
+confirmation's time; and a failing owner never stops the record, with or without the project's
+logging set up.
 
 ### `tests/writers/test_json_tick_writer.py`
 
@@ -257,9 +339,14 @@ the log through a listener.
 
 Defends: WARNING counts as a warning and ERROR/CRITICAL as errors while INFO counts as nothing; a
 failing listener never costs the log line itself; the collector actually wires its stats to the
-log — the shape the original defect had was a working counter nothing was connected to; and the
+log — the shape the original defect had was a working counter nothing was connected to; the
 display renders a logged message as text, because that code had never run with an entry in it and
-Rich raises on a message holding a closing-tag shape like `[/red]`.
+Rich raises on a message holding a closing-tag shape like `[/red]`; and, since the counters count
+lines, the Kraken client writes one line per event: a subscription send refused because the
+connection ended is the drop's warning, not an extra error, a failed connection attempt is one
+ERROR line, not two, and a connection that ended is a warning while one the code ended itself - a
+detector that raised - is an error, also when Kraken's close frame names the end, and its line
+then keeps the fault.
 
 ### `tests/utils/test_describe_exception.py`
 
@@ -310,6 +397,11 @@ Windows — reaches the log file instead of stderr, through the handler a real l
 every other loop event keeps asyncio's default handling. And the route carries `loop_lag` and
 `exports`, the two figures that make a blocked loop visible from off the machine.
 
+And `/v1/build` names the websocket library and the client implementation `websockets.connect`
+resolves to, sampled from the package metadata rather than written down, and absent rather than
+guessed when the metadata is missing: the two implementations end a connection differently, and
+how a drop is classified depends on which one runs.
+
 ### `tests/api/test_diagnostic_routes.py`
 
 Config, archive inventory, log excerpt, and the file handover. The archive route has a named
@@ -333,8 +425,11 @@ reads. The pair is only worth having if both halves stay structural rather than 
 the round-trip test compares the WHOLE object rather than a list of fields, and covers a member
 added to the statistics on the day it is added.
 
-Defends: everything the collector sends survives the journey; every field whose type a freshly
-built object cannot state is registered, and a stale registration is removed; a **newer**
+Defends: everything the collector sends survives the journey - an outage record with its
+per-symbol trade ids and per-stream timeline included; every field whose type a freshly
+built object cannot state is registered, and a stale registration is removed; a reconnect record
+from a collector older than 2026-10-08 - four fields, no totals - still draws, with no count
+invented for the totals it never sent; a **newer**
 collector's unknown key is dropped rather than raised on, because the box and the laptop are
 routinely different builds; an **older** collector missing a required value is named by class
 instead of guessed at; a timestamp arriving without an offset is read as UTC and not as the
@@ -383,17 +478,36 @@ whatever the error is.
 ### `tests/utils/test_alert_policy.py`
 
 When a restored connection is worth interrupting somebody. Measured over the night of
-2026-09-21: seven reconnects, each 1.3 to 7.2 s, 19.9 s of downtime in fifteen hours — about 22
-ticks, and not one of them among the eight longest gaps in the file it fell into, which were all
-quiet market. Six alerts arrived on a phone for something that cannot be found in the data
-afterwards.
+2026-09-21: seven reconnects, recorded at 1.3 to 7.2 s each - figures that ran from noticing the
+drop to the handshake and left out the 10-11 s before it was noticed. Even counted in full they
+were not among the longest gaps of their files, and six alerts arrived on a phone for them.
 
-Defends: a short self-healed reconnect stays in the log and off the phone; an outage past the
-consumer's lag window still reaches it, and carries its length; the threshold includes its own
+Defends: a short self-healed reconnect stays in the log and off the phone; a gap past 30 s still
+reaches it, and carries its length (not because a file would be refused - an outage shortens a
+file - but because a drop now costs seconds, and thirty means reconnecting is failing); the threshold includes its own
 value; a cluster inside one hour is worth saying even when each was short, because a host that
 blips every two hours is weather and one that blips four times an hour is degrading; and the
 duration is never rendered as whole minutes — that turned a 7.22 s outage into "0m downtime", a
 field asserting less than the code knew, printed on a phone.
+
+### `tests/utils/test_reconnect_reporting.py`
+
+Where an outage record goes. Until 2026-10-08 the history lived in memory, capped at 100 and
+emptied after every weekly report and every Telegram `/report`; the log carried a sentence per
+drop and no record; and the alert judged the window from noticing a drop to the handshake.
+
+Defends: a record moves from in progress into the history and the totals, counted once - also one
+a shutdown ended before it was restored; the history is capped and the count is not; the daily
+count keeps fourteen dates and the uncapped outage times a week and a day; the totals'
+dictionaries are replaced rather than changed in place, because the status route serialises them
+in another thread; no totals means no count rather than a zero; each outage is written to the log
+as an `[OUTAGE]` line when restored and again when resolved, in exactly the shape `/v1/status`
+serves, and a value JSON cannot hold does not cost the line; the alert reads the data gap, and a
+cluster is counted whole rather than off the twenty-record ring - a threshold above twenty could
+never fire; and a weekly report leaves the history in place, renders seconds, counts and lists
+the same rolling seven days - whole UTC dates for the count left about 18 hours a week in no
+report - and from a process younger than a week says 'Since Start' rather than 'This Week',
+turning one hour either side of the week.
 
 ## What is not covered
 
