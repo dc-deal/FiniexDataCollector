@@ -8,15 +8,12 @@ under NSSM, or as a systemd unit on Linux.
 [running the collector](running_the_collector.md)), or watching one that is already running (see
 [watching a collector](watching_a_collector.md)).
 
-**Status: installed on the production box 2026-09-23, reboot not yet done.** Everything below
-except the reboot has been measured, and the numbers are named where they matter. Steps 1 to 3 of
-the acceptance test passed on installation day: the service starts, `/v1/build` answers with a
-real commit rather than `null`, and the narrow token reaches `/v1/status` and is refused **403**
-on `/v1/archive`, `/v1/logs` and `/v1/configs`.
-
-**The autostart is already armed**, which is worth separating from the test: a host reset before
-the scheduled reboot brings the collector back by itself. Step 4 verifies that rather than
-enabling it.
+**Status: installed on the production box 2026-09-23, rebooted 2026-10-10.** The numbers are
+named where they matter. Steps 1 to 3 of the acceptance test passed on installation day: the
+service starts, `/v1/build` answers with a real commit rather than `null`, and the narrow token
+reaches `/v1/status` and is refused **403** on `/v1/archive`, `/v1/logs` and `/v1/configs`. Step 4,
+the reboot, passed on 2026-10-10 - and showed that a Windows restart does not deliver the stop
+(see [Stopping](#stopping-and-what-a-stop-is-worth)). Step 5 waits for the next day cut.
 
 ## Why, in two outages
 
@@ -243,6 +240,16 @@ collected, and the next start rebuilds the file — which is what the 2026-09-20
 demonstrated on the real archive: nine logs recovered, 115,919 ticks, no torn line. What a
 graceful stop buys is a finished archive file instead of a recovery.
 
+**A Windows restart does not deliver the stop.** Measured 2026-10-10, a restart from the Start
+menu - not a reset: the log of the old process ends without `Shutdown signal received`, and all
+nine write-ahead logs were recovered at the next start, where every `Restart-Service` before it
+had logged the full shutdown. The likely cause, not verified: at shutdown Windows sends the
+process its own console event rather than a Ctrl+C, the collector handles only SIGINT, and
+Python's default for that event ends the process at once - a Python-level handler would not help
+either, since Windows ends the process as soon as the handler returns. Nothing was lost; this is
+the case the write-ahead log exists for. A fix would block in a native console handler until the
+graceful stop has finished, within whatever `WaitToKillServiceTimeout` grants.
+
 ## Two instances on one directory
 
 Starting a console instance while the service runs is **refused**, before anything with a side
@@ -269,8 +276,12 @@ A service definition is proven by a reboot and by nothing else. In order:
    token.** `/v1/status` must answer 200 and `/v1/archive`, `/v1/logs` and `/v1/configs` must
    answer **403**. A grant is only narrow if something refuses; a token that is merely *named*
    narrow reads identically until the day it does not. Passed 2026-09-23.
-4. **Reboot the machine.** The collector must be collecting before anyone logs in — check
-   `/v1/build` for a `started_at` within a minute or two of boot, without opening a session.
+4. **[passed 2026-10-10]** **Reboot the machine.** The collector must be collecting before anyone
+   logs in — check `/v1/build` for a `started_at` within a minute or two of boot, without opening a
+   session. Measured from outside: unreachable by 10:02:04 UTC, the edge answering at 10:03:55,
+   the process logging at 10:04:02 with nobody starting it, nine write-ahead logs recovered, the
+   first tick at 10:04:09, every symbol trading within four minutes, no error and no warning. An
+   RDP session watched the services list; a session does not start a service.
 5. Leave it through one UTC day cut. Nine files close at once there, and the archive index should
    show no open write-ahead log older than the cut.
 
