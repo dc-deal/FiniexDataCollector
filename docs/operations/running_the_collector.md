@@ -118,10 +118,11 @@ Then restart the collector. **The address is a credential**: whoever holds it ca
 collector healthy. It belongs in `user_configs/` and nowhere else, it is never logged, and
 `/v1/configs` masks it.
 
-Give the check a period of 5 minutes and a grace time of 5, and choose its notification channel
-there. It alarms about 10 minutes after the last ping: room for lost pings and a deploy restart,
-while the host restarts of October, about 15 minutes each until the collector was back, would have
-alarmed.
+The standard for the Finiex services is a period of 10 minutes and a grace time of 30, with an e-mail
+on down. It alarms about 40 minutes after the last ping, so only larger outages raise one: a deploy
+restart stays silent, and so would the host restarts of October, about 15 minutes each until the
+collector was back. A shorter outage still has to be read from the data. Shorten both times if you
+want to hear sooner.
 
 **A ping goes out only while `/v1/health` says `ok`**, so `failing` and `degraded` alarm too, if they
 last. The first beat comes one interval after the start, because the feed is not connected before
