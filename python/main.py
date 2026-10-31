@@ -24,6 +24,7 @@ import psutil
 
 from python.api.api_app import create_api
 from python.api.build_info import sample_build_info
+from python.alerts.heartbeat import Heartbeat
 from python.api.stats_serializer import health_payload, plain, serialize_stats
 from python.api.token_loader import load_token_registry
 from python.collectors.kraken.quote_cache import QuoteCache
@@ -526,7 +527,7 @@ class FiniexDataCollector:
 
         app = create_api(
             build=sample_build_info(self._config.version, DATA_FORMAT_VERSION),
-            health_provider=lambda: health_payload(self._stats),
+            health_provider=self._health,
             detail_provider=lambda: serialize_stats(self._stats),
             registry=load_token_registry(self._config.api.tokens),
             # Established here as well as in the collector path, because the API
@@ -665,7 +666,31 @@ class FiniexDataCollector:
         )
         self._monitoring_tasks.append(folder_task)
 
+        # Off without an address. Off the same loop as everything else on purpose:
+        # a frozen loop must stop the heartbeat, that is one of the things it reports.
+        if self._config.monitoring.heartbeat_url:
+            heartbeat = Heartbeat(
+                url=self._config.monitoring.heartbeat_url,
+                interval_seconds=self._config.monitoring.heartbeat_interval_seconds,
+                health_provider=self._health,
+                stats=self._stats
+            )
+            self._monitoring_tasks.append(asyncio.create_task(heartbeat.run()))
+
         self._logger.info("Monitoring tasks started")
+
+    def _health(self) -> Dict[str, Any]:
+        """
+        What `/v1/health` answers, and what the heartbeat goes by.
+
+        Returns:
+            The health payload, derived now
+        """
+        return health_payload(
+            self._stats,
+            write_ahead_logs_lost=sum(
+                1 for writer in list(self._writers.values())
+                if writer.write_ahead_log_lost))
 
     async def _await_pending_exports(self) -> None:
         """
@@ -1300,6 +1325,11 @@ class FiniexDataCollector:
         started = time.monotonic()
         try:
             self._handle_tick(tick)
+            self._stats.record_tick_handled(tick.symbol)
+        except Exception:
+            # The client logs it; this is what keeps it visible after the line.
+            self._stats.record_tick_failed(tick.symbol)
+            raise
         finally:
             self._stats.record_tick_work((time.monotonic() - started) * 1000)
 

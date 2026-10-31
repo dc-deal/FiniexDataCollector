@@ -771,3 +771,13 @@ def test_a_file_from_before_provenance_says_so_with_null(tmp_path: Path) -> None
 
     assert "instance_id" in entry, "the key must be present, so its absence is not the answer"
     assert entry["instance_id"] is None
+
+
+def test_the_heartbeat_address_is_never_served() -> None:
+    """It carries no secret-looking key name, and it can report us healthy."""
+    redacted = redact_config(
+        {"monitoring": {"heartbeat_url": "https://hc-ping.com/abc",
+                        "heartbeat_interval_seconds": 60}})
+
+    assert redacted["monitoring"]["heartbeat_url"] == "<redacted>"
+    assert redacted["monitoring"]["heartbeat_interval_seconds"] == 60

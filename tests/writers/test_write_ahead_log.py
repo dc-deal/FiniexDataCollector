@@ -485,3 +485,36 @@ def test_a_shutdown_with_nothing_buffered_names_no_file(
 
     assert len(archive_files(tmp_path)) == 1, "an empty buffer produced a file"
     assert wal_files(tmp_path) == [], "the empty log was left behind"
+
+
+def test_a_lost_log_is_visible_until_the_next_file_opens_one(
+    tmp_path: Path,
+    tick_series: List[TickData]
+) -> None:
+    """
+    What `/v1/health` reads. A failed write used to be one ERROR line and then
+    silence, for as long as the file stayed open.
+    """
+    writer = build_writer(tmp_path, CollectionClock())
+    assert writer.write_ahead_log_lost is False, "no file is open yet"
+
+    writer.write_tick(tick_series[0])
+    assert writer.write_ahead_log_lost is False, "the log is healthy"
+
+    class Broken:
+        def write(self, text: str) -> None:
+            raise OSError("disk full")
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    writer._wal = Broken()
+    writer.write_tick(tick_series[1])
+    assert writer.write_ahead_log_lost is True
+
+    writer.rotate_file()
+    writer.write_tick(tick_series[2])
+    assert writer.write_ahead_log_lost is False, "the next file opened its own"

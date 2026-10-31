@@ -166,22 +166,47 @@ def uptime_seconds(stats: CollectorStats) -> int:
     return int((datetime.now(timezone.utc) - started).total_seconds())
 
 
-def health_payload(stats: CollectorStats) -> Dict[str, Any]:
+def health_payload(stats: CollectorStats,
+                   write_ahead_logs_lost: int = 0) -> Dict[str, Any]:
     """
-    The open route's answer: is it alive, since when, is it connected.
+    The open route's answer: is it alive, since when, is it collecting.
+
+    `failing` means ticks are at risk right now; `degraded` means the feed or the
+    archive needs attention while nothing already collected is in danger. Derived
+    on every call and never stored, so it cannot go on reading `ok` over a fault
+    nobody re-checked: FiniexRAGEngine's route said `ok` for 37 h over a dead
+    worker. A silent feed needs no reason of its own, because the watchdog turns
+    it into `not_connected` within seconds - and a quiet market, which still sends
+    ticker and heartbeat traffic, must never read as a fault.
 
     Deliberately without symbol names, tick rates or file names. Those describe
     what is being traded and how much of it, which an uptime probe does not need
-    and an unauthenticated caller should not receive.
+    and an unauthenticated caller should not receive. The reasons are codes.
 
     Args:
         stats: The collector's live statistics object
+        write_ahead_logs_lost: How many open files have lost their write-ahead log
 
     Returns:
         Liveness payload
     """
+    failing = []
+    if write_ahead_logs_lost:
+        failing.append("write_ahead_log_lost")
+    if stats.tick_handler_failing:
+        failing.append("tick_handler_failing")
+
+    degraded = []
+    if stats.websocket_status != "connected":
+        degraded.append("not_connected")
+    if stats.exports.failed_in_a_row:
+        degraded.append("export_failed")
+    if stats.disk_space.status == "EMERGENCY":
+        degraded.append("disk_low")
+
     return {
-        "status": "ok" if stats.websocket_status == "connected" else "degraded",
+        "status": "failing" if failing else "degraded" if degraded else "ok",
+        "reasons": failing + degraded,
         "websocket_status": stats.websocket_status,
         "uptime_seconds": uptime_seconds(stats),
         "started_at": plain(stats.start_time)

@@ -1,5 +1,6 @@
 # Claude Code
 .claude/
+CLAUDE.md
 
 # Python
 __pycache__/
@@ -55,6 +56,8 @@ htmlcov/
 user_configs/*.json
 !user_configs/*.example.json
 !user_configs/.gitkeep
+# Key files live one level down; `*.json` above does not reach into subfolders.
+user_configs/credentials/
 
 # Broker configs (except examples)
 configs/brokers/*/*.json

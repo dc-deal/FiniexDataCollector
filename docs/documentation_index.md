@@ -23,6 +23,5 @@ Links only. Order within a section is reading priority — the first entry is wh
 ## Elsewhere
 
 - [README](../README.md) — what the project is, quickstart, output format
-- [CLAUDE.md](../CLAUDE.md) — project rules and conventions
 - GitHub issue #8 — vision and roadmap
 - GitHub issue #11 — the tick data contract as it was agreed with FiniexTestingIDE

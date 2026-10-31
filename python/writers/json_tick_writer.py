@@ -265,6 +265,17 @@ class JsonTickWriter(AbstractTickWriter):
         return self._current_file
 
     @property
+    def write_ahead_log_lost(self) -> bool:
+        """
+        True while a file is open without its write-ahead log.
+
+        A failed write drops the log and collection carries on, so from here until
+        the next file a hard stop costs the buffer instead of a tick. It was one
+        ERROR line and then silence; `/v1/health` reads this on every call.
+        """
+        return self._current_file is not None and self._wal is None
+
+    @property
     def last_closed_tick_count(self) -> int:
         """Ticks in the file that closed last, as it was written."""
         return self._last_closed_tick_count

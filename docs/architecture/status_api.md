@@ -20,7 +20,7 @@ anything — see *Boundaries* at the end.
 ## The routes
 
 ```
-GET /v1/health         open              is it alive, since when, is it connected
+GET /v1/health         open              is it alive, since when, is it collecting
 GET /v1/build          open              which code is running
 GET /openapi.json      open              the schema: every route and parameter
 GET /v1/status         status:detail     the complete live metrics
@@ -37,18 +37,42 @@ per route rather than a general policy — see below.
 
 ## `GET /v1/health` — open
 
-Liveness, uptime and connection state:
+Liveness, uptime and whether the collector is doing its job:
 
 ```json
 {
   "status": "ok",
+  "reasons": [],
   "websocket_status": "connected",
   "uptime_seconds": 241200,
   "started_at": "2026-09-12T05:00:00+00:00"
 }
 ```
 
-`status` is `ok` while the WebSocket is connected and `degraded` otherwise.
+`status` is derived on every call and never stored, and `reasons` names what it found:
+
+| `status` | `reasons` | Means |
+|---|---|---|
+| `failing` | `write_ahead_log_lost` | an open file has no write-ahead log; a hard stop would cost its buffer rather than one tick |
+| `failing` | `tick_handler_failing` | the latest tick of some symbol failed in the handler and is not in its file |
+| `degraded` | `not_connected` | the feed is down; a normal drop passes here for a few seconds |
+| `degraded` | `export_failed` | the last archive writer produced no file; its log is on disk and the next start recovers it |
+| `degraded` | `disk_low` | at most 20 % of the disk is free |
+| `ok` | none | none of the above |
+
+`failing` outranks `degraded`, and every reason that applies is listed. Until 2026-10-31 `status`
+was the WebSocket alone, so a full disk read `ok` for as long as the connection held.
+
+**A quiet market is not a reason.** A connected feed with no trade for an hour is a statement about
+the world, so no tick age enters this. A feed that really went silent needs no reason of its own:
+ticker and heartbeat traffic stop as well, and the watchdog turns that into `not_connected` within
+seconds.
+
+**A frozen event loop gives no answer at all**, because the route is served from that loop, and a
+probe's timeout is the correct reading of it.
+
+An outside check does not read this route directly: the [heartbeat](../operations/running_the_collector.md#the-outside-check)
+goes by the same answer from inside the process.
 
 **Open because an uptime probe carries no credential**, and a probe that needs one is a
 probe that stops working the day a token rotates.
@@ -159,7 +183,15 @@ subprocesses because of it.
 **`exports` counts those subprocesses**: handed over, finished, failed, in flight, the last file
 with its tick count and duration, and the file a failure left owed. A failed export is not lost
 data — its write-ahead log stays on disk and the next start recovers it — but it is a file the
-archive does not have yet, and `last_failed_file` is what names it.
+archive does not have yet, and `last_failed_file` is what names it. `failed_in_a_row` falls back
+to zero when a writer next finishes a file, which is what lets `/v1/health` recover.
+
+**`heartbeat` says what the [outside check](../operations/running_the_collector.md#the-outside-check)
+cannot.** The check knows only that pings arrived. Here: `enabled`, `interval_seconds`, how many
+beats were `sent`, `withheld` because the collector was not `ok`, or `failed` on the way, and the
+time and text of the last withheld and the last failed one. An alarm with `withheld` rising is the
+collector; an alarm with `failed` rising is the network between it and the check. Neither field ever
+holds the address.
 
 **`streams`, `clock`, `max_ticks_per_file` and each symbol's `digits` are here so a screen can be
 drawn from this payload alone** — the first half of issue #15. The display used to read all four

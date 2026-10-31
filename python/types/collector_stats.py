@@ -7,7 +7,7 @@ Location: python/types/collector_stats.py
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional, Set
 
 from python.types.log_level import ERROR, LogLevel
 
@@ -559,6 +559,65 @@ class CounterCheck:
 
 
 @dataclass
+class HeartbeatStats:
+    """
+    The heartbeat to the outside check, as this process saw it.
+
+    The check itself knows only that pings arrived. Why one did not - withheld
+    because the collector was unwell, or sent and lost - is known here alone.
+
+    Attributes:
+        enabled: Whether a check address is configured
+        interval_seconds: Seconds between beats
+        sent: Beats the check answered
+        withheld: Beats not sent because `/v1/health` was not `ok`
+        failed: Beats sent, or attempted, that did not reach the check
+        last_sent_at: When the check last answered
+        last_withheld_at: When a beat was last withheld
+        last_withheld_reasons: What `/v1/health` named then
+        last_failed_at: When a beat last failed
+        last_failure: What went wrong then, without the address
+    """
+    enabled: bool = False
+    interval_seconds: int = 0
+    sent: int = 0
+    withheld: int = 0
+    failed: int = 0
+    last_sent_at: Optional[datetime] = None
+    last_withheld_at: Optional[datetime] = None
+    last_withheld_reasons: str = ""
+    last_failed_at: Optional[datetime] = None
+    last_failure: str = ""
+
+    def record_sent(self) -> None:
+        """The check answered."""
+        self.sent += 1
+        self.last_sent_at = datetime.now(timezone.utc)
+
+    def record_withheld(self, reasons: str) -> None:
+        """
+        A beat was withheld.
+
+        Args:
+            reasons: What `/v1/health` named
+        """
+        self.withheld += 1
+        self.last_withheld_at = datetime.now(timezone.utc)
+        self.last_withheld_reasons = reasons
+
+    def record_failed(self, text: str) -> None:
+        """
+        A beat did not reach the check.
+
+        Args:
+            text: What went wrong, without the address
+        """
+        self.failed += 1
+        self.last_failed_at = datetime.now(timezone.utc)
+        self.last_failure = text
+
+
+@dataclass
 class ExportStats:
     """
     The archive writers that run as subprocesses.
@@ -575,6 +634,8 @@ class ExportStats:
         last_failed_file: The last file that was not written - its log is still
             on disk and the next start recovers it
         last_failed_at: When that was
+        failed_in_a_row: Failures since a writer last finished a file; what
+            `/v1/health` reads, because `failed` only ever grows
     """
     started: int = 0
     finished: int = 0
@@ -586,6 +647,7 @@ class ExportStats:
     max_ms: float = 0.0
     last_failed_file: Optional[str] = None
     last_failed_at: Optional[datetime] = None
+    failed_in_a_row: int = 0
 
     # Spawning a child is not free and it happens ON the loop - `communicate()`
     # awaits, but `create_subprocess_exec` itself does not. At the UTC day cut
@@ -649,6 +711,12 @@ class CollectorStats:
         self.folders: Dict[str, FolderStats] = {}
         self.loop_lag: LoopLag = LoopLag()
         self.exports: ExportStats = ExportStats()
+        self.heartbeat: HeartbeatStats = HeartbeatStats()
+        # Symbols whose latest tick the handler failed on. A set per symbol rather
+        # than one flag: a symbol failing every tick must not be reset by the eight
+        # that work. Private because a name on it describes what is traded, and
+        # because the open health route reads only whether it is empty.
+        self._failing_tick_symbols: Set[str] = set()
         self.counter_check: CounterCheck = CounterCheck()
         self.scans: ScanTimings = ScanTimings()
         self.gc: GcPauses = GcPauses()
@@ -1097,6 +1165,32 @@ class CollectorStats:
         self.exports.last_ticks = ticks
         self.exports.last_ms = round(duration_ms, 1)
         self.exports.max_ms = max(self.exports.max_ms, round(duration_ms, 1))
+        self.exports.failed_in_a_row = 0
+
+    def record_tick_failed(self, symbol: str) -> None:
+        """
+        The tick handler raised on a tick of this symbol.
+
+        Args:
+            symbol: The tick's symbol
+        """
+        self._failing_tick_symbols.add(symbol)
+
+    def record_tick_handled(self, symbol: str) -> None:
+        """
+        The tick handler finished a tick of this symbol. Called per tick, so it
+        does nothing at all in the normal case of an empty set.
+
+        Args:
+            symbol: The tick's symbol
+        """
+        if self._failing_tick_symbols:
+            self._failing_tick_symbols.discard(symbol)
+
+    @property
+    def tick_handler_failing(self) -> bool:
+        """True while the latest tick of any symbol failed in the handler."""
+        return bool(self._failing_tick_symbols)
 
     def record_export_failed(self, filename: str) -> None:
         """
@@ -1106,6 +1200,7 @@ class CollectorStats:
             filename: The archive file that is still owed
         """
         self.exports.failed += 1
+        self.exports.failed_in_a_row += 1
         self.exports.in_flight = max(0, self.exports.in_flight - 1)
         self.exports.last_failed_file = filename
         self.exports.last_failed_at = datetime.now(timezone.utc)

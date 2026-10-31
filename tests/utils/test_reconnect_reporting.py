@@ -390,3 +390,86 @@ def test_the_weekly_label_turns_at_seven_days(tmp_path, hours, label) -> None:
     assert asyncio.run(app._send_weekly_report())
 
     assert label in telegram.sent[0][1]
+
+
+# ------------------------------------------------------------- the wiring
+
+
+class WriterState:
+    """A writer as `_health` sees it."""
+
+    def __init__(self, lost: bool) -> None:
+        self.write_ahead_log_lost = lost
+
+
+def test_the_tick_handler_records_a_failure_and_still_raises() -> None:
+    """The client logs what escapes; health is what keeps it visible afterwards."""
+    app = an_app()
+    tick = types.SimpleNamespace(symbol="BTCUSD")
+
+    def broken(_: object) -> None:
+        raise OSError("disk full")
+
+    app._handle_tick = broken
+    with pytest.raises(OSError):
+        app._on_tick_received(tick)
+    assert app._stats.tick_handler_failing is True
+
+    app._handle_tick = lambda _: None
+    app._on_tick_received(tick)
+    assert app._stats.tick_handler_failing is False
+
+
+def test_health_counts_the_writers_that_lost_their_log() -> None:
+    app = an_app()
+    app._stats.set_websocket_status("connected")
+    app._writers = {"BTCUSD": WriterState(False), "ETHUSD": WriterState(False)}
+    assert app._health()["status"] == "ok"
+
+    app._writers["ETHUSD"] = WriterState(True)
+    assert app._health()["reasons"] == ["write_ahead_log_lost"]
+
+
+def test_without_an_address_no_heartbeat_starts(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Off is the default: a fresh checkout must not ping anything."""
+    started = []
+
+    class Spy:
+        def __init__(self, url: str, **kwargs: object) -> None:
+            started.append((url, kwargs["interval_seconds"]))
+
+        async def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(main_module, "Heartbeat", Spy)
+
+    async def idle(self: object) -> None:
+        return None
+
+    for name in ("_monitor_disk_space", "_monitor_loop_lag", "_monitor_folders"):
+        monkeypatch.setattr(main_module.FiniexDataCollector, name, idle)
+
+    async def scenario(url: str) -> None:
+        app = an_app()
+        app._monitoring_tasks = []
+        app._config.monitoring.heartbeat_url = url
+        app._config.monitoring.heartbeat_interval_seconds = 60
+        await app._start_monitoring_tasks()
+        await asyncio.gather(*app._monitoring_tasks)
+
+    asyncio.run(scenario(""))
+    assert started == []
+
+    asyncio.run(scenario("https://hc-ping.example/x"))
+    assert started == [("https://hc-ping.example/x", 60)]
+
+
+def test_the_tracked_configuration_leaves_the_heartbeat_off() -> None:
+    """The address is a credential; only user_configs/ may hold one."""
+    root = Path(__file__).resolve().parents[2]
+    for name in ("configs/app_config.json", "user_configs/app_config.example.json"):
+        monitoring = json.loads(
+            (root / name).read_text(encoding="utf-8"))["monitoring"]
+        assert monitoring["heartbeat_url"] == "", name

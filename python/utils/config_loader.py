@@ -211,12 +211,20 @@ class MonitoringConfig(BaseModel):
             an alert whatever their length. A host that blips every two hours is
             weather; one that blips four times an hour is degrading, and that
             distinction is the only thing a short reconnect can still tell you.
+        heartbeat_url: Ping address of an outside check, such as healthchecks.io,
+            which alarms when the pings stop. Empty is off. It belongs in
+            user_configs/, never in the tracked file: whoever holds it can report
+            this collector healthy.
+        heartbeat_interval_seconds: Seconds between pings. Keep the check's period
+            well above it, so that one lost ping is not an alarm.
     """
     disk_space_check_interval_seconds: int = Field(default=60, ge=10, le=600)
     folder_scan_interval_seconds: int = Field(default=60, ge=10, le=600)
     reconnect_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
     reconnect_alert_min_seconds: float = Field(default=30.0, ge=0.0, le=3600.0)
     reconnect_alert_cluster: int = Field(default=4, ge=2, le=100)
+    heartbeat_url: str = ""
+    heartbeat_interval_seconds: int = Field(default=60, ge=30, le=3600)
 
 
 class AppConfig(BaseModel):

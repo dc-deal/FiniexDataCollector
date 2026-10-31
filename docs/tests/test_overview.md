@@ -24,6 +24,19 @@ importer enforces, so they keep meaning after a refactor.
 
 ## The suites
 
+### `tests/alerts/test_heartbeat.py`
+
+An outside check alarms when pings stop, so the one dangerous failure is a ping that should not have
+gone out: it tells the phone a sick collector is fine.
+
+Defends: nothing is sent unless `/v1/health` says `ok`, and that is the route's own answer rather than
+a second judgement; a provider that raises sends nothing; a check answering 404 is not a beat, because
+a deleted check means nothing is watching; a failure never escapes into collection; the address stays
+out of every log line and off `/v1/status`, including when aiohttp puts it into an error; only a change
+of state is logged; the first beat waits one interval, because the feed is not connected at startup;
+and a fresh checkout pings nothing. One test goes over a real loopback socket, because the fakes only
+know how aiohttp is called as well as their author does.
+
 ### `tests/collectors/test_message_parser.py`
 
 Every local timestamp enters the data here, and a trade meets the quote it executed against
@@ -401,6 +414,11 @@ And `/v1/build` names the websocket library and the client implementation `webso
 resolves to, sampled from the package metadata rather than written down, and absent rather than
 guessed when the metadata is missing: the two implementations end a connection differently, and
 how a drop is classified depends on which one runs.
+
+And `/v1/health` is derived rather than read off the socket: a lost write-ahead log and a failing tick
+handler read `failing`, a dropped feed, a failed export and a nearly full disk read `degraded`, each
+recovers by itself, one working symbol does not clear another's failure, and a quiet market is none of
+these. It went on saying `ok` over a full disk until 2026-10-31.
 
 ### `tests/api/test_diagnostic_routes.py`
 

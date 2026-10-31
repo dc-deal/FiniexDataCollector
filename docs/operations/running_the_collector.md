@@ -95,6 +95,44 @@ Everything else stays on `/v1/status` - the latest twenty outage records, and to
 every one - and in the log, as one `[OUTAGE]` line per outage when the feed is restored and
 another when the record is complete.
 
+## The outside check
+
+Every alarm above runs inside the process, and on 2026-10-18 and 10-20, when the hosting provider
+restarted the machine twice, there was nothing left to raise one. An outside check inverts that: it
+alarms when pings **stop**, so a dead process, a frozen loop and a dead machine all reach the phone
+without any of them having to speak.
+
+Off by default. To turn it on, create a check at a service such as healthchecks.io and put its ping
+address into `user_configs/app_config.json`:
+
+```json
+{
+  "monitoring": {
+    "heartbeat_url": "https://hc-ping.com/<the check's id>",
+    "heartbeat_interval_seconds": 60
+  }
+}
+```
+
+Then restart the collector. **The address is a credential**: whoever holds it can report this
+collector healthy. It belongs in `user_configs/` and nowhere else, it is never logged, and
+`/v1/configs` masks it.
+
+Give the check a period of 5 minutes and a grace time of 5, and choose its notification channel
+there. It alarms about 10 minutes after the last ping: room for lost pings and a deploy restart,
+while the host restarts of October, about 15 minutes each until the collector was back, would have
+alarmed.
+
+**A ping goes out only while `/v1/health` says `ok`**, so `failing` and `degraded` alarm too, if they
+last. The first beat comes one interval after the start, because the feed is not connected before
+that. A failed ping costs one line in the log and never touches collection.
+
+| The phone says down, and | It is |
+|---|---|
+| `/v1/health` does not answer | the machine, the process or a frozen loop |
+| `/v1/health` is not `ok` | what `reasons` names |
+| `/v1/health` is `ok`, `heartbeat.failed` rising on `/v1/status` | the network between the collector and the check |
+
 ## Stopping
 
 **Ctrl+C, once.** Not the window close button, not `Stop-Process`, not `kill -9`.

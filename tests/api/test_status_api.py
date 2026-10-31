@@ -596,3 +596,106 @@ def test_missing_package_metadata_is_absent_not_guessed(monkeypatch) -> None:
     monkeypatch.setattr(build_info, "package_version", missing)
 
     assert build_info.sample_build_info("x", "y").websockets_version is None
+
+
+# =============================================================================
+# WHAT /v1/health SAYS
+# =============================================================================
+
+def connected_stats() -> CollectorStats:
+    """Statistics of a collector with nothing wrong."""
+    stats = CollectorStats()
+    stats.set_websocket_status("connected")
+    return stats
+
+
+def test_health_is_ok_with_no_reasons_when_nothing_is_wrong() -> None:
+    payload = health_payload(connected_stats())
+
+    assert payload["status"] == "ok"
+    assert payload["reasons"] == []
+
+
+def test_a_quiet_market_is_not_a_fault() -> None:
+    """Connected with no tick yet: a statement about the world, not an outage."""
+    stats = connected_stats()
+    stats.symbols.clear()
+
+    assert health_payload(stats)["status"] == "ok"
+
+
+def test_health_is_degraded_while_not_connected() -> None:
+    stats = connected_stats()
+    stats.set_websocket_status("reconnecting")
+
+    payload = health_payload(stats)
+
+    assert payload["status"] == "degraded"
+    assert payload["reasons"] == ["not_connected"]
+    assert payload["websocket_status"] == "reconnecting"
+
+
+def test_a_failed_export_degrades_until_a_writer_finishes_again() -> None:
+    """`failed` only ever grows; health has to be able to recover."""
+    stats = connected_stats()
+
+    stats.record_export_failed("BTCUSD_a_ticks.json")
+    stats.record_export_failed("BTCUSD_b_ticks.json")
+    assert health_payload(stats)["reasons"] == ["export_failed"]
+    assert stats.exports.failed_in_a_row == 2
+
+    stats.record_export_finished("BTCUSD_c_ticks.json", 10, 5.0)
+    assert health_payload(stats)["status"] == "ok"
+    assert stats.exports.failed == 2
+
+
+def test_disk_degrades_only_in_its_emergency_band() -> None:
+    """WARNING and CRITICAL are bands the operator has lived in for months."""
+    stats = connected_stats()
+
+    stats.disk_space.percent_used = 75.0
+    assert stats.disk_space.status == "CRITICAL"
+    assert health_payload(stats)["status"] == "ok"
+
+    stats.disk_space.percent_used = 85.0
+    assert stats.disk_space.status == "EMERGENCY"
+    assert health_payload(stats)["reasons"] == ["disk_low"]
+
+
+def test_a_lost_write_ahead_log_is_failing() -> None:
+    payload = health_payload(connected_stats(), write_ahead_logs_lost=1)
+
+    assert payload["status"] == "failing"
+    assert payload["reasons"] == ["write_ahead_log_lost"]
+
+
+def test_failing_outranks_degraded_and_every_reason_is_named() -> None:
+    stats = connected_stats()
+    stats.set_websocket_status("reconnecting")
+    stats.record_tick_failed("BTCUSD")
+
+    payload = health_payload(stats, write_ahead_logs_lost=2)
+
+    assert payload["status"] == "failing"
+    assert payload["reasons"] == [
+        "write_ahead_log_lost", "tick_handler_failing", "not_connected"]
+
+
+def test_one_working_symbol_does_not_clear_another_ones_failure() -> None:
+    """Eight symbols that work must not hide the ninth that fails on every tick."""
+    stats = connected_stats()
+
+    stats.record_tick_failed("BTCUSD")
+    stats.record_tick_handled("ETHUSD")
+    assert health_payload(stats)["reasons"] == ["tick_handler_failing"]
+
+    stats.record_tick_handled("BTCUSD")
+    assert health_payload(stats)["status"] == "ok"
+
+
+def test_the_open_route_names_no_symbol_even_when_one_is_failing() -> None:
+    stats = connected_stats()
+    stats.record_tick_failed("BTCUSD")
+
+    assert "BTCUSD" not in str(health_payload(stats))
+    assert "BTCUSD" not in str(serialize_stats(stats).get("_failing_tick_symbols"))
