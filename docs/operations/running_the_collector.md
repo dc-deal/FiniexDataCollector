@@ -95,6 +95,33 @@ Everything else stays on `/v1/status` - the latest twenty outage records, and to
 every one - and in the log, as one `[OUTAGE]` line per outage when the feed is restored and
 another when the record is complete.
 
+## The memory trail
+
+Every ten minutes the log gets one line on what the window did:
+
+```
+[MEMORY] {"schema": 1, "window_s": 600.0, "rss_mb": 218.4, "private_mb": 231.0, "threads": 7,
+          "gc": {"collections": [212, 19, 1], "ms": 96.3, "longest_ms": 41.5, "threshold": [2000, 10, 10]},
+          "loop": {"over_500ms": 0, "worst_stall_ms": null, "worst_stall_cause": null},
+          "outages": 1, "ticks": {"BTCUSD": 4211, "ETHUSD": 1873, ...}}
+```
+
+`/v1/status` says how much memory the process holds now, and a restart forgets it. Whether that
+number settles or creeps over weeks is a question of slope, and the slope needs readings that
+outlive the process: `/v1/logs?contains=[MEMORY]` reads them back from anywhere, a day at a time.
+Every figure is a delta over its own window, never a total since the start, so lines on either
+side of a restart need no telling apart. The first line comes one window after the start.
+
+- **`private_mb` is the one to watch on Windows.** `rss_mb` is the working set, which the system
+  trims under pressure; `private_mb` is what is committed. Rising together means memory is held,
+  `rss_mb` alone moving means the system is shuffling pages.
+- **`gc.threshold` reading `[2000, 10, 0]`** is the tell-tale of the incremental collector in
+  CPython 3.14.0-3.14.4, which let cyclic garbage pile up in long-running processes.
+  FiniexRAGEngine measured that on this box. The collector runs 3.14.7.
+- **`loop.worst_stall_ms`** is the longest stall recorded in the window, with its cause, or `null`.
+- **`ticks`** per symbol shows a symbol going quiet over hours; one window of zero is the market.
+- **`outages`** is `null` until the first outage of the process, then the count in the window.
+
 ## The outside check
 
 Every alarm above runs inside the process, and on 2026-10-18 and 10-20, when the hosting provider

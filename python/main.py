@@ -25,6 +25,7 @@ import psutil
 from python.api.api_app import create_api
 from python.api.build_info import sample_build_info
 from python.alerts.heartbeat import Heartbeat
+from python.utils.memory_trail import MemoryTrail
 from python.api.stats_serializer import health_payload, plain, serialize_stats
 from python.api.token_loader import load_token_registry
 from python.collectors.kraken.quote_cache import QuoteCache
@@ -665,6 +666,16 @@ class FiniexDataCollector:
             self._monitor_folders()
         )
         self._monitoring_tasks.append(folder_task)
+
+        # One line every ten minutes that outlives the process, so a slope over
+        # weeks is readable from the log where /v1/status only has the present.
+        trail = MemoryTrail(
+            stats=self._stats,
+            ticks_provider=lambda: {
+                symbol: writer.ticks_written
+                for symbol, writer in list(self._writers.items())},
+            log=self._logger.info)
+        self._monitoring_tasks.append(asyncio.create_task(trail.run()))
 
         # Off without an address. Off the same loop as everything else on purpose:
         # a frozen loop must stop the heartbeat, that is one of the things it reports.

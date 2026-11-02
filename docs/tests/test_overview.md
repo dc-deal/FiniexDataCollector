@@ -436,6 +436,29 @@ a path escaping the archive is refused even when its name passes the pattern; th
 match the register's checksum; no route is authenticated but ungated; and compression changes
 the size without changing what arrives.
 
+### `tests/api/test_outage_history.py`
+
+A consumer comparing a month of its own feed against ours needs every interruption in that
+month; `/v1/status` holds about two days.
+
+Defends: each outage appears once, at its furthest stage, even when the lines come out of order;
+the window is on the outage start; an outage resolved after midnight is found in the next day's
+file; a day without a file is named, never read as a day without outages; a torn line is counted
+and the rest kept; a long answer is cut and says where to continue; the default window is seven
+days; a reversed or too long window is a 400; a naive time is UTC; a finished day is read once and
+a grown file again; a credential in a record is masked; the route needs its own grant, which a
+status token does not hold.
+
+### `tests/utils/test_memory_trail.py`
+
+The memory trail exists for the slope, so every figure in a line has to be a delta over its own
+window. Defends: the first reading only opens a window; ticks, collections, collection time and
+loop lag are differences; the longest collection is per window, not since the start; a symbol new
+in the window counts from zero; the worst stall comes from inside the window only, and none is
+`null`; outages are `null` until the first; private memory is `null` where the platform does not
+report it, and a refusing process does not raise; `/v1/status` carries `private_mb`; one line is
+logged per interval and none at the start; and the writer's tick count survives a closed file.
+
 ### `tests/viewer/test_stats_from_payload.py`
 
 The reverse of the status serializer: the payload turned back into the object the renderer

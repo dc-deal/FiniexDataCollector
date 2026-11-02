@@ -445,6 +445,15 @@ def test_without_an_address_no_heartbeat_starts(
 
     monkeypatch.setattr(main_module, "Heartbeat", Spy)
 
+    class IdleTrail:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(main_module, "MemoryTrail", IdleTrail)
+
     async def idle(self: object) -> None:
         return None
 
@@ -454,6 +463,7 @@ def test_without_an_address_no_heartbeat_starts(
     async def scenario(url: str) -> None:
         app = an_app()
         app._monitoring_tasks = []
+        app._writers = {}
         app._config.monitoring.heartbeat_url = url
         app._config.monitoring.heartbeat_interval_seconds = 60
         await app._start_monitoring_tasks()

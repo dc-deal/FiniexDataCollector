@@ -28,6 +28,7 @@ GET /v1/configs        config:effective  the settings actually in force
 GET /v1/archive        archive:index     what has been written, per file
 GET /v1/files/{name}   files:*           one finished archive file
 GET /v1/logs           logs:collector    one UTC day of the log, filtered
+GET /v1/outages        outages:history   every interruption of the feed in a window
 ```
 
 Three are open. That exemption is written down rather than implied, and the reasoning is
@@ -398,12 +399,18 @@ which the public repository already shows. An identity is the key a consumer's t
 registry is keyed on and names one machine's data directory; it belongs behind the same
 grant as the symbol names.
 
-The payload also carries **`process`** — resident memory, thread and socket counts and
+The payload also carries **`process`** — resident and private memory, thread and socket counts and
 consumed CPU time, sampled per request:
 
 ```json
-"process": {"available": true, "rss_mb": 118.4, "threads": 12, "open_sockets": 9, "cpu_seconds": 431.2}
+"process": {"available": true, "rss_mb": 118.4, "private_mb": 131.7, "threads": 12, "open_sockets": 9, "cpu_seconds": 431.2}
 ```
+
+**Two memory figures, because on Windows they disagree.** `rss_mb` is the working set, which the
+system trims under pressure; `private_mb` is what the process has committed. FiniexRAGEngine read
+5.2 GB of the first while its process held 7.2 GB. Where the platform does not report private
+memory, `private_mb` is `null`. Neither figure has a history here: the
+[memory trail](../operations/running_the_collector.md#the-memory-trail) is where the slope is.
 
 It is a reading rather than a record, which is why it is computed here and not stored in
 `CollectorStats`. It exists because the box is shared: three services on 8 GB with roughly 2.4 GB
@@ -547,6 +554,52 @@ level filter and whose body vanished is worse than no excerpt.
 
 An unknown day answers `exists: false` with `available_days`, rather than a 404 that
 leaves the caller guessing. A malformed day is a 400.
+
+---
+
+## `GET /v1/outages` — `outages:history`
+
+Every interruption of the Kraken feed that began in a window, oldest first. `/v1/status` keeps
+the latest twenty records, about two days at the October 2026 rate, and its totals start again
+with the process. A consumer comparing a month of its own feed against our capture needs every
+interruption in that month, and the trade ids each one cost.
+
+```
+GET /v1/outages?since=2026-11-24T00:00:00Z&until=2026-12-24T00:00:00Z
+```
+
+```json
+{
+  "since": "2026-11-24T00:00:00+00:00", "until": "2026-12-24T00:00:00+00:00",
+  "count": 241, "truncated": false, "next_since": null,
+  "days_read": ["2026-11-24", "..."], "days_missing": [], "unreadable_lines": 0,
+  "records": [
+    {"schema": 1, "stage": "resolved", "timestamp": "2026-11-24T03:12:07+00:00",
+     "reason": "connection_lost", "duration_seconds": 2.7, "detected_after_ms": 41.0,
+     "symbols": {"BTCUSD": {"last_trade_id": 1, "first_trade_id": 6, "missing_trade_ids": 4}},
+     "resolved_by": "all_symbols_traded", "logged_at": "2026-11-24T03:14:30+00:00"}
+  ]
+}
+```
+
+- **A record is the one `/v1/status` serves**, the same fields read back from the `[OUTAGE]` line
+  the log holds for it (see `reconnect_events` above). `stage` is the furthest the log reached:
+  `resolved` normally, `restored` when the process ended before the record was complete.
+  `logged_at` is when that line was written.
+- **The window is on the outage start.** `since` defaults to seven days before `until`, `until`
+  to now; both are UTC, and a time without a zone is taken as UTC. At most 62 days per request.
+  A reversed or longer window is a 400.
+- **Nothing is invented for a gap in the files.** `days_missing` names each day without a log
+  file. That is a day nothing can be said about, not a day without outages. A torn line, as a hard
+  stop leaves one, is counted in `unreadable_lines`.
+- **At most 2,000 records**; `truncated` says when there were more, and `next_since` is where the
+  next request starts.
+- **The history starts on 2026-10-10**, with the build that writes the lines, and reaches as far
+  back as the log files do: nothing deletes them.
+
+**Its own surface, `outages`.** The log says far more than a consumer needs, and a token that
+holds the history does not hold the log. A day that has ended does not change, so its records
+are parsed once per process and kept; only a file that grew is read again.
 
 ---
 

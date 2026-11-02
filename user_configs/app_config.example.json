@@ -53,7 +53,8 @@
           "archive:index",
           "files:*",
           "config:effective",
-          "logs:collector"
+          "logs:collector",
+          "outages:history"
         ],
         "note": "Diagnostics from a session - archive listings, log excerpts, file transfers."
       }

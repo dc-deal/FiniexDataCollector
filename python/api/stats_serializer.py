@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from python.types.collector_stats import CollectorStats
+from python.utils.memory_trail import private_mb
 
 # Display knobs, not measurements. They describe how much history the terminal
 # keeps, which tells a consumer nothing about the collection.
@@ -121,6 +122,7 @@ def process_resources() -> Dict[str, Any]:
             return {
                 "available": True,
                 "rss_mb": round(process.memory_info().rss / (1024 * 1024), 1),
+                "private_mb": private_mb(process),
                 "threads": process.num_threads(),
                 "open_sockets": _socket_count(process),
                 "cpu_seconds": round(times.user + times.system, 1)

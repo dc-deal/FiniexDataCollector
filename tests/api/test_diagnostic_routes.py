@@ -359,7 +359,7 @@ def test_no_route_is_authenticated_but_ungated(client: TestClient) -> None:
             f"nothing - it is authenticated but ungated")
 
     assert sorted(walked) == ["/v1/archive", "/v1/configs", "/v1/files/{name}",
-                              "/v1/logs", "/v1/status"], (
+                              "/v1/logs", "/v1/outages", "/v1/status"], (
         "a gated route appeared or disappeared; listing them here is what keeps "
         "a router that drops out of the app from leaving the walk green while "
         "the surface it protected goes unreachable")

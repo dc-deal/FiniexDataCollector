@@ -712,6 +712,9 @@ class CollectorStats:
         self.loop_lag: LoopLag = LoopLag()
         self.exports: ExportStats = ExportStats()
         self.heartbeat: HeartbeatStats = HeartbeatStats()
+        # The longest collection since the memory trail last asked. Private: the
+        # trail's window is its own, and /v1/status already carries the maxima.
+        self._gc_window_max_ms: float = 0.0
         # Symbols whose latest tick the handler failed on. A set per symbol rather
         # than one flag: a symbol failing every tick must not be reset by the eight
         # that work. Private because a name on it describes what is traded, and
@@ -967,6 +970,7 @@ class CollectorStats:
         self.gc.last_ms = round(duration_ms, 1)
         self.gc.last_generation = generation
         self.gc.total_ms = round(self.gc.total_ms + duration_ms, 1)
+        self._gc_window_max_ms = max(self._gc_window_max_ms, duration_ms)
 
         if 0 <= generation < len(self.gc.collections):
             self.gc.collections[generation] += 1
@@ -977,6 +981,16 @@ class CollectorStats:
                 # cannot. Nine entries to add up, a few hundred times a day.
                 self.gc.live_ticks_at_max = sum(
                     entry.current_file_ticks for entry in self.symbols.values())
+
+    def take_gc_window_max(self) -> float:
+        """
+        The longest collection since the last call, and start a new window.
+
+        Returns:
+            Milliseconds, 0.0 when nothing was collected
+        """
+        longest, self._gc_window_max_ms = self._gc_window_max_ms, 0.0
+        return round(longest, 1)
 
     def record_render(self, duration_ms: float) -> None:
         """

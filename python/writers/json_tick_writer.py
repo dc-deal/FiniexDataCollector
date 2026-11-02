@@ -265,6 +265,11 @@ class JsonTickWriter(AbstractTickWriter):
         return self._current_file
 
     @property
+    def ticks_written(self) -> int:
+        """Ticks this writer has taken since the process started, across files."""
+        return self._total_ticks_written
+
+    @property
     def write_ahead_log_lost(self) -> bool:
         """
         True while a file is open without its write-ahead log.
