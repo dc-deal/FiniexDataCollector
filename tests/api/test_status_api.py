@@ -34,7 +34,7 @@ from python.api.stats_serializer import (
     health_payload,
     serialize_stats
 )
-from python.main import serve_status_api
+from python.main import ACCEPT_FAILED, report_loop_exception, serve_status_api
 from python.api.token_loader import ConsumerToken, load_token_registry
 from python.types.collector_stats import CollectorStats
 from python.types.tick_types import OriginBlock
@@ -336,6 +336,79 @@ def test_a_status_api_that_stops_later_does_not_kill_the_collector() -> None:
     assert "socket went away" in recorded[0]
 
 
+class _RecordingLoop:
+    """Stands in for the loop; records what reached asyncio's default handling."""
+
+    def __init__(self) -> None:
+        self.defaulted: List[Dict[str, Any]] = []
+
+    def default_exception_handler(self, context: Dict[str, Any]) -> None:
+        self.defaulted.append(context)
+
+
+def test_an_accept_failure_reaches_the_log_instead_of_stderr() -> None:
+    """
+    The one loop event that silently kills the status API is logged as such.
+
+    On Windows, CPython's proactor loop closes the listening socket when
+    accept() raises, and tells only the loop's exception handler - which
+    defaulted to stderr, outside the log file. uvicorn keeps running on a
+    socket that no longer exists.
+    """
+    recorded: List[str] = []
+
+    class RecordingLogger:
+        def error(self, message: str) -> None:
+            recorded.append(message)
+
+    loop = _RecordingLoop()
+    report_loop_exception(RecordingLogger())(loop, {
+        "message": ACCEPT_FAILED,
+        "exception": OSError(
+            64, "The specified network name is no longer available")})
+
+    assert len(recorded) == 1
+    assert "unreachable" in recorded[0]
+    assert "OSError" in recorded[0]
+    assert not loop.defaulted, "reported twice: once here, once on stderr"
+
+
+def test_every_other_loop_event_keeps_asyncio_default_handling() -> None:
+    """Only the accept failure is taken over; nothing else changes route."""
+    recorded: List[str] = []
+
+    class RecordingLogger:
+        def error(self, message: str) -> None:
+            recorded.append(message)
+
+    loop = _RecordingLoop()
+    context = {"message": "Task exception was never retrieved"}
+    report_loop_exception(RecordingLogger())(loop, context)
+
+    assert loop.defaulted == [context]
+    assert recorded == []
+
+
+def test_a_real_loop_hands_the_accept_failure_to_the_installed_handler() -> None:
+    """The handler is reached through the call asyncio itself makes."""
+    recorded: List[str] = []
+
+    class RecordingLogger:
+        def error(self, message: str) -> None:
+            recorded.append(message)
+
+    async def fail_an_accept() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(report_loop_exception(RecordingLogger()))
+        loop.call_exception_handler({
+            "message": ACCEPT_FAILED, "exception": ConnectionResetError()})
+
+    asyncio.run(fail_an_accept())
+
+    assert len(recorded) == 1
+    assert "ConnectionResetError" in recorded[0]
+
+
 # =============================================================================
 # DIAGNOSIS FROM A DISTANCE
 # =============================================================================
@@ -356,6 +429,57 @@ def test_the_status_reports_what_the_process_costs(client: TestClient) -> None:
     assert process["rss_mb"] > 0
     assert process["threads"] >= 1
     assert process["cpu_seconds"] >= 0
+
+
+def test_the_status_shows_the_stall_a_tick_file_cannot_show(
+    client: TestClient,
+    stats: CollectorStats
+) -> None:
+    """
+    The instrument for the day-cut defect, readable from off the machine.
+
+    A blocked event loop stamps `collected_msc` late, and nothing in a tick file
+    says so - it just reads later than it should, until the lag passes the
+    consuming importer's 30 s window and the whole file is refused. Measured on
+    production 2026-09-20: 21 s of blocking at the UTC day cut. The counters
+    beside it say whether the files that were handed to an archive writer ever
+    arrived.
+    """
+    stats.record_loop_lag(1750.0)
+    stats.record_export_started()
+    stats.record_export_finished(
+        "BTCUSD_20260920_000004_ticks.json", 42, 310.0)
+
+    payload = client.get("/v1/status", headers=as_reader()).json()
+
+    assert payload["loop_lag"]["max_ms"] == 1750.0
+    assert payload["loop_lag"]["over_500ms"] == 1
+    assert payload["loop_lag"]["max_at"].endswith("+00:00")
+    assert payload["exports"]["finished"] == 1
+    assert payload["exports"]["in_flight"] == 0
+    assert payload["exports"]["last_file"] == "BTCUSD_20260920_000004_ticks.json"
+
+
+def test_the_status_carries_what_a_screen_needs_to_draw(
+    client: TestClient,
+    stats: CollectorStats
+) -> None:
+    """
+    The three things the in-process display reads off live objects.
+
+    A viewer in another process cannot reach a `CollectionClock` or the broker
+    specification, and a second source for the same fact is how two screens
+    start disagreeing. This is the payload half of the service/viewer split.
+    """
+    stats.streams = ["trade", "ticker"]
+    stats.record_clock(3, 17)
+    stats.get_symbol_stats("ADAUSD").digits = 4
+
+    payload = client.get("/v1/status", headers=as_reader()).json()
+
+    assert payload["streams"] == ["trade", "ticker"]
+    assert payload["clock"] == {"resyncs": 3, "max_correction_ms": 17}
+    assert payload["symbols"]["ADAUSD"]["digits"] == 4
 
 
 def test_a_refused_socket_count_is_unknown_and_not_zero(
@@ -431,3 +555,147 @@ def test_the_interpreter_version_is_sampled_not_invented() -> None:
     sampled = sample_build_info("9.9.9", "9.9.9")
 
     assert sampled.python_version == platform.python_version()
+
+
+def test_build_names_the_websocket_library_and_its_client(
+        client: TestClient) -> None:
+    """
+    requirements.txt allows websockets>=12.0, and its two client
+    implementations end a connection differently - a close frame on an open
+    connection blocks recv() for 20 s in one and 10 s in the other. How the
+    collector classifies a drop depends on which one runs, so the route says.
+    """
+    payload = client.get("/v1/build").json()
+
+    assert "websockets_version" in payload
+    assert "websockets_client" in payload
+
+
+def test_the_websocket_library_is_sampled_not_invented(monkeypatch) -> None:
+    """Read from the package metadata and from what websockets.connect is."""
+    from python.api import build_info
+
+    monkeypatch.setattr(build_info, "package_version", lambda name: "9.9-test")
+
+    sampled = build_info.sample_build_info("9.9.9", "9.9.9")
+
+    assert sampled.websockets_version == "9.9-test"
+    assert sampled.websockets_client in ("websockets.asyncio.client",
+                                         "websockets.legacy.client")
+
+
+def test_missing_package_metadata_is_absent_not_guessed(monkeypatch) -> None:
+    """Like the commit: a fabricated version is worse than a missing one."""
+    from importlib.metadata import PackageNotFoundError
+
+    from python.api import build_info
+
+    def missing(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(build_info, "package_version", missing)
+
+    assert build_info.sample_build_info("x", "y").websockets_version is None
+
+
+# =============================================================================
+# WHAT /v1/health SAYS
+# =============================================================================
+
+def connected_stats() -> CollectorStats:
+    """Statistics of a collector with nothing wrong."""
+    stats = CollectorStats()
+    stats.set_websocket_status("connected")
+    return stats
+
+
+def test_health_is_ok_with_no_reasons_when_nothing_is_wrong() -> None:
+    payload = health_payload(connected_stats())
+
+    assert payload["status"] == "ok"
+    assert payload["reasons"] == []
+
+
+def test_a_quiet_market_is_not_a_fault() -> None:
+    """Connected with no tick yet: a statement about the world, not an outage."""
+    stats = connected_stats()
+    stats.symbols.clear()
+
+    assert health_payload(stats)["status"] == "ok"
+
+
+def test_health_is_degraded_while_not_connected() -> None:
+    stats = connected_stats()
+    stats.set_websocket_status("reconnecting")
+
+    payload = health_payload(stats)
+
+    assert payload["status"] == "degraded"
+    assert payload["reasons"] == ["not_connected"]
+    assert payload["websocket_status"] == "reconnecting"
+
+
+def test_a_failed_export_degrades_until_a_writer_finishes_again() -> None:
+    """`failed` only ever grows; health has to be able to recover."""
+    stats = connected_stats()
+
+    stats.record_export_failed("BTCUSD_a_ticks.json")
+    stats.record_export_failed("BTCUSD_b_ticks.json")
+    assert health_payload(stats)["reasons"] == ["export_failed"]
+    assert stats.exports.failed_in_a_row == 2
+
+    stats.record_export_finished("BTCUSD_c_ticks.json", 10, 5.0)
+    assert health_payload(stats)["status"] == "ok"
+    assert stats.exports.failed == 2
+
+
+def test_disk_degrades_only_in_its_emergency_band() -> None:
+    """WARNING and CRITICAL are bands the operator has lived in for months."""
+    stats = connected_stats()
+
+    stats.disk_space.percent_used = 75.0
+    assert stats.disk_space.status == "CRITICAL"
+    assert health_payload(stats)["status"] == "ok"
+
+    stats.disk_space.percent_used = 85.0
+    assert stats.disk_space.status == "EMERGENCY"
+    assert health_payload(stats)["reasons"] == ["disk_low"]
+
+
+def test_a_lost_write_ahead_log_is_failing() -> None:
+    payload = health_payload(connected_stats(), write_ahead_logs_lost=1)
+
+    assert payload["status"] == "failing"
+    assert payload["reasons"] == ["write_ahead_log_lost"]
+
+
+def test_failing_outranks_degraded_and_every_reason_is_named() -> None:
+    stats = connected_stats()
+    stats.set_websocket_status("reconnecting")
+    stats.record_tick_failed("BTCUSD")
+
+    payload = health_payload(stats, write_ahead_logs_lost=2)
+
+    assert payload["status"] == "failing"
+    assert payload["reasons"] == [
+        "write_ahead_log_lost", "tick_handler_failing", "not_connected"]
+
+
+def test_one_working_symbol_does_not_clear_another_ones_failure() -> None:
+    """Eight symbols that work must not hide the ninth that fails on every tick."""
+    stats = connected_stats()
+
+    stats.record_tick_failed("BTCUSD")
+    stats.record_tick_handled("ETHUSD")
+    assert health_payload(stats)["reasons"] == ["tick_handler_failing"]
+
+    stats.record_tick_handled("BTCUSD")
+    assert health_payload(stats)["status"] == "ok"
+
+
+def test_the_open_route_names_no_symbol_even_when_one_is_failing() -> None:
+    stats = connected_stats()
+    stats.record_tick_failed("BTCUSD")
+
+    assert "BTCUSD" not in str(health_payload(stats))
+    assert "BTCUSD" not in str(serialize_stats(stats).get("_failing_tick_symbols"))

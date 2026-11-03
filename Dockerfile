@@ -1,7 +1,10 @@
 # FiniexDataCollector Dockerfile
 # ==============================
 
-FROM python:3.12-slim
+# The interpreter production runs, to the patch - `/v1/build` reports it as `python_version`.
+# This said 3.12 while the server ran 3.14, and a suite green here proved a version nobody
+# ran. Moved together with `.github/workflows/tests.yml` and the server.
+FROM python:3.14.7-slim
 
 # System-Pakete installieren (Git, Build-Tools und htop für Monitoring)
 # curl is required by the GitHub CLI install below, not optional tooling.

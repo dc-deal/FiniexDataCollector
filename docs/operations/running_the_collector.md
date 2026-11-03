@@ -12,12 +12,21 @@ From the project root, as a module:
 
     python -m python.main collect      # collect until stopped
     python -m python.main status       # show state without collecting
+    python -m python.main watch        # draw a collector running elsewhere
 
 The file-path form (`python python/main.py`) fails with `No module named 'python'` — the
 package root is not on `sys.path` that way.
 
 **Set `PYTHONUTF8=1` on Windows.** The live display and the log lines carry box drawing and
 emoji; a cp1252 console truncates the display and kills a piped run outright.
+
+`watch` is a different program that happens to share this entry point: it reads one HTTP
+route and draws the screen, loads none of this configuration, and writes to no log file.
+See [watching a collector](watching_a_collector.md).
+
+**On the production box it runs as a service**, with no console at all — see
+[running as a service](running_as_a_service.md). The commands above are how it is run by hand,
+which is development and the occasional deliberate check.
 
 **Use a virtualenv**, matching the sister projects:
 
@@ -27,6 +36,130 @@ emoji; a cp1252 console truncates the display and kills a piped run outright.
 
 Docker in this repository is the **development** environment: the compose service runs
 `tail -f /dev/null` and never starts the collector. Production runs from a virtualenv.
+
+## One collector per output directory
+
+Starting a second one against the same `raw_data_dir` is **refused**, and the refusal is the
+first thing that happens — before Telegram, before the scheduler, before the status port. The
+message names the pid that holds it:
+
+    Another collector is already writing to data
+aw (pid 4892).
+
+This is not about duplicate work. Startup recovery cannot tell a crashed run's write-ahead log
+from a running instance's: on Windows removing a live log fails and aborts the start, and on
+Linux it **succeeds**, taking away the running instance's only protection.
+
+A lock left by a crash is **taken over**, not obeyed — the holder is identified by pid *and*
+process creation time, so a reused pid cannot lock the directory forever, and a truncated lock
+file counts as stale. Verified 2026-09-21: second start refused, first process killed outright,
+third start took over and recovered the log the kill left behind.
+
+**Exit codes**, which matter once a service manager is in front of it:
+
+| Code | Meaning | What a manager should do |
+|---|---|---|
+| 0 | stopped cleanly | nothing |
+| 1 | crashed | restart |
+| 2 | bad configuration, or the directory is taken | **stay stopped** — a retry produces the same failure |
+
+## What reaches the phone, and what does not
+
+Telegram carries the things somebody would act on, and deliberately not the rest.
+
+**A reconnect is normally silent.** Measured over the night of 2026-09-21: seven of them,
+recorded at 1.3 to 7.2 s each. Those figures ran from the moment a drop was noticed to the socket
+handshake and so left out the 10-11 s of silence before it was noticed - the record was corrected
+on 2026-10-08 - but even counted in full the drops were not among the longest gaps of the files
+they fell into. This host loses outbound connectivity several times a day; FiniexRAGEngine
+measured that from five sides, and nothing on our side prevents it. Six alerts for an event
+invisible in the data trains the reader to swipe, and the next one that mattered is swiped with
+it.
+
+Two still arrive:
+
+| | Why |
+|---|---|
+| a data gap past `reconnect_alert_min_seconds` (30 s) | a normal drop costs a few seconds and a silent link about fifteen, so thirty means reconnecting itself is failing or the link stayed dead |
+| `reconnect_alert_cluster` (4) inside one hour | blips every two hours are weather; four in an hour is a machine degrading |
+
+Both carry the length in seconds, how the drop was detected and how many attempts it took.
+Whole minutes rendered every reconnect that night as "0m downtime", including the 7.22 s one
+that was three times the others. The length is the data gap - last message before the drop to
+the feed restored - not the window from noticing the drop to the handshake, which is what the
+alert judged until 2026-10-08. (The threshold's old justification, that past the consumer's lag
+window a whole file is refused, was wrong: an outage shortens a file. Kraken replays nothing after
+a reconnect, so the ticks that follow are fresh.)
+
+Everything else stays on `/v1/status` - the latest twenty outage records, and totals that count
+every one - and in the log, as one `[OUTAGE]` line per outage when the feed is restored and
+another when the record is complete.
+
+## The memory trail
+
+Every ten minutes the log gets one line on what the window did:
+
+```
+[MEMORY] {"schema": 1, "window_s": 600.0, "rss_mb": 218.4, "private_mb": 231.0, "threads": 7,
+          "gc": {"collections": [212, 19, 1], "ms": 96.3, "longest_ms": 41.5, "threshold": [2000, 10, 10]},
+          "loop": {"over_500ms": 0, "worst_stall_ms": null, "worst_stall_cause": null},
+          "outages": 1, "ticks": {"BTCUSD": 4211, "ETHUSD": 1873, ...}}
+```
+
+`/v1/status` says how much memory the process holds now, and a restart forgets it. Whether that
+number settles or creeps over weeks is a question of slope, and the slope needs readings that
+outlive the process: `/v1/logs?contains=[MEMORY]` reads them back from anywhere, a day at a time.
+Every figure is a delta over its own window, never a total since the start, so lines on either
+side of a restart need no telling apart. The first line comes one window after the start.
+
+- **`private_mb` is the one to watch on Windows.** `rss_mb` is the working set, which the system
+  trims under pressure; `private_mb` is what is committed. Rising together means memory is held,
+  `rss_mb` alone moving means the system is shuffling pages.
+- **`gc.threshold` reading `[2000, 10, 0]`** is the tell-tale of the incremental collector in
+  CPython 3.14.0-3.14.4, which let cyclic garbage pile up in long-running processes.
+  FiniexRAGEngine measured that on this box. The collector runs 3.14.7.
+- **`loop.worst_stall_ms`** is the longest stall recorded in the window, with its cause, or `null`.
+- **`ticks`** per symbol shows a symbol going quiet over hours; one window of zero is the market.
+- **`outages`** is `null` until the first outage of the process, then the count in the window.
+
+## The outside check
+
+Every alarm above runs inside the process, and on 2026-10-18 and 10-20, when the hosting provider
+restarted the machine twice, there was nothing left to raise one. An outside check inverts that: it
+alarms when pings **stop**, so a dead process, a frozen loop and a dead machine all reach the phone
+without any of them having to speak.
+
+Off by default. To turn it on, create a check at a service such as healthchecks.io and put its ping
+address into `user_configs/app_config.json`:
+
+```json
+{
+  "monitoring": {
+    "heartbeat_url": "https://hc-ping.com/<the check's id>",
+    "heartbeat_interval_seconds": 60
+  }
+}
+```
+
+Then restart the collector. **The address is a credential**: whoever holds it can report this
+collector healthy. It belongs in `user_configs/` and nowhere else, it is never logged, and
+`/v1/configs` masks it.
+
+The standard for the Finiex services is a period of 10 minutes and a grace time of 30, with an e-mail
+on down. It alarms about 40 minutes after the last ping, so only larger outages raise one: a deploy
+restart stays silent, and so would the host restarts of October, about 15 minutes each until the
+collector was back. A shorter outage still has to be read from the data. Shorten both times if you
+want to hear sooner.
+
+**A ping goes out only while `/v1/health` says `ok`**, so `failing` and `degraded` alarm too, if they
+last. The first beat comes one interval after the start, because the feed is not connected before
+that. A failed ping costs one line in the log and never touches collection.
+
+| The phone says down, and | It is |
+|---|---|
+| `/v1/health` does not answer | the machine, the process or a frozen loop |
+| `/v1/health` is not `ok` | what `reasons` names |
+| `/v1/health` is `ok`, `heartbeat.failed` rising on `/v1/status` | the network between the collector and the check |
 
 ## Stopping
 
@@ -47,9 +180,23 @@ A remaining `.jsonl.part` means that symbol's file was never finalized. Nothing 
 next start rebuilds it — but it tells you the stop was not clean.
 
 On Linux both SIGINT and SIGTERM are handled through the event loop. On Windows the handler is
-installed with `signal.signal`, which only runs while the main thread executes bytecode; an
-interactive Ctrl+C is the reliable path there, and a signal delivered to a service is not
-something this project has verified.
+installed with `signal.signal`, which only runs while the main thread executes bytecode.
+
+**A stop from a service manager was verified on 2026-09-21**, and it found something first.
+NSSM's `AppStopMethodConsole` detaches from its own console, attaches to the service's, and
+raises a console Ctrl+C there. Reproducing exactly that sequence: the collector **ignored it for
+a full minute** and its archive was never written. The cause was not the handler — it was that
+**Ctrl+C processing can be switched off in a process and is INHERITED by everything it
+launches**, and the shell running the test had it off. The event is accepted by the console, the
+handler never runs, and nothing is logged. The collector now calls
+`SetConsoleCtrlHandler(NULL, FALSE)` for itself before registering the handler, so it no longer
+depends on what launched it. With that one call, the same test stopped it in **0.15 s**, wrote
+the archive, removed the write-ahead log, and the file passed every import invariant.
+
+**A kill is still not a loss.** Had the stop failed, the write-ahead log would have held every
+tick and the next start would have rebuilt the file — which is what the 2026-09-20 host reset
+demonstrated on the real archive. The difference a graceful stop makes is a finished archive
+file instead of a recovery.
 
 ## Reading the live display
 
@@ -74,13 +221,74 @@ apart.
 
 ## When a connection drops
 
-The collector detects a stale connection after roughly three times
-`heartbeat_interval_seconds` and reconnects on its own, resubscribing both channels. Kraken
-sends a ticker snapshot on subscribe, so the quote cache is refreshed before the first trade
-arrives — measured at 235 ms after a reconnect rather than the length of the outage.
+A drop costs the trades Kraken makes while nobody is listening, so the first thing that matters
+is noticing it. Three things end a connection, whichever comes first:
 
-Each drop costs the market data of its detection window. At the shipped interval of 10 s that
-is roughly 30–40 s; it was 105 s at the previous 30 s setting.
+- **The receive loop ends** - Kraken closed the socket, or the connection was reset or lost.
+  Noticed at once. Until 2026-10-08 this end was handed back by `asyncio.gather(...,
+  return_exceptions=True)` and ignored, and in 136 of 137 drops between 2026-09-20 and 2026-10-08
+  the socket was already closing when the silence watchdog found it, 10-11 s later.
+- **A close frame on a connection left open.** Kraken can send its close frame and keep the TCP
+  connection open; `recv()` then waits for the next keepalive ping, 20 s later. The watchdog reads
+  the connection's state every second and takes the frame as the end.
+- **Silence** for `stale_after_seconds` - a link that stopped answering without ending. Silence
+  counts every message, heartbeats included, and Kraken sends one every second on a live
+  connection, measured at a largest gap of 1.03 s on a quiet pair.
+
+A connection given up on is dropped at once rather than closed politely, which on a dead link used
+to wait out the 5 s close timeout. Then both channels are subscribed again. Their answers are read
+by the receive loop and matched to their stream by `req_id`: until 2026-10-08 `subscribe()` read
+one message per stream and kept it if it looked like an answer, so Kraken's status message - its
+first on every connection - was discarded unseen and the first trade answer was logged as the
+ticker's, in 169 of 169 subscription cycles on production. A pair that neither answers nor
+delivers data within 10 s is listed in the record and the feed carries on; only a stream that
+produced nothing at all is reconnected, and a refusal that arrives after those 10 s still counts
+as a refusal. A single message that cannot be handled - a format Kraken changed - costs that
+message and a WARNING, never the connection. Kraken sends a ticker snapshot on subscribe, so the quote
+cache is refreshed before the first trade arrives - measured at 235 ms after a reconnect rather
+than the length of the outage.
+
+**What a drop costs now.** Measured 2026-10-08 against a local far side, both websockets
+implementations: a closed or reset connection is noticed after about 0.1 s and the feed is back
+after about 1.1 s; a close frame on an open connection after about 1.1 and 2.1 s; a silent link
+after 10.2 and 11.2 s. Against the real Kraken from the development laptop, a connection cut
+locally was noticed after 15 ms and restored after 3.4 s - 1 s of backoff and 2.3 s of handshake
+and subscription. Before 2026-09-19 the check ran every 10 s and reconnected at three times that:
+41-51 s of silence per drop on the liquid pairs, measured by `trade_id` gaps on production - 537
+trades in four drops in one evening.
+
+**The backoff starts over only after a restored connection has stayed up for 10 s.** It used to
+start over at every handshake, which with drops noticed at once would dial a far side that
+accepts and closes again every few seconds - about 150 attempts in ten minutes in a simulation
+with the 2.3 s handshake measured against Kraken, the limit Kraken documents per IP, with a
+ten-minute ban beyond it. The 10 s watchdog used to hide this by accident. Ten seconds keeps even a
+far side that closes just past the window at 45 attempts. A longer window costs data instead: when
+a degraded Kraken drops connections every 20-50 s, a 60 s window held the delay at its 60 s
+maximum - 62 % offline in the same simulation (2026-10-09), against 9 % with ten seconds.
+
+Every drop is one record on `/v1/status` and an `[OUTAGE]` line in the log when the feed is
+restored and again when the record is complete, with what it cost per symbol in trade ids - see
+[the status API](../architecture/status_api.md).
+
+## Reading a rotation in the log
+
+Two lines describe every closed file, and they come from different places:
+
+    Closed: BTCUSD_..._ticks.json (47368 ticks) - handed to the archive writer   <- the writer
+    File rotated: BTCUSD_..._ticks.json (47,368 ticks)                            <- the handler
+    Exported BTCUSD_..._ticks.json (47,368 ticks) in 840 ms                       <- the subprocess
+
+**They are a cross-check, not a repetition.** The first counts the buffer that became the file,
+the second the counter the display and `/v1/status` show, the third what the subprocess actually
+wrote. Until 2026-09-20 the middle one disagreed with the other two by one tick at every day cut.
+`counter_check` on `/v1/status` now compares the first two once a minute; `mismatches` above zero
+is the signal.
+
+**A blocked event loop is not a dead feed.** While a file closes nothing reads the socket — the
+midnight cut blocked the loop for 17.85 s — and messages wait there unread. A check that wakes
+late therefore skips its judgement for that round; the next one sees what the receive loop read
+in the meantime. Without that exemption a 10 s threshold would force a reconnect at every day
+cut.
 
 ## Where things are
 

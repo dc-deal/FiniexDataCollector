@@ -1,4 +1,35 @@
 {
+  "_comment": "Copy to .mcp.json (gitignored) and keep the ONE block that matches where this session runs. The container block is the default; the host block is for a session working directly on the machine, Windows or Linux. A block naming a path that does not exist fails at session start with CONNECTION_CLOSED and no further explanation, which is how an empty inbox stops being evidence that nothing arrived. Replace every <...> with a real path; none of them belongs in a tracked file.",
+  "_in_the_container": {
+    "finiex-bus": {
+      "command": "python3",
+      "args": ["/bus/client/bus_mcp.py"],
+      "env": {
+        "BUS_ROOT": "/bus",
+        "BUS_PEER": "datacollector"
+      }
+    }
+  },
+  "_on_a_linux_host": {
+    "finiex-bus": {
+      "command": "python3",
+      "args": ["<bus folder>/client/bus_mcp.py"],
+      "env": {
+        "BUS_ROOT": "<bus folder>",
+        "BUS_PEER": "datacollector"
+      }
+    }
+  },
+  "_on_a_windows_host": {
+    "finiex-bus": {
+      "command": "python",
+      "args": ["<bus folder>/client/bus_mcp.py"],
+      "env": {
+        "BUS_ROOT": "<bus folder>",
+        "BUS_PEER": "datacollector"
+      }
+    }
+  },
   "mcpServers": {
     "finiex-bus": {
       "command": "python3",

@@ -5,8 +5,7 @@ Custom exceptions for tick collection and processing.
 Location: python/exceptions/collector_exceptions.py
 """
 
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 
 class CollectorException(Exception):
@@ -151,45 +150,3 @@ class AlertDeliveryError(CollectorException):
         super().__init__(
             f"{message} (Provider: {provider}, Type: {alert_type})"
         )
-
-
-@dataclass
-class CollectorHealthReport:
-    """
-    Health report for collector diagnostics.
-
-    Used when collector encounters issues that need reporting.
-    """
-    collector_name: str
-    status: str                          # "healthy", "degraded", "failed"
-    uptime_seconds: float
-    ticks_collected: int
-    errors_count: int
-    last_tick_time: Optional[str]
-    connection_status: str
-    symbols_active: List[str]
-    warnings: List[str]
-    details: Dict[str, Any]
-
-    def get_report(self) -> str:
-        """Generate human-readable health report."""
-        lines = [
-            "=" * 60,
-            f"COLLECTOR HEALTH REPORT: {self.collector_name}",
-            "=" * 60,
-            f"Status:      {self.status.upper()}",
-            f"Uptime:      {self.uptime_seconds:.1f}s",
-            f"Ticks:       {self.ticks_collected:,}",
-            f"Errors:      {self.errors_count}",
-            f"Connection:  {self.connection_status}",
-            f"Last Tick:   {self.last_tick_time or 'N/A'}",
-            f"Symbols:     {', '.join(self.symbols_active)}",
-        ]
-
-        if self.warnings:
-            lines.append("\nWarnings:")
-            for warning in self.warnings:
-                lines.append(f"  ⚠️  {warning}")
-
-        lines.append("=" * 60)
-        return "\n".join(lines)

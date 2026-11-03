@@ -15,6 +15,7 @@ import aiohttp
 import certifi
 
 from python.exceptions.collector_exceptions import ConfigurationError
+from python.utils.logging_setup import describe_exception
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,7 @@ class BrokerConfig:
                 data = json.load(f)
         except json.JSONDecodeError as e:
             raise ConfigurationError(
-                f"Invalid JSON in broker config: {e}",
+                f"Invalid JSON in broker config: {describe_exception(e)}",
                 config_file=str(config_path)
             )
 
@@ -157,7 +158,7 @@ class BrokerConfig:
                     data = await resp.json()
         except (aiohttp.ClientError, TimeoutError) as e:
             raise ConfigurationError(
-                f"Failed to fetch symbol config from Kraken API: {e}"
+                f"Failed to fetch symbol config from Kraken API: {describe_exception(e)}"
             )
 
         errors = data.get("error", [])

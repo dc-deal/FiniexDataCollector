@@ -13,6 +13,8 @@ Links only. Order within a section is reading priority — the first entry is wh
 ## Operations
 
 - [Running the collector](operations/running_the_collector.md)
+- [Watching a collector](operations/watching_a_collector.md)
+- [Running as a service](operations/running_as_a_service.md)
 
 ## Tests
 
@@ -21,6 +23,5 @@ Links only. Order within a section is reading priority — the first entry is wh
 ## Elsewhere
 
 - [README](../README.md) — what the project is, quickstart, output format
-- [CLAUDE.md](../CLAUDE.md) — project rules and conventions
 - GitHub issue #8 — vision and roadmap
 - GitHub issue #11 — the tick data contract as it was agreed with FiniexTestingIDE

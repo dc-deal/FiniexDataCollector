@@ -39,6 +39,7 @@ from python.api.archive_reader import read_archive
 from python.api.build_info import BuildInfo
 from python.api.file_server import resolve_archive_file
 from python.api.log_reader import MAX_LINES, available_days, read_log
+from python.api.outage_history import MAX_RECORDS, read_outages
 from python.api.redaction import redact_config
 from python.types.tick_types import OriginBlock
 
@@ -124,6 +125,8 @@ def create_api(
             "commit": build.commit,
             "dirty": build.dirty,
             "python_version": build.python_version,
+            "websockets_version": build.websockets_version,
+            "websockets_client": build.websockets_client,
             "started_at": build.started_at
         }
 
@@ -282,6 +285,35 @@ def create_api(
                 log_dir, parsed, min_level=min_level,
                 since=_as_utc(since), until=_as_utc(until),
                 contains=contains, limit=limit)
+
+        @app.get(
+            "/v1/outages",
+            dependencies=[
+                Depends(verify_bearer),
+                Security(verify_grant, scopes=["outages"])
+            ]
+        )
+        def outage_history(
+            since: Optional[datetime] = Query(
+                None, description="Earliest outage start, UTC. Default: seven days before until"),
+            until: Optional[datetime] = Query(
+                None, description="Latest outage start, UTC. Default: now"),
+            limit: int = Query(MAX_RECORDS, ge=1, le=MAX_RECORDS)
+        ) -> Dict[str, Any]:
+            """
+            Every interruption of the feed that began in the window, oldest first:
+            how it was detected, the data gap, and the trade ids missed per symbol.
+
+            Its own surface, `outages`, so a consumer comparing its feed against
+            ours can hold the history without holding the log, which says far more
+            than a consumer needs. Read from the `[OUTAGE]` lines the log already
+            holds, from 2026-10-10 on. At most 62 days per request; `next_since`
+            continues a truncated answer.
+            """
+            try:
+                return read_outages(log_dir, since=since, until=until, limit=limit)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
 
     return app
 

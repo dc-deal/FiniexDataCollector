@@ -11,6 +11,7 @@ not be given because nobody with the question had access to the archive.
 Location: tests/api/test_diagnostic_routes.py
 """
 
+import inspect
 import json
 import re
 import warnings
@@ -24,6 +25,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from fastapi.testclient import TestClient
 
 from python.api.api_app import create_api
+from python.api.archive_reader import read_archive
 from python.api.build_info import BuildInfo
 from python.api.redaction import redact_config
 from python.api.token_loader import load_token_registry
@@ -81,7 +83,8 @@ def write_archive_file(
     name: str,
     resyncs_open: int = 0,
     resyncs_close: int = 0,
-    tick_count: int = 2
+    tick_count: int = 2,
+    instance_id: str = None
 ) -> None:
     """
     Plant one archive file.
@@ -92,6 +95,8 @@ def write_archive_file(
         resyncs_open: Anchor counter in the header
         resyncs_close: Anchor counter in the summary
         tick_count: How many ticks to write, for tests that need a realistic size
+        instance_id: The producing identity. None plants a file from before 1.7.0,
+            which carried no `origin` block at all
     """
     directory.mkdir(parents=True, exist_ok=True)
     (directory / name).write_text(json.dumps({
@@ -100,7 +105,12 @@ def write_archive_file(
             "data_format_version": "1.6.0",
             "collected_msc_timebase": "utc",
             "start_time": "2026.09.15 10:00:00",
-            "anchor_resyncs": resyncs_open
+            "anchor_resyncs": resyncs_open,
+            **({"origin": {"instance_id": instance_id,
+                           "collected_on": "a-host",
+                           "producer": "finiex-data-collector",
+                           "producer_version": "1.2.1"}}
+               if instance_id else {})
         },
         "ticks": [
             {"time_msc": 1789000000000 + i * 1000,
@@ -349,10 +359,33 @@ def test_no_route_is_authenticated_but_ungated(client: TestClient) -> None:
             f"nothing - it is authenticated but ungated")
 
     assert sorted(walked) == ["/v1/archive", "/v1/configs", "/v1/files/{name}",
-                              "/v1/logs", "/v1/status"], (
+                              "/v1/logs", "/v1/outages", "/v1/status"], (
         "a gated route appeared or disappeared; listing them here is what keeps "
         "a router that drops out of the app from leaving the walk green while "
         "the surface it protected goes unreachable")
+
+
+def test_no_route_does_its_work_on_the_event_loop(client: TestClient) -> None:
+    """
+    A route defined with `def` runs in a threadpool; `async def` runs on the loop.
+
+    That distinction is the whole reason the file transfer does not cost the
+    collection: handing out a 22 MB archive file, walking the archive to build
+    the register, or reading a day of log are all blocking work, and the loop
+    they would block is the one that stamps every tick's arrival time. The
+    consuming project fetches files in a loop, so this is not a rare event.
+
+    Nothing in FastAPI warns about the change. One keyword moves the work onto
+    the loop, and it would show as arrival lag in the data rather than as an
+    error anywhere.
+    """
+    on_the_loop = [
+        route.path for route in client.app.routes
+        if getattr(route, "path", "").startswith("/v1")
+        and inspect.iscoroutinefunction(getattr(route, "endpoint", None))]
+
+    assert not on_the_loop, (
+        f"these routes would block the collector's event loop: {on_the_loop}")
 
 
 def test_the_open_routes_stay_open(client: TestClient) -> None:
@@ -686,3 +719,65 @@ def test_an_empty_log_directory_answers_rather_than_guesses(
     assert payload["exists"] is False
     assert payload["day"] is None
     assert payload["available_days"] == []
+
+
+def test_the_register_names_the_identity_that_wrote_each_file(
+    tmp_path: Path
+) -> None:
+    """
+    A consumer has to be able to decide before transferring, not after.
+
+    It costs nothing while one instance writes into a directory. From the moment
+    two have - which is exactly what pointing a new deployment at an existing
+    archive root does - "which files here did an identity I do not know write"
+    would otherwise mean downloading the archive to read twelve characters out of
+    each file. At 50,000 ticks that is about 22 MB per answer.
+
+    The argument is the one that already put `data_format_version` in the
+    register; FiniexTestingIDE made it back to us on 2026-09-17 and it is theirs
+    as much as ours.
+
+    Args:
+        tmp_path: pytest temp directory
+    """
+    kraken = tmp_path / "kraken"
+    write_archive_file(kraken, "BTCUSD_20260917_100000_ticks.json",
+                       instance_id="cac17e8c4d70")
+    write_archive_file(kraken, "ETHUSD_20260917_100000_ticks.json",
+                       instance_id="db9a1776313e")
+
+    entries = {e["file"]: e for e in read_archive(tmp_path, "kraken")["files"]}
+
+    assert entries["BTCUSD_20260917_100000_ticks.json"]["instance_id"] == "cac17e8c4d70"
+    assert entries["ETHUSD_20260917_100000_ticks.json"]["instance_id"] == "db9a1776313e"
+
+
+def test_a_file_from_before_provenance_says_so_with_null(tmp_path: Path) -> None:
+    """
+    `null`, and never a guess.
+
+    Files below 1.7.0 carry no `origin` block, and nothing can infer afterwards
+    which instance wrote them - that is the whole reason the consuming project
+    labels them from a dated attestation instead. Reporting anything but `null`
+    here would be this project's oldest mistake in a new place.
+
+    Args:
+        tmp_path: pytest temp directory
+    """
+    kraken = tmp_path / "kraken"
+    write_archive_file(kraken, "BTCUSD_20260915_100000_ticks.json")
+
+    entry = read_archive(tmp_path, "kraken")["files"][0]
+
+    assert "instance_id" in entry, "the key must be present, so its absence is not the answer"
+    assert entry["instance_id"] is None
+
+
+def test_the_heartbeat_address_is_never_served() -> None:
+    """It carries no secret-looking key name, and it can report us healthy."""
+    redacted = redact_config(
+        {"monitoring": {"heartbeat_url": "https://hc-ping.com/abc",
+                        "heartbeat_interval_seconds": 60}})
+
+    assert redacted["monitoring"]["heartbeat_url"] == "<redacted>"
+    assert redacted["monitoring"]["heartbeat_interval_seconds"] == 60

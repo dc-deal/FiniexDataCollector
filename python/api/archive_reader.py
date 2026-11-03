@@ -65,6 +65,16 @@ def _file_entry(
         "readable": True,
         "symbol": metadata.get("symbol"),
         "data_format_version": metadata.get("data_format_version"),
+        # The identity, in the register and not only inside the file. The argument
+        # is the same one that put `data_format_version` here: a consumer has to be
+        # able to decide BEFORE transferring. It costs nothing while one instance
+        # writes into a directory, and from the moment two have - which is what
+        # pointing a new deployment at an existing archive root does - the question
+        # "which files here did an identity I do not know write" would otherwise
+        # mean downloading the archive to read twelve characters out of each file.
+        # `null` for anything below 1.7.0, which is the honest answer: those files
+        # were written before provenance existed and nothing can infer it now.
+        "instance_id": (metadata.get("origin") or {}).get("instance_id"),
         "collected_msc_timebase": metadata.get("collected_msc_timebase"),
         "start_time": metadata.get("start_time"),
         "tick_count": len(ticks),

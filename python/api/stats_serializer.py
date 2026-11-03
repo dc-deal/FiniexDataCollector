@@ -22,15 +22,21 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from python.types.collector_stats import CollectorStats
+from python.utils.memory_trail import private_mb
 
 # Display knobs, not measurements. They describe how much history the terminal
 # keeps, which tells a consumer nothing about the collection.
 NOT_METRICS = ("max_recent_logs", "max_reconnect_history")
 
 
-def _plain(value: Any) -> Any:
+def plain(value: Any) -> Any:
     """
     Convert one value into something json.dumps accepts.
+
+    Public because a second destination uses it: the '[OUTAGE]' log line writes
+    each outage record through this same function, so the line a session reads
+    months later has exactly the shape /v1/status served. A second converter
+    for the same record is how two shapes start to drift.
 
     Args:
         value: Any member of the stats tree
@@ -46,13 +52,13 @@ def _plain(value: Any) -> Any:
         return value.astimezone(timezone.utc).isoformat(timespec="seconds")
 
     if is_dataclass(value) and not isinstance(value, type):
-        return {key: _plain(inner) for key, inner in asdict(value).items()}
+        return {key: plain(inner) for key, inner in asdict(value).items()}
 
     if isinstance(value, dict):
-        return {str(key): _plain(inner) for key, inner in value.items()}
+        return {str(key): plain(inner) for key, inner in value.items()}
 
     if isinstance(value, (list, tuple)):
-        return [_plain(inner) for inner in value]
+        return [plain(inner) for inner in value]
 
     return value
 
@@ -68,7 +74,7 @@ def serialize_stats(stats: CollectorStats) -> Dict[str, Any]:
         JSON-native representation of every measurement it holds
     """
     payload = {
-        name: _plain(value)
+        name: plain(value)
         for name, value in vars(stats).items()
         if not name.startswith("_") and name not in NOT_METRICS
     }
@@ -116,6 +122,7 @@ def process_resources() -> Dict[str, Any]:
             return {
                 "available": True,
                 "rss_mb": round(process.memory_info().rss / (1024 * 1024), 1),
+                "private_mb": private_mb(process),
                 "threads": process.num_threads(),
                 "open_sockets": _socket_count(process),
                 "cpu_seconds": round(times.user + times.system, 1)
@@ -161,23 +168,48 @@ def uptime_seconds(stats: CollectorStats) -> int:
     return int((datetime.now(timezone.utc) - started).total_seconds())
 
 
-def health_payload(stats: CollectorStats) -> Dict[str, Any]:
+def health_payload(stats: CollectorStats,
+                   write_ahead_logs_lost: int = 0) -> Dict[str, Any]:
     """
-    The open route's answer: is it alive, since when, is it connected.
+    The open route's answer: is it alive, since when, is it collecting.
+
+    `failing` means ticks are at risk right now; `degraded` means the feed or the
+    archive needs attention while nothing already collected is in danger. Derived
+    on every call and never stored, so it cannot go on reading `ok` over a fault
+    nobody re-checked: FiniexRAGEngine's route said `ok` for 37 h over a dead
+    worker. A silent feed needs no reason of its own, because the watchdog turns
+    it into `not_connected` within seconds - and a quiet market, which still sends
+    ticker and heartbeat traffic, must never read as a fault.
 
     Deliberately without symbol names, tick rates or file names. Those describe
     what is being traded and how much of it, which an uptime probe does not need
-    and an unauthenticated caller should not receive.
+    and an unauthenticated caller should not receive. The reasons are codes.
 
     Args:
         stats: The collector's live statistics object
+        write_ahead_logs_lost: How many open files have lost their write-ahead log
 
     Returns:
         Liveness payload
     """
+    failing = []
+    if write_ahead_logs_lost:
+        failing.append("write_ahead_log_lost")
+    if stats.tick_handler_failing:
+        failing.append("tick_handler_failing")
+
+    degraded = []
+    if stats.websocket_status != "connected":
+        degraded.append("not_connected")
+    if stats.exports.failed_in_a_row:
+        degraded.append("export_failed")
+    if stats.disk_space.status == "EMERGENCY":
+        degraded.append("disk_low")
+
     return {
-        "status": "ok" if stats.websocket_status == "connected" else "degraded",
+        "status": "failing" if failing else "degraded" if degraded else "ok",
+        "reasons": failing + degraded,
         "websocket_status": stats.websocket_status,
         "uptime_seconds": uptime_seconds(stats),
-        "started_at": _plain(stats.start_time)
+        "started_at": plain(stats.start_time)
     }

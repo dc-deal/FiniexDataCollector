@@ -6,8 +6,18 @@ Location: python/types/collector_stats.py
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import List, Optional, Dict
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set
+
+from python.types.log_level import ERROR, LogLevel
+
+# Dates the per-day outage count keeps - the most recent dates that had an
+# outage, which on a feed dropping several times a day is two weeks.
+RECONNECT_DAYS_KEPT = 14
+
+# How far back the uncapped outage times reach: the week a report counts, and a
+# day of margin for a report that runs late.
+OUTAGE_TIMES_KEPT = timedelta(days=8)
 
 
 @dataclass
@@ -28,6 +38,10 @@ class SymbolStats:
         errors_count: Errors for this symbol
         file_count: Number of files created this session
         folder_file_count: Total files in folder (all sessions)
+        digits: Decimal places this instrument's prices carry, from the broker
+            specification. Two fixed places once rendered ADAUSD's 0.2103 and
+            0.2104 both as 0.21, a screen asserting a spread the book did not
+            have - so a screen outside this process needs the real number
     """
     symbol: str
     current_file_ticks: int = 0
@@ -41,6 +55,7 @@ class SymbolStats:
     errors_count: int = 0
     file_count: int = 0
     folder_file_count: int = 0
+    digits: Optional[int] = None
 
     @property
     def is_active(self) -> bool:
@@ -53,20 +68,179 @@ class SymbolStats:
 
 
 @dataclass
-class ReconnectEvent:
+class TradeIdGap:
     """
-    Single reconnect event.
+    What one symbol's trade ids say about one interruption of the feed.
+
+    Kraken numbers trades per pair, and in this collector's 1.7.0 files those
+    numbers have been dense: no gap outside a drop, consecutive files joining at
+    last + 1. So the first id after a drop minus the last one before it says how
+    many trades went by unseen - as an UPPER bound, because the venue may
+    allocate ids it never publishes. Measured here, live, it does not depend on
+    which file either trade ended up in.
 
     Attributes:
-        timestamp: When disconnect occurred
-        reconnected_at: When reconnection succeeded
-        duration_seconds: Downtime duration
-        reason: Disconnect reason
+        last_trade_id: The symbol's last trade received before the drop - with
+            spans_previous_outage, before the earliest outage the gap covers;
+            None if there was none
+        last_trade_time_msc: That trade's exchange time
+        first_trade_id: The first trade after the drop on the connection that
+            restored the feed; None until it arrives, and for good if the record
+            was resolved before it did
+        first_trade_time_msc: That trade's exchange time
+        first_trade_after_ms: Offset of its arrival from the outage's last
+            message, on the monotonic clock
+        missing_trade_ids: Ids after the last trade before the drop and before
+            the first one after it that never arrived - first - last - 1, less
+            any trades an attempt that failed before the restoration delivered
+            in between. An upper bound on trades missed; None when an end is
+            unknown or the ids did not increase - never 0 by default, because 0
+            would claim nothing was missed
+        ids_not_increasing: Somewhere in this outage a first trade - on the
+            restoring connection or on an attempt that failed - was not above
+            the highest id received before it: a replay or a reordering,
+            flagged rather than counted, and the count stays unknown
+        spans_previous_outage: The symbol's first trade after the previous
+            outage was still unknown when that record closed - by the next
+            drop, the deadline, or a refusal - and it did not trade before
+            this drop. This gap starts at its last trade before that outage
+            and keeps whatever a failed attempt of it counted, so it covers
+            both: the total stays right, the attribution to this one outage
+            does not
+    """
+    last_trade_id: Optional[int] = None
+    last_trade_time_msc: Optional[int] = None
+    first_trade_id: Optional[int] = None
+    first_trade_time_msc: Optional[int] = None
+    first_trade_after_ms: Optional[float] = None
+    missing_trade_ids: Optional[int] = None
+    ids_not_increasing: bool = False
+    spans_previous_outage: bool = False
+
+
+@dataclass
+class ReconnectEvent:
+    """
+    One interruption of the Kraken feed, from the last message before it to the
+    moment every subscription was answered again.
+
+    The four leading fields kept their names through 2026-10-08 and got back the
+    meaning their documentation always claimed. Until then `timestamp` was the
+    moment the drop was NOTICED - 10-11 s after the data stopped, because a
+    socket Kraken had closed was only found by the silence watchdog - the event
+    ended at the socket handshake, before anything was subscribed again, the
+    duration was two wall-clock readings subtracted, and `reason` was the
+    constant 'connection_restored'. A reconnect recorded as 2.2 s had cost about
+    12 s of trades.
+
+    Durations are measured on the monotonic clock; the two datetimes are wall
+    clock readings for a human and are never subtracted from each other.
+
+    Attributes:
+        timestamp: Wall clock at the last message received before the drop -
+            when data stopped, as far as this process can know
+        reconnected_at: Wall clock when every (stream, symbol) subscription had
+            been answered again - or when the 10 s subscription deadline gave
+            up on the stragglers listed in `unconfirmed`; None while the
+            outage is in progress
+        duration_seconds: The data gap - last message to feed restored,
+            monotonic; at a give-up it includes the wait for the deadline,
+            while most pairs may have been back long before. None while in
+            progress
+        reason: How the drop was detected - far_side_close, connection_lost,
+            keepalive_timeout, library_failure, silence_watchdog,
+            subscribe_unanswered, subscribe_send_failed or unexpected
+        close_code: Code of the close frame Kraken sent; None when no frame
+            arrived or it carried no code - reason far_side_close says a frame
+            came. Never 0, and never the 1006 or 1005 the library reports for a
+            missing frame or a missing code
+        close_reason: Text of that frame
+        exception: What ended the connection, as text
+        cause: The error chained under it (a reset, a DNS failure), as text
+        detected_after_ms: Last message to detection
+        teardown_ms: Time spent dropping the old socket: about 0, because a
+            connection given up on is aborted rather than closed politely for
+            its close timeout - it does not tell a closed link from a dead one
+        attempts: Connection attempts in this outage, the successful one included
+        backoff_s: Seconds slept between attempts in this outage
+        last_failure: The most recent failed attempt, as text
+        handshake_after_ms: Last message to the handshake that succeeded
+        confirmed_after_ms: Per stream, last message to the latest moment a
+            pair of it was acknowledged or confirmed by its data; a stream
+            Kraken refused outright was confirmed at no time and is absent
+        rejected: Pairs Kraken refused to subscribe, as 'stream SYMBOL: error'
+        unconfirmed: Pairs that neither answered nor delivered data within the
+            subscription deadline; the feed was taken as restored without them
+        first_trade_after_ms: Last message to the first trade on any symbol
+        connection_age_s: How long the dropped connection had been fully
+            subscribed - the same anchor the backoff reset is measured from
+        kraken_connection_id: Kraken's id for the dropped connection, a string
+            because it is a 63-bit integer a JavaScript reader would round
+        kraken_system: The last system state Kraken announced on it
+        resolved_by: What closed the record - all_symbols_traded, deadline,
+            next_drop or shutdown; '' while open
+        symbols: Per symbol, what its trade ids say about this interruption
     """
     timestamp: datetime
     reconnected_at: Optional[datetime]
-    duration_seconds: float
+    duration_seconds: Optional[float]
     reason: str
+
+    # Defaulted rather than required, as on StallEvent: a viewer runs against
+    # whatever build the box carries, and an older collector sends only the four
+    # fields above.
+    close_code: Optional[int] = None
+    close_reason: str = ""
+    exception: str = ""
+    cause: str = ""
+    detected_after_ms: Optional[float] = None
+    teardown_ms: Optional[float] = None
+    attempts: int = 0
+    backoff_s: float = 0.0
+    last_failure: str = ""
+    handshake_after_ms: Optional[float] = None
+    confirmed_after_ms: Dict[str, float] = field(default_factory=dict)
+    rejected: List[str] = field(default_factory=list)
+    unconfirmed: List[str] = field(default_factory=list)
+    first_trade_after_ms: Optional[float] = None
+    connection_age_s: Optional[float] = None
+    kraken_connection_id: str = ""
+    kraken_system: str = ""
+    resolved_by: str = ""
+    symbols: Dict[str, TradeIdGap] = field(default_factory=dict)
+
+
+@dataclass
+class ReconnectTotals:
+    """
+    Every outage since the process started, beyond what the ring keeps.
+
+    The detailed records are capped, because each one carries nine symbols and
+    the status payload is serialised every second while a viewer is open. The
+    totals are what a count or an average is computed from - the length of a
+    capped list stops being a count the moment it fills.
+
+    Attributes:
+        count: Outages restored (or ended by a shutdown) since start
+        by_reason: Count per detection kind
+        by_day: Count per UTC date, for the fourteen most recent dates on which
+            an outage occurred - not a calendar window: after a quiet stretch
+            the oldest key can be weeks back, and the keys say how far
+        gap_seconds_total: Sum of the data gaps
+        gap_seconds_max: The longest data gap
+        missing_trade_ids_total: Sum of the per-symbol counts the records came
+            to. A symbol whose first trade after an outage arrived only after
+            its record had closed, with no new outage before it, adds nothing,
+            and neither does what a failed attempt counted for a symbol whose
+            first trade had not come when the process stopped: those ids are
+            counted in no record
+    """
+    count: int = 0
+    by_reason: Dict[str, int] = field(default_factory=dict)
+    by_day: Dict[str, int] = field(default_factory=dict)
+    gap_seconds_total: float = 0.0
+    gap_seconds_max: float = 0.0
+    missing_trade_ids_total: int = 0
 
 
 @dataclass
@@ -179,6 +353,312 @@ class DiskSpaceStats:
             return "EMERGENCY"
 
 
+@dataclass
+class LoopLag:
+    """
+    How late the collector's event loop runs, measured rather than assumed.
+
+    Everything shares one loop, so a long piece of work anywhere delays the
+    stamping of every tick that arrives meanwhile - and that delay is invisible
+    in a tick file until it passes the consumer's 30 s window and costs the
+    whole file.
+
+    Attributes:
+        samples: How many measurements the numbers rest on
+        last_ms: The most recent lateness
+        max_ms: The worst since this process started
+        max_at: When that worst one happened
+        over_500ms: How often the loop was late by more than half a second
+    """
+    samples: int = 0
+    last_ms: float = 0.0
+    max_ms: float = 0.0
+    max_at: Optional[datetime] = None
+    over_500ms: int = 0
+
+
+@dataclass
+class ClockState:
+    """
+    What the session clock has had to absorb, for whoever draws the screen.
+
+    The display read these off the live `CollectionClock`, which only a program
+    inside this process can do. They are here so a viewer somewhere else shows
+    the same two numbers the file headers carry.
+
+    Attributes:
+        resyncs: Backwards steps the clock clamped, cumulative over the session
+        max_correction_ms: The largest single correction it absorbed
+    """
+    resyncs: int = 0
+    max_correction_ms: int = 0
+
+
+@dataclass
+class GcPauses:
+    """
+    What garbage collection costs this process.
+
+    The collector holds every tick of an open file in memory, and a generation-2
+    collection walks all of them - on the event loop, between two ticks, with
+    nothing in Python reporting it.
+
+    Attributes:
+        collections: How many collections per generation, index 0 to 2
+        max_ms: The longest pause per generation
+        last_ms: The most recent pause
+        last_generation: Which generation that was
+        total_ms: Everything spent collecting since this process started
+    """
+    collections: List[int] = field(default_factory=lambda: [0, 0, 0])
+    max_ms: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    last_ms: float = 0.0
+    last_generation: int = -1
+    total_ms: float = 0.0
+
+    # How many ticks were sitting in the open files when the worst pause
+    # happened. The collector holds every tick of an open file in memory AND in
+    # its write-ahead log, so a collection walks all of them - and whether the
+    # pause tracks that number is the question that decides between a smaller
+    # archive boundary and dropping the in-memory copy. One number, recorded at
+    # the moment it matters, answers it in a night.
+    live_ticks_at_max: int = 0
+
+
+@dataclass
+class TickWork:
+    """
+    How much of the loop's time the tick handler itself has consumed.
+
+    A running total rather than a rate, because the reader is the stall
+    attribution: it takes a snapshot before waiting and another after, and the
+    difference is what the handler cost inside that one window. A rate computed
+    here would have to guess the window somebody else is measuring.
+
+    Attributes:
+        ticks: Ticks handled since the session started
+        total_ms: Milliseconds spent inside the handler, cumulative
+    """
+    ticks: int = 0
+    total_ms: float = 0.0
+
+
+@dataclass
+class StallEvent:
+    """
+    One moment the event loop stood still, with what was going on.
+
+    A stall costs stamping accuracy: `collected_msc` reads that much later than
+    the tick arrived, and beyond the consumer's 30 s window a whole file is
+    refused. The cause is recorded beside it because the first attribution made
+    from reasoning alone was wrong - the folder scan was blamed and then
+    measured at 15 ms.
+
+    Attributes:
+        at: When the stall was observed
+        ms: How late the loop was
+        gc_ms: How much of it was garbage collection
+        gc_generation: The highest generation collected in that window, -1 for none
+        render_ms: How long the live display's last redraw took
+        exports_in_flight: Archive writers running at that moment
+        cause: What the numbers above account for, or "unknown"
+        blocked_in: Where the loop's stack was while it stood still, when the
+            sampler caught it - an observation rather than a timing, so it ranks
+            below every arm that measured a duration
+    """
+    at: datetime
+    ms: float
+    gc_ms: float
+    gc_generation: int
+    render_ms: float
+    exports_in_flight: int
+    cause: str
+
+    # Defaulted rather than required, and that is a decision rather than a
+    # convenience: a viewer runs against whatever build the box happens to
+    # carry, and a required field missing from an older payload would make the
+    # reading unreadable as a whole. A stall from before this existed reports
+    # zero work measured, which is true - nobody measured it.
+    tick_ms: float = 0.0
+    ticks: int = 0
+
+    # Work that runs in a thread but still contends for the interpreter lock, so
+    # it delays the loop without appearing anywhere in the loop's own timings.
+    # Measured 2026-09-23: nine stalls of 285-395 ms with no ticks in the window,
+    # no collection and no export - against a folder scan whose worst reading
+    # that day was 335 ms. A duration, not a presence, so it ranks with the rest
+    # of the measured arms.
+    offloop_ms: float = 0.0
+    offloop_what: str = ""
+
+    # Presence, not duration - a reconnect either happened inside this window or
+    # it did not. Measured 2026-09-22: the reconnect at 02:43:50 produced two
+    # stalls, 252 ms and 271 ms, and both said `unknown` because nothing
+    # connected the socket to the loop that noticed.
+    reconnected: bool = False
+
+    # Where the loop actually was, read off its own stack while it was stuck.
+    # Every arm above answers for one candidate that somebody thought to
+    # instrument; twenty stalls across two nights said `unknown` with all of
+    # them reading zero. This one has no candidate list.
+    blocked_in: str = ""
+
+
+@dataclass
+class ScanTimings:
+    """
+    How long the background scans take, and therefore what they would cost.
+
+    They run off the event loop, so these numbers no longer show up as stamping
+    lag — which is exactly why they are worth reporting: measured 2026-09-21,
+    while they still ran on the loop, they stalled it up to 4.3 s about once a
+    minute. If `loop_lag` ever rises with these, they are back on the loop.
+
+    Attributes:
+        folder_scan_last_ms: The most recent walk over the archive, MT5 and logs
+        folder_scan_max_ms: The worst one since this process started
+        disk_check_last_ms: The most recent disk-space reading
+        disk_check_max_ms: The worst one
+        render_last_ms: The live display's most recent redraw, which unlike the
+            two above does run on the event loop
+        render_max_ms: The worst redraw
+    """
+    folder_scan_last_ms: float = 0.0
+    folder_scan_max_ms: float = 0.0
+    disk_check_last_ms: float = 0.0
+    disk_check_max_ms: float = 0.0
+    render_last_ms: float = 0.0
+    render_max_ms: float = 0.0
+
+
+@dataclass
+class CounterCheck:
+    """
+    Whether the displayed tick count still matches what the writer wrote.
+
+    Two counters for one number drift, and this pair drifted by exactly one tick
+    at every UTC day cut until 2026-09-20 — for weeks, unnoticed, because
+    nothing compared them. What is reported here is the comparison, not the
+    repair: `mismatches` staying at zero is the evidence that the counts are
+    sound, and any other number is the signal to go looking.
+
+    Attributes:
+        checks: Comparisons made since this process started
+        mismatches: How many of them disagreed
+        last_mismatch_symbol: The symbol of the most recent disagreement
+        last_mismatch_counted: What the display had said
+        last_mismatch_written: What the writer held, and what was taken
+        last_mismatch_at: When that was
+    """
+    checks: int = 0
+    mismatches: int = 0
+    last_mismatch_symbol: Optional[str] = None
+    last_mismatch_counted: int = 0
+    last_mismatch_written: int = 0
+    last_mismatch_at: Optional[datetime] = None
+
+
+@dataclass
+class HeartbeatStats:
+    """
+    The heartbeat to the outside check, as this process saw it.
+
+    The check itself knows only that pings arrived. Why one did not - withheld
+    because the collector was unwell, or sent and lost - is known here alone.
+
+    Attributes:
+        enabled: Whether a check address is configured
+        interval_seconds: Seconds between beats
+        sent: Beats the check answered
+        withheld: Beats not sent because `/v1/health` was not `ok`
+        failed: Beats sent, or attempted, that did not reach the check
+        last_sent_at: When the check last answered
+        last_withheld_at: When a beat was last withheld
+        last_withheld_reasons: What `/v1/health` named then
+        last_failed_at: When a beat last failed
+        last_failure: What went wrong then, without the address
+    """
+    enabled: bool = False
+    interval_seconds: int = 0
+    sent: int = 0
+    withheld: int = 0
+    failed: int = 0
+    last_sent_at: Optional[datetime] = None
+    last_withheld_at: Optional[datetime] = None
+    last_withheld_reasons: str = ""
+    last_failed_at: Optional[datetime] = None
+    last_failure: str = ""
+
+    def record_sent(self) -> None:
+        """The check answered."""
+        self.sent += 1
+        self.last_sent_at = datetime.now(timezone.utc)
+
+    def record_withheld(self, reasons: str) -> None:
+        """
+        A beat was withheld.
+
+        Args:
+            reasons: What `/v1/health` named
+        """
+        self.withheld += 1
+        self.last_withheld_at = datetime.now(timezone.utc)
+        self.last_withheld_reasons = reasons
+
+    def record_failed(self, text: str) -> None:
+        """
+        A beat did not reach the check.
+
+        Args:
+            text: What went wrong, without the address
+        """
+        self.failed += 1
+        self.last_failed_at = datetime.now(timezone.utc)
+        self.last_failure = text
+
+
+@dataclass
+class ExportStats:
+    """
+    The archive writers that run as subprocesses.
+
+    Attributes:
+        started: Files handed over since this process started
+        finished: Files the writer reported as written
+        failed: Handovers that ended without a file; their logs stay on disk
+        in_flight: Handed over and not yet reported
+        last_file: The last file a writer finished
+        last_ticks: How many ticks it held
+        last_ms: How long that writer took, including process start
+        max_ms: The slowest one so far
+        last_failed_file: The last file that was not written - its log is still
+            on disk and the next start recovers it
+        last_failed_at: When that was
+        failed_in_a_row: Failures since a writer last finished a file; what
+            `/v1/health` reads, because `failed` only ever grows
+    """
+    started: int = 0
+    finished: int = 0
+    failed: int = 0
+    in_flight: int = 0
+    last_file: Optional[str] = None
+    last_ticks: int = 0
+    last_ms: float = 0.0
+    max_ms: float = 0.0
+    last_failed_file: Optional[str] = None
+    last_failed_at: Optional[datetime] = None
+    failed_in_a_row: int = 0
+
+    # Spawning a child is not free and it happens ON the loop - `communicate()`
+    # awaits, but `create_subprocess_exec` itself does not. At the UTC day cut
+    # nine or ten go out within the same second, and on 2026-09-23 that cut cost
+    # 3397 ms of loop lag against 856 ms the night before. Whether the cost is
+    # the spawning or the writing is a question a total cannot answer.
+    spawn_last_ms: float = 0.0
+    spawn_max_ms: float = 0.0
+    spawn_total_ms: float = 0.0
+
+
 class CollectorStats:
     """
     Aggregated statistics for the entire collector.
@@ -212,12 +692,69 @@ class CollectorStats:
         self.last_file: Optional[FileInfo] = None
         self.reconnect_events: List[ReconnectEvent] = []
         self.last_reconnect: Optional[ReconnectEvent] = None
+
+        # The outage whose feed is still down, until every subscription is
+        # answered again or the deadline gave up on the stragglers. On
+        # /v1/status this is the answer to 'is the feed down right now, and why'. A restored record still waiting for its first
+        # trade per symbol is already the newest entry in reconnect_events,
+        # with resolved_by '' until it is complete.
+        self.reconnect_in_progress: Optional[ReconnectEvent] = None
+        # None until the first outage, not a zero: a viewer reading a build
+        # that does not send totals must not show a count nobody measured.
+        self.reconnect_totals: Optional[ReconnectTotals] = None
+        # When each outage of the last OUTAGE_TIMES_KEPT began, uncapped: an
+        # hour's or a week's count read off the twenty-record ring stops at
+        # twenty. Private, so /v1/status does not serialise it; the event loop
+        # is its only reader and writer.
+        self._outage_times: List[datetime] = []
         self.disk_space: DiskSpaceStats = DiskSpaceStats()
         self.folders: Dict[str, FolderStats] = {}
+        self.loop_lag: LoopLag = LoopLag()
+        self.exports: ExportStats = ExportStats()
+        self.heartbeat: HeartbeatStats = HeartbeatStats()
+        # The longest collection since the memory trail last asked. Private: the
+        # trail's window is its own, and /v1/status already carries the maxima.
+        self._gc_window_max_ms: float = 0.0
+        # Symbols whose latest tick the handler failed on. A set per symbol rather
+        # than one flag: a symbol failing every tick must not be reset by the eight
+        # that work. Private because a name on it describes what is traded, and
+        # because the open health route reads only whether it is empty.
+        self._failing_tick_symbols: Set[str] = set()
+        self.counter_check: CounterCheck = CounterCheck()
+        self.scans: ScanTimings = ScanTimings()
+        self.gc: GcPauses = GcPauses()
+        self.tick_work: TickWork = TickWork()
+        self.stalls: List[StallEvent] = []
+
+        # The session's largest, kept apart from the latest. A ring of the most
+        # recent alone discards the biggest first, which is backwards: the rare
+        # stall is the one worth reading and the routine one is what evicts it.
+        self.worst_stalls: List[StallEvent] = []
+
+        # What a screen needs and the statistics did not carry: which streams
+        # are subscribed, what the clock has absorbed, and how many decimals a
+        # price is worth printing to. A display inside this process could read
+        # all three from live objects; one in another process cannot, and a
+        # second source for the same fact is how two screens start disagreeing.
+        self.streams: List[str] = []
+        self.clock: ClockState = ClockState()
+
+        # The file boundary this instance was configured with. A screen shows a
+        # file's progress against it, and the display used to read it out of the
+        # local app_config on every frame - which on the collector is a file read
+        # per symbol per second, and in a viewer is the wrong machine's config
+        # entirely: a laptop set to 1,000 rendered a production file of 12,737
+        # ticks as "1274 %" of a limit that instance does not have.
+        self.max_ticks_per_file: int = 0
 
         # Config
+        self.max_stalls: int = 10
+        self.max_worst_stalls: int = 10
         self.max_recent_logs: int = 50
-        self.max_reconnect_history: int = 100
+        # Twenty detailed records, with the totals carrying everything older:
+        # one record with nine symbols is about 3 KB, and the payload is
+        # serialised every second while a viewer is open.
+        self.max_reconnect_history: int = 20
 
     def get_symbol_stats(self, symbol: str) -> SymbolStats:
         """
@@ -278,67 +815,100 @@ class CollectorStats:
             created_at=datetime.now(timezone.utc)
         )
 
-    def record_reconnect(self, reason: str, duration_seconds: float = 0.0) -> None:
+    def record_outage(self, stage: str, event: ReconnectEvent) -> None:
         """
-        Record a reconnect event.
+        Follow one outage through its three stages.
+
+        The record is the same object in every stage and on every list it is
+        on, so what arrives later - the first trade per symbol - shows up on the
+        status route without being copied anywhere.
 
         Args:
-            reason: Disconnect reason
-            duration_seconds: Downtime duration
+            stage: 'opened' when the drop is detected, 'restored' when every
+                subscription is answered again, 'resolved' when nothing more
+                will be added (all symbols traded, a deadline, the next drop,
+                or a shutdown)
+            event: The record
         """
-        now = datetime.now(timezone.utc)
-        disconnect_time = datetime.fromtimestamp(
-            now.timestamp() - duration_seconds,
-            tz=timezone.utc
-        )
+        if stage == "opened":
+            self.reconnect_in_progress = event
+            return
 
-        event = ReconnectEvent(
-            timestamp=disconnect_time,
-            reconnected_at=now,
-            duration_seconds=duration_seconds,
-            reason=reason
-        )
+        if stage == "restored":
+            self._settle_outage(event)
+            return
+
+        if stage == "resolved":
+            # A record a shutdown resolved was never restored; it is still an
+            # outage the process saw, so it is counted once, here.
+            never_restored = (event.reconnected_at is None
+                              and self.reconnect_in_progress is event)
+            if never_restored:
+                self._settle_outage(event)
+            if self.reconnect_totals is None:
+                self.reconnect_totals = ReconnectTotals()
+            self.reconnect_totals.missing_trade_ids_total += sum(
+                gap.missing_trade_ids for gap in event.symbols.values()
+                if gap.missing_trade_ids is not None)
+
+    def _settle_outage(self, event: ReconnectEvent) -> None:
+        """
+        Move an outage from 'in progress' into the history and the totals.
+
+        Args:
+            event: The record, restored or ended by a shutdown
+        """
+        if self.reconnect_in_progress is event:
+            self.reconnect_in_progress = None
 
         self.reconnect_events.append(event)
         self.last_reconnect = event
+        history = self.max_reconnect_history
+        if len(self.reconnect_events) > history:
+            self.reconnect_events = self.reconnect_events[-history:]
 
-        # Trim history
-        if len(self.reconnect_events) > self.max_reconnect_history:
-            self.reconnect_events = self.reconnect_events[-self.max_reconnect_history:]
+        times = self._outage_times + [event.timestamp]
+        newest = max(times)
+        self._outage_times = [at for at in times
+                              if at >= newest - OUTAGE_TIMES_KEPT]
 
-        # Log for debugging
-        from python.utils.logging_setup import get_logger
-        logger = get_logger("FiniexDataCollector.stats")
-        logger.debug(
-            f"[STATS] Reconnect recorded: reason={reason}, "
-            f"duration={duration_seconds:.1f}s, "
-            f"disconnect_time={disconnect_time}, "
-            f"reconnected_at={now}, "
-            f"total_events={len(self.reconnect_events)}"
-        )
+        if self.reconnect_totals is None:
+            self.reconnect_totals = ReconnectTotals()
+        totals = self.reconnect_totals
+        totals.count += 1
 
-    def get_reconnects_this_week(self) -> List[ReconnectEvent]:
+        # Rebound, never mutated: /v1/status serialises in a worker thread while
+        # this runs on the event loop, and a dict gaining a key mid-iteration
+        # raises 'dictionary changed size during iteration' - a sporadic 500.
+        reason_count = totals.by_reason.get(event.reason, 0) + 1
+        totals.by_reason = {**totals.by_reason, event.reason: reason_count}
+
+        day = event.timestamp.astimezone(timezone.utc).date().isoformat()
+        by_day = {**totals.by_day, day: totals.by_day.get(day, 0) + 1}
+        kept = sorted(by_day)[-RECONNECT_DAYS_KEPT:]
+        totals.by_day = {key: by_day[key] for key in kept}
+
+        if event.duration_seconds is not None:
+            totals.gap_seconds_total += event.duration_seconds
+            totals.gap_seconds_max = max(totals.gap_seconds_max,
+                                         event.duration_seconds)
+
+    def outages_since(self, cutoff: datetime) -> int:
         """
-        Get reconnect events from last 7 days.
+        How many outages began at or after a moment, counted without a cap.
+
+        Not off the ring, which holds the latest twenty: a cluster threshold
+        above twenty could never fire, and a busy week read twenty. Not off
+        by_day either, whose whole dates made a weekly count and the weekly
+        list disagree about the part of a day seven days back.
+
+        Args:
+            cutoff: The earliest moment counted; at most OUTAGE_TIMES_KEPT back
 
         Returns:
-            List of recent reconnect events
+            Outages whose last message before the drop came at or after cutoff
         """
-        now = datetime.now(timezone.utc)
-        week_ago = datetime.fromtimestamp(
-            now.timestamp() - (7 * 24 * 3600),
-            tz=timezone.utc
-        )
-
-        return [
-            event for event in self.reconnect_events
-            if event.timestamp >= week_ago
-        ]
-
-    def reset_weekly_reconnects(self) -> None:
-        """Reset reconnect history (called after weekly report)."""
-        self.reconnect_events = []
-        self.last_reconnect = None
+        return sum(1 for at in self._outage_times if at >= cutoff)
 
     def record_error(self, message: str) -> None:
         """
@@ -359,6 +929,315 @@ class CollectorStats:
         """
         self.total_warnings += 1
         self._add_log_entry("WARNING", message)
+
+    def record_loop_lag(self, lateness_ms: float) -> None:
+        """
+        Record one measurement of how late the event loop ran.
+
+        Args:
+            lateness_ms: Milliseconds the wake-up came after it was due
+        """
+        lateness_ms = max(0.0, lateness_ms)
+        self.loop_lag.samples += 1
+        self.loop_lag.last_ms = round(lateness_ms, 1)
+
+        if lateness_ms > 500:
+            self.loop_lag.over_500ms += 1
+
+        if lateness_ms > self.loop_lag.max_ms:
+            self.loop_lag.max_ms = round(lateness_ms, 1)
+            self.loop_lag.max_at = datetime.now(timezone.utc)
+
+    def record_clock(self, resyncs: int, max_correction_ms: int) -> None:
+        """
+        Copy the session clock's counters into the payload.
+
+        Args:
+            resyncs: Backwards steps the clock has clamped
+            max_correction_ms: The largest correction it absorbed
+        """
+        self.clock.resyncs = resyncs
+        self.clock.max_correction_ms = max_correction_ms
+
+    def record_gc_pause(self, generation: int, duration_ms: float) -> None:
+        """
+        Record one garbage collection, as the interpreter reported it.
+
+        Args:
+            generation: Which generation was collected, 0 to 2
+            duration_ms: How long the pause lasted
+        """
+        self.gc.last_ms = round(duration_ms, 1)
+        self.gc.last_generation = generation
+        self.gc.total_ms = round(self.gc.total_ms + duration_ms, 1)
+        self._gc_window_max_ms = max(self._gc_window_max_ms, duration_ms)
+
+        if 0 <= generation < len(self.gc.collections):
+            self.gc.collections[generation] += 1
+            if duration_ms > self.gc.max_ms[generation]:
+                self.gc.max_ms[generation] = round(duration_ms, 1)
+                # Only on a new worst: the question is whether the pause tracks
+                # the buffer, and one paired reading answers that where a total
+                # cannot. Nine entries to add up, a few hundred times a day.
+                self.gc.live_ticks_at_max = sum(
+                    entry.current_file_ticks for entry in self.symbols.values())
+
+    def take_gc_window_max(self) -> float:
+        """
+        The longest collection since the last call, and start a new window.
+
+        Returns:
+            Milliseconds, 0.0 when nothing was collected
+        """
+        longest, self._gc_window_max_ms = self._gc_window_max_ms, 0.0
+        return round(longest, 1)
+
+    def record_render(self, duration_ms: float) -> None:
+        """
+        Record how long the live display took to draw one frame.
+
+        Args:
+            duration_ms: Milliseconds spent rendering, on the event loop
+        """
+        self.scans.render_last_ms = round(duration_ms, 1)
+        self.scans.render_max_ms = max(
+            self.scans.render_max_ms, round(duration_ms, 1))
+
+    def record_tick_work(self, duration_ms: float) -> None:
+        """
+        Add what handling one tick cost.
+
+        Called for every tick, so it does two additions and nothing else. Any
+        derived figure is computed by whoever reads it over a window they chose.
+
+        Args:
+            duration_ms: Milliseconds spent inside the tick handler
+        """
+        self.tick_work.ticks += 1
+        self.tick_work.total_ms += duration_ms
+
+    def record_stall(self, duration_ms: float, gc_ms: float,
+                     gc_generation: int, render_ms: float,
+                     exports_in_flight: int, tick_ms: float = 0.0,
+                     ticks: int = 0, reconnected: bool = False,
+                     offloop_ms: float = 0.0, offloop_what: str = "",
+                     blocked_in: str = "") -> None:
+        """
+        Record a moment the event loop stood still, with what explains it.
+
+        The cause is derived from what was measured in the same window, and says
+        "unknown" when nothing accounts for at least half of it. An attribution
+        made from reasoning rather than measurement was wrong once already.
+
+        Args:
+            duration_ms: How late the loop was
+            gc_ms: Garbage collection time inside that window
+            gc_generation: Highest generation collected, -1 for none
+            render_ms: The display's most recent redraw
+            exports_in_flight: Archive writers running at that moment
+            tick_ms: Time the tick handler spent inside this window
+            ticks: Ticks it handled in that time
+            reconnected: Whether the socket was re-established inside it
+            offloop_ms: Longest timed off-loop task that finished in the window
+            offloop_what: Which one that was
+            blocked_in: The loop's own stack, sampled while it was stuck
+        """
+        half = duration_ms / 2
+
+        # Measured arms first, in order of how specific they are. They overlap
+        # on purpose: a collection triggered by an allocation inside the tick
+        # handler counts in both, and naming garbage collection is the more
+        # useful answer of the two. `exports_in_flight` comes last because it is
+        # a presence check rather than a duration - the weakest evidence here,
+        # and it must never outrank something that was actually timed.
+        if gc_ms >= half:
+            cause = f"garbage collection, generation {gc_generation}"
+        elif render_ms >= half:
+            cause = "the live display"
+        elif tick_ms >= half:
+            cause = f"handling {ticks} ticks"
+        elif offloop_ms >= half:
+            cause = f"the {offloop_what}"
+        elif blocked_in:
+            # Observed rather than timed: one sample says where the loop was at
+            # one moment inside the stall, which cannot be weighed against half
+            # of it. It outranks the two presence checks below because it is a
+            # reading of the loop itself rather than of something that happened
+            # to be nearby.
+            cause = f"the loop was in {blocked_in}"
+        elif exports_in_flight:
+            cause = "an archive export was handed over"
+        elif reconnected:
+            cause = "the websocket reconnected"
+        else:
+            cause = "unknown"
+
+        event = StallEvent(
+            at=datetime.now(timezone.utc),
+            ms=round(duration_ms, 1),
+            gc_ms=round(gc_ms, 1),
+            gc_generation=gc_generation,
+            render_ms=round(render_ms, 1),
+            exports_in_flight=exports_in_flight,
+            cause=cause,
+            tick_ms=round(tick_ms, 1),
+            ticks=ticks,
+            reconnected=reconnected,
+            offloop_ms=round(offloop_ms, 1),
+            offloop_what=offloop_what,
+            blocked_in=blocked_in)
+
+        self.stalls.append(event)
+        if len(self.stalls) > self.max_stalls:
+            self.stalls = self.stalls[-self.max_stalls:]
+
+        # The recent list alone loses the interesting one first. Measured
+        # 2026-09-24: the UTC day cut closed nine files at 00:00 and its stall
+        # was gone by 03:45, pushed out by ten routine 300 ms stalls - the one
+        # event of the night anybody wanted to read, overwritten by the ones
+        # nobody did. A session keeps its largest as well as its latest, and a
+        # stall is normally in both.
+        self.worst_stalls.append(event)
+        self.worst_stalls.sort(key=lambda stall: stall.ms, reverse=True)
+        if len(self.worst_stalls) > self.max_worst_stalls:
+            self.worst_stalls = self.worst_stalls[:self.max_worst_stalls]
+
+    def record_folder_scan(self, duration_ms: float) -> None:
+        """
+        Record how long the folder scan took.
+
+        Args:
+            duration_ms: Milliseconds spent counting and measuring folders
+        """
+        self.scans.folder_scan_last_ms = round(duration_ms, 1)
+        self.scans.folder_scan_max_ms = max(
+            self.scans.folder_scan_max_ms, round(duration_ms, 1))
+
+    def record_disk_check(self, duration_ms: float) -> None:
+        """
+        Record how long reading the disk usage took.
+
+        Args:
+            duration_ms: Milliseconds spent on the reading
+        """
+        self.scans.disk_check_last_ms = round(duration_ms, 1)
+        self.scans.disk_check_max_ms = max(
+            self.scans.disk_check_max_ms, round(duration_ms, 1))
+
+    def record_counter_check(self, symbol: str, counted: int,
+                             written: int) -> None:
+        """
+        Record one comparison of the displayed count against the written one.
+
+        Args:
+            symbol: The symbol compared
+            counted: What the display and the status API had
+            written: What the writer holds, which is what the file says
+        """
+        self.counter_check.checks += 1
+
+        if counted == written:
+            return
+
+        self.counter_check.mismatches += 1
+        self.counter_check.last_mismatch_symbol = symbol
+        self.counter_check.last_mismatch_counted = counted
+        self.counter_check.last_mismatch_written = written
+        self.counter_check.last_mismatch_at = datetime.now(timezone.utc)
+
+    def record_export_started(self) -> None:
+        """A closed file was handed to an archive writer."""
+        self.exports.started += 1
+        self.exports.in_flight += 1
+
+    def record_export_spawn(self, duration_ms: float) -> None:
+        """
+        Record what starting one archive writer cost the event loop.
+
+        Args:
+            duration_ms: Milliseconds spent inside `create_subprocess_exec`
+        """
+        self.exports.spawn_last_ms = round(duration_ms, 1)
+        self.exports.spawn_max_ms = round(
+            max(self.exports.spawn_max_ms, duration_ms), 1)
+        self.exports.spawn_total_ms = round(
+            self.exports.spawn_total_ms + duration_ms, 1)
+
+    def record_export_finished(self, filename: str, ticks: int,
+                               duration_ms: float) -> None:
+        """
+        An archive writer reported a finished file.
+
+        Args:
+            filename: The archive file it wrote
+            ticks: How many ticks it held
+            duration_ms: How long it took, process start included
+        """
+        self.exports.finished += 1
+        self.exports.in_flight = max(0, self.exports.in_flight - 1)
+        self.exports.last_file = filename
+        self.exports.last_ticks = ticks
+        self.exports.last_ms = round(duration_ms, 1)
+        self.exports.max_ms = max(self.exports.max_ms, round(duration_ms, 1))
+        self.exports.failed_in_a_row = 0
+
+    def record_tick_failed(self, symbol: str) -> None:
+        """
+        The tick handler raised on a tick of this symbol.
+
+        Args:
+            symbol: The tick's symbol
+        """
+        self._failing_tick_symbols.add(symbol)
+
+    def record_tick_handled(self, symbol: str) -> None:
+        """
+        The tick handler finished a tick of this symbol. Called per tick, so it
+        does nothing at all in the normal case of an empty set.
+
+        Args:
+            symbol: The tick's symbol
+        """
+        if self._failing_tick_symbols:
+            self._failing_tick_symbols.discard(symbol)
+
+    @property
+    def tick_handler_failing(self) -> bool:
+        """True while the latest tick of any symbol failed in the handler."""
+        return bool(self._failing_tick_symbols)
+
+    def record_export_failed(self, filename: str) -> None:
+        """
+        An archive writer produced no file; its log is still on disk.
+
+        Args:
+            filename: The archive file that is still owed
+        """
+        self.exports.failed += 1
+        self.exports.failed_in_a_row += 1
+        self.exports.in_flight = max(0, self.exports.in_flight - 1)
+        self.exports.last_failed_file = filename
+        self.exports.last_failed_at = datetime.now(timezone.utc)
+
+    def record_logged(self, level: LogLevel, logger_name: str,
+                      message: str) -> None:
+        """
+        Count one logged line at WARNING or above - the log listener.
+
+        Registered with add_log_listener, so the counters follow the log
+        instead of depending on each error path remembering to report itself.
+
+        Args:
+            level: Level of the line; ERROR and CRITICAL count as errors
+            logger_name: The logger that wrote it - part of the listener
+                signature, not stored, because the entry shape is shared with
+                the display and the status API
+            message: The logged text
+        """
+        if level >= ERROR:
+            self.record_error(message)
+        else:
+            self.record_warning(message)
 
     def _add_log_entry(self, level: str, message: str) -> None:
         """Add log entry, maintaining max size."""

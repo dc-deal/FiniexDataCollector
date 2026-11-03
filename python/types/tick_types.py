@@ -221,25 +221,3 @@ class TickFileContent:
         "details": []
     })
     summary: Optional[TickFileSummary] = None
-
-
-@dataclass
-class KrakenTickerMessage:
-    """
-    Parsed Kraken WebSocket ticker message.
-
-    Intermediate format before conversion to TickData.
-    """
-    symbol: str           # "BTC/USD"
-    bid: float
-    bid_qty: float
-    ask: float
-    ask_qty: float
-    last: float
-    volume: float         # 24h volume
-    vwap: float
-    low: float            # 24h low
-    high: float           # 24h high
-    change: float
-    change_pct: float
-    received_at_msc: int  # Local receive timestamp in milliseconds

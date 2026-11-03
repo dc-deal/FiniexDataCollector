@@ -33,7 +33,7 @@
     ],
     "reconnect_max_delay_seconds": 60,
     "reconnect_initial_delay_seconds": 1,
-    "heartbeat_interval_seconds": 10,
+    "stale_after_seconds": 10,
     "max_ticks_per_file": 50000
   },
   "mt5": {
@@ -56,7 +56,11 @@
   "monitoring": {
     "disk_space_check_interval_seconds": 60,
     "folder_scan_interval_seconds": 60,
-    "reconnect_alert_cooldown_minutes": 30
+    "reconnect_alert_cooldown_minutes": 30,
+    "reconnect_alert_min_seconds": 30.0,
+    "reconnect_alert_cluster": 4,
+    "heartbeat_url": "",
+    "heartbeat_interval_seconds": 60
   },
   "api": {
     "enabled": false,

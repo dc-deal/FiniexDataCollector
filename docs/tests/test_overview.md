@@ -24,6 +24,19 @@ importer enforces, so they keep meaning after a refactor.
 
 ## The suites
 
+### `tests/alerts/test_heartbeat.py`
+
+An outside check alarms when pings stop, so the one dangerous failure is a ping that should not have
+gone out: it tells the phone a sick collector is fine.
+
+Defends: nothing is sent unless `/v1/health` says `ok`, and that is the route's own answer rather than
+a second judgement; a provider that raises sends nothing; a check answering 404 is not a beat, because
+a deleted check means nothing is watching; a failure never escapes into collection; the address stays
+out of every log line and off `/v1/status`, including when aiohttp puts it into an error; only a change
+of state is logged; the first beat waits one interval, because the feed is not connected at startup;
+and a fresh checkout pings nothing. One test goes over a real loopback socket, because the fakes only
+know how aiohttp is called as well as their author does.
+
 ### `tests/collectors/test_message_parser.py`
 
 Every local timestamp enters the data here, and a trade meets the quote it executed against
@@ -37,6 +50,101 @@ reverses arrival times; a one-tick spread is never reported as zero.
 
 That last one came from live data, not review: `int(spread_raw / tick_size)` truncated
 `0.00999999999999801` to 0, and 59 % of LTCUSD ticks claimed no spread.
+
+And since 2026-10-08: the decoded path the receive loop uses produces exactly the ticks the text
+path does. Every message used to go through `json.loads` twice - once to ask whether it was a
+heartbeat - on the loop that stamps the ticks.
+
+### `tests/collectors/test_stale_detection.py`
+
+A dropped connection costs the trades made while the dead socket is still believed alive, and on
+2026-09-18 that was 537 trades in four drops, 30–40 s of each spent noticing. Silence is now
+judged every second, because Kraken sends a heartbeat every second.
+
+Defends: a silent feed is reopened on the first check past the threshold; a feed that sends its
+heartbeat is left alone; and — the half that matters more — a blocked event loop is not mistaken
+for a dead feed. The midnight cut blocks the loop for 17.85 s while the socket holds unread
+messages, so a short threshold without that exemption would force a reconnect at every day cut.
+A feed that really died during a block is still reopened on the next check. The time source and
+the sleep are driven by hand; waiting for a real outage is not a test strategy.
+
+Since 2026-10-08 the watchdog reports the end it found and closes nothing - a connection is torn
+down in one place, whichever detector saw the end first - so these tests read the detection it
+returns. The other two detectors are in `test_drop_detection.py`. One test here drives the
+teardown instead: a close frame without a code that arrived before a detector without the frame
+fired is named from the frame - with no code, never the library's 1005.
+
+### `tests/collectors/test_drop_detection.py`
+
+The other ways a connection ends, run against a REAL socket. Measured on production over 19 days
+to 2026-10-08: 137 forced reconnects, and in 136 the socket was already closing when the 10 s
+watchdog found it - the receive loop's end was handed back by `gather(..., return_exceptions=True)`
+and ignored, and a close frame on a connection left open does not end `recv()` until the next
+keepalive ping, 20 s later. Each drop cost about 12 s of trades, about 10 of them spent not
+knowing.
+
+**Why a real socket, against this project's rule of driven time:** the defect lived in the
+library's semantics - which ending raises what, when `recv()` returns, that only one coroutine may
+call `recv()` - and a fake reproduces those only as well as its author's assumptions; the review of
+this change found such an assumption. `far_side.py` is a Kraken-like endpoint written frame by
+frame on a raw TCP server, so it can produce endings no websocket library would: a close frame
+without a TCP close, a FIN without a frame, a reset, a peer that stops answering pings. Every
+library-dependent case runs against both client implementations of websockets, because they differ
+exactly here and `websockets>=12.0` allows either; the check interval is shortened so the file runs
+in seconds.
+
+Defends: a reset, a FIN and a clean close are noticed at once and named with the frame's code or
+none; a close frame on an open connection is a far-side close within a second, not the watchdog's
+silence; a close frame without a code records no code rather than the library's 1005, whether
+the TCP connection closes behind it or stays open; a silent link is still the watchdog's, and
+dropped rather than closed for its timeout; the missing trade ids in the record equal exactly what
+the far side produced and never sent; Kraken's status message is read rather than discarded; a
+refusal - which names no channel, so only its `req_id` ties it to a stream - is matched and named,
+and a stream with a refused pair and a silent one has answered at the deadline - the silent pair
+is listed - rather than being reconnected as dead; a pair that answers slowly but delivers is
+confirmed by its data, one silent pair is listed rather than costing the connection, and a stream
+that produced nothing at all is reconnected; a drop during resubscription is one outage with two attempts; a far side that keeps
+closing is backed off (0.02, 0.04, 0.08, 0.16 s - never 1, 1, 1, which Kraken would ban), and a
+connection stable for 10 s - not 60, which held a degraded Kraken at the maximum delay - starts
+the backoff over; nothing but a stop ends collection, not even a failure in the teardown; a
+message that cannot be handled costs that message, not the connection; a stop during the backoff
+hands the open outage over itself, because start() is not awaited at shutdown; a stop while a
+send waits on a closing connection opens no new record; and a handshake that opens or fails after
+a stop leaves neither a socket nor a 'failed' status nor an ERROR line behind. Every wait in these
+tests has a deadline - the polling loops, every stop and every awaited task - so a regression
+fails instead of holding CI until its six-hour limit.
+
+### `tests/collectors/test_outage_tracker.py`
+
+The record each interruption leaves, driven with plain numbers: the tracker holds no socket and no
+event loop. Until 2026-10-08 a reconnect was recorded from the moment it was noticed to the socket
+handshake by subtracting two wall-clock readings, with a constant reason and no word on what was
+missed.
+
+Defends: a close is classified by the frames exchanged and never by the exception class (Kraken's
+close arrives as either), with a code only when a frame carried one - never the 1005 the library
+reports for a frame without a code - and no 'NoneType: None' cause; the gap runs from the last
+message on the monotonic clock, untouched by a wall-clock step; missing trade ids are
+first - last - 1 per symbol with the ids from before the drop, from the highest id seen rather than
+the last received, unknown rather than zero when an id is missing, and flagged rather than counted
+when they do not increase; trades an attempt delivered before it failed do not end the count - the
+ids between the highest of them and the restoring connection are counted too, the first trade is
+the restored feed's, a replay on such an attempt leaves the count unknown and flagged, and the
+next outage counts from its own last trade; a stop during an attempt that never restored names no
+first trade; a quiet symbol is closed by the 15-minute deadline, and a symbol whose first trade was
+still unknown when its record closed - by the next drop, the deadline or a refusal - is flagged in
+the next one, whose gap keeps what a failed attempt of the first had counted, while a symbol that
+traded in between is not flagged; a stop resolves whatever is open, once; a connection that ends
+before restoration is the same outage; a process that never got going records none; data confirms
+a pair, stragglers are listed not waited for, a stream with nothing at all is dead; a refused pair
+and a ticker-only feed hold nothing open - and a ticker-only feed carries nothing into the next
+record - a refusal after the deadline is still recorded as one and only once, but only for a pair
+the deadline listed that has neither delivered data nor been acknowledged since, and a refusal
+for an acknowledged pair changes nothing; a replay's flag travels with the unknown count it
+explains; a spanning gap is counted from before both drops; a stream refused outright was confirmed at no time; the
+confirmation line counts a refused pair as refused, not as confirmed, and gives the last
+confirmation's time; and a failing owner never stops the record, with or without the project's
+logging set up.
 
 ### `tests/writers/test_json_tick_writer.py`
 
@@ -126,8 +234,12 @@ in the README status line. Two are machine-readable and guarded here; the README
 a regex because nothing else keeps it in step.
 
 Also: the tracked config carries no live credentials; the reconnect rule recognises a
-connection coming back (it reported zero for 173 of them); the staleness detection window
-stays under a minute; file logging is not DEBUG by default.
+connection coming back (it reported zero for 173 of them); the dead-connection threshold stays
+short; file logging is not DEBUG by default.
+
+Also the example files a new machine is set up from. Found 2026-09-23 while adding a token on the production box: `app_config.example.json` was tracked **with a leading space in its name** and **truncated mid-file**, so `cp user_configs/app_config.example.json ...` reported a missing file and copying it by hand produced a configuration the collector refuses. It also carried no `api.tokens` section - the one part of the configuration a reader cannot guess, and the part that was needed that day.
+
+Defends: every tracked example parses; no file in `user_configs/` is named with stray whitespace; and the example demonstrates a consumer holding `status:detail` **alone**, because an example whose only consumer holds every grant teaches the opposite of one token per consumer.
 
 ### `tests/utils/test_console_and_counting.py`
 
@@ -137,7 +249,8 @@ A Windows console in QuickEdit mode suspends the next write while text is select
 display writes from the collector's only event loop — so one stray click stops the WebSocket
 reader and the writers with it. No tick arrives, which is the one gap the write-ahead log cannot
 close: it opens before the safety net, and a gap in a tick series is the same bytes as a quiet
-market. FiniexRAGEngine measured 13.5 hours of it on the same host.
+market. FiniexRAGEngine measured 13 h 33 min of it on the same host, in a watcher rather than
+in a producer - their series was unaffected, and ours would not be.
 
 Defends: the console call never raises, anywhere, and returns `None` where there is no console;
 `ENABLE_EXTENDED_FLAGS` is set alongside the cleared QuickEdit bit, without which the console
@@ -147,6 +260,116 @@ files, not the open write-ahead logs it used to count as "files".
 The failing-console test exists because the mutation check found the hole: every other test
 returns before the Windows branch, so the `except` that keeps a console problem away from the
 collection was carrying no test at all.
+
+### `tests/writers/test_archive_export.py`
+
+Writing an archive file ran on the collector's only event loop: about 1 s per file plus 66 µs per
+tick, measured on production, and nine files at the UTC day cut meant 21 s in which nothing else
+ran. A closed file is handed to a subprocess instead — the ticks are already on disk in the
+write-ahead log, and the closing state goes in as its last line.
+
+Defends: the handed-over file is **byte for byte** the file the inline path would have written
+(with the clock frozen, because the metadata carries the moment a file was opened); the log
+outlives the window in which the archive is missing, so the ticks are never nowhere; an export
+that never happens is recovered as a *complete* file rather than a shortened one, because the
+closing record travelled with it; a log from a real crash still says it was recovered; an existing
+archive file is never overwritten; and the module actually runs as a program, started the way
+main.py starts it — the module path, the working directory and the exit code are what production
+depends on and none of them can fail in-process.
+
+One test exists because a mutation slipped through: the inline and the handed-over path share one
+builder now, so comparing them cannot see a change in the file format at all. That one holds the
+output against `json.dump`, the encoder every existing file was written with, with a non-ASCII
+value in it and the top-level key order named rather than derived.
+
+### `tests/utils/test_tick_counters.py`
+
+The tick handler in `main.py` had no test at all, which is why a counting error ran for weeks:
+every UTC day cut reported the closed file one tick too large and started the next one one tick
+too small, and the error was carried until the next cut cancelled it. Measured on production —
+"File rotated: … (47,369 ticks)" for a file holding 47,368, and "(49,999)" for one holding 50,000.
+
+Also the payload a screen elsewhere needs (issue #15): the clock's correction counters are copied
+when a tick is stamped, which is the moment they can change; a symbol carries its decimal places
+from the broker specification; and an unknown symbol carries `None` rather than an invented 2.
+
+Defends: the day cut reports what the file holds and carries the triggering tick into the new
+file, because the cut is checked *before* the tick is appended; a file that fills up reports the
+tick that filled it, because that threshold fires *after*; the two counters are compared while
+the collector runs, with the writer winning; and — the part a direct call would not have caught —
+the comparison is actually reached from the folder monitor, since a check nobody calls observes
+nothing.
+
+### `tests/utils/test_diagnostics.py`
+
+The two numbers a remote session reads when it cannot open a shell: how late the event loop has
+been running, and whether the files that were handed to an archive writer arrived.
+
+Defends: the worst stall is kept with the moment it happened; a wake-up that came early counts as
+no lag rather than as negative; an export in flight is what was handed over and not yet reported;
+a failure names the file that is still owed; and the gauge cannot go below zero.
+
+And the attribution chain, which exists because the first attribution was wrong: a collection is
+timed by the interpreter's own callback; only the collections inside a stall's window count
+towards it; a stall names the one thing that accounts for at least half of it and says `unknown`
+otherwise; the list stays short; and a **real** stall reaches the record — that test blocks the
+event loop on purpose, because driving the recorder by hand would leave untested the only thing
+that matters, namely that the monitor notices at all.
+
+Also, and this is the half that needed a thread to test: the folder scan and the disk reading run
+**off the event loop**. Both tests check which thread the work actually ran in, because the defect
+they guard against is invisible in behaviour — the numbers come out the same either way, and the
+only trace is arrival lag in the tick data.
+
+And the two additions of 2026-09-24: a sampled stack names the cause when nothing else accounts
+for the stall, a **timed** arm still outranks it (one sample says where the loop was, not for how
+long), a sample outranks a mere presence, and the session keeps its largest stalls as well as its
+latest — the day cut's stall was evicted by ten routine ones before anybody read it.
+
+### `tests/utils/test_stall_sampler.py`
+
+The arm with no candidate list. Every other attribution answers for one suspect somebody thought
+to instrument, and twenty stalls across two production nights reported `unknown` with all of them
+at zero. This one reads the event loop's own stack while the loop is stuck.
+
+It is also the instrument here that can fail invisibly: a sampler that never captures returns an
+empty string, and an empty string reads exactly like "the loop was fine". So the tests drive a
+real blocked thread rather than calling the formatter.
+
+Defends: a thread that stops checking in gets its stack read and the blocking function is named;
+a thread that keeps checking in is **never** sampled, because a cause that is always present is
+worth nothing while looking like an answer; a stack captured in an earlier stall is not offered to
+a later window; one stall is sampled once however long it lasts; and a sampler that was never
+started answers nothing rather than raising — a diagnostic that takes the collector down is
+worse than the stall it explains.
+
+### `tests/utils/test_error_counters.py`
+
+The error and warning counters were initialised and never raised — nothing called
+`record_error` or `record_warning`. The display said "No errors or warnings", `/v1/status` and the
+weekly report said 0 and 0, while the production log carried forced reconnects. They now follow
+the log through a listener.
+
+Defends: WARNING counts as a warning and ERROR/CRITICAL as errors while INFO counts as nothing; a
+failing listener never costs the log line itself; the collector actually wires its stats to the
+log — the shape the original defect had was a working counter nothing was connected to; the
+display renders a logged message as text, because that code had never run with an entry in it and
+Rich raises on a message holding a closing-tag shape like `[/red]`; and, since the counters count
+lines, the Kraken client writes one line per event: a subscription send refused because the
+connection ended is the drop's warning, not an extra error, a failed connection attempt is one
+ERROR line, not two, and a connection that ended is a warning while one the code ended itself - a
+detector that raised - is an error, also when Kraken's close frame names the end, and its line
+then keeps the fault.
+
+### `tests/utils/test_describe_exception.py`
+
+`TimeoutError`, `ConnectionResetError` and aiohttp's `ClientPayloadError` turn into an empty
+string, so a caught exception interpolated bare leaves a log line naming no cause. Production
+logged "Command polling error: " and nothing more during the 2026-09-19 midnight close.
+
+Defends: the helper names an exception without text and keeps the text of one that has it; and no
+source file writes a caught exception into text without it — a convention held by one helper only
+holds while nobody adds a site that skips it.
 
 ### `tests/utils/test_doc_links.py`
 
@@ -182,6 +405,21 @@ grant naming a surface that does not exist fails at parse time rather than silen
 nothing; and the producing identity is served on the gated route, in the shape a tick file
 carries it, while staying off both open routes.
 
+Also: an accept failure — after which CPython's proactor loop closes the listening socket on
+Windows — reaches the log file instead of stderr, through the handler a real loop calls, while
+every other loop event keeps asyncio's default handling. And the route carries `loop_lag` and
+`exports`, the two figures that make a blocked loop visible from off the machine.
+
+And `/v1/build` names the websocket library and the client implementation `websockets.connect`
+resolves to, sampled from the package metadata rather than written down, and absent rather than
+guessed when the metadata is missing: the two implementations end a connection differently, and
+how a drop is classified depends on which one runs.
+
+And `/v1/health` is derived rather than read off the socket: a lost write-ahead log and a failing tick
+handler read `failing`, a dropped feed, a failed export and a nearly full disk read `degraded`, each
+recovers by itself, one working symbol does not clear another's failure, and a quiet market is none of
+these. It went on saying `ok` over a full disk until 2026-10-31.
+
 ### `tests/api/test_diagnostic_routes.py`
 
 Config, archive inventory, log excerpt, and the file handover. The archive route has a named
@@ -189,17 +427,134 @@ origin: the consuming project asked which tick files spanned a host migration, w
 and the answer could not be given because nobody holding the question had access to the
 archive.
 
-Defends: no credential leaves through the config route, including a key that did not exist when
-the redaction was written; only finished files can be fetched, never an open write-ahead log;
+Defends: **no route runs on the event loop** — a route defined with `def` is served from a
+threadpool, `async def` is not, and one keyword would put a 22 MB file transfer, an archive walk
+or a day of log onto the loop that stamps every tick; no credential leaves through the config
+route, including a key that did not exist when the redaction was written; only finished files can
+be fetched, never an open write-ahead log;
 a path escaping the archive is refused even when its name passes the pattern; the served bytes
 match the register's checksum; no route is authenticated but ungated; and compression changes
 the size without changing what arrives.
 
+### `tests/api/test_outage_history.py`
+
+A consumer comparing a month of its own feed against ours needs every interruption in that
+month; `/v1/status` holds about two days.
+
+Defends: each outage appears once, at its furthest stage, even when the lines come out of order;
+the window is on the outage start; an outage resolved after midnight is found in the next day's
+file; a day without a file is named, never read as a day without outages; a torn line is counted
+and the rest kept; a long answer is cut and says where to continue; the default window is seven
+days; a reversed or too long window is a 400; a naive time is UTC; a finished day is read once and
+a grown file again; a credential in a record is masked; the route needs its own grant, which a
+status token does not hold.
+
+### `tests/utils/test_memory_trail.py`
+
+The memory trail exists for the slope, so every figure in a line has to be a delta over its own
+window. Defends: the first reading only opens a window; ticks, collections, collection time and
+loop lag are differences; the longest collection is per window, not since the start; a symbol new
+in the window counts from zero; the worst stall comes from inside the window only, and none is
+`null`; outages are `null` until the first; private memory is `null` where the platform does not
+report it, and a refusing process does not raise; `/v1/status` carries `private_mb`; one line is
+logged per interval and none at the start; and the writer's tick count survives a closed file.
+
+### `tests/viewer/test_stats_from_payload.py`
+
+The reverse of the status serializer: the payload turned back into the object the renderer
+reads. The pair is only worth having if both halves stay structural rather than enumerated, so
+the round-trip test compares the WHOLE object rather than a list of fields, and covers a member
+added to the statistics on the day it is added.
+
+Defends: everything the collector sends survives the journey - an outage record with its
+per-symbol trade ids and per-stream timeline included; every field whose type a freshly
+built object cannot state is registered, and a stale registration is removed; a reconnect record
+from a collector older than 2026-10-08 - four fields, no totals - still draws, with no count
+invented for the totals it never sent; a **newer**
+collector's unknown key is dropped rather than raised on, because the box and the laptop are
+routinely different builds; an **older** collector missing a required value is named by class
+instead of guessed at; a timestamp arriving without an offset is read as UTC and not as the
+viewer's local time; and something that is not a status payload at all never becomes a
+half-drawn screen.
+
+### `tests/viewer/test_status_feed.py`
+
+The polling loop and every way it can fail. The failure TEXT is asserted rather than a failure
+count, because the four common ones send the operator to four different machines.
+
+Defends: 401 and 403 stay distinguishable — one means the credential, the other means one line
+in a registry; a reason on screen is a sentence and not an exception class name; a build
+mismatch is named as one instead of reading as a broken collector; the timeout leaves room for a
+refused connection to report itself (measured 2.04 s on Windows, which a two-second timeout beat
+by forty milliseconds and mislabelled); the clock skew between the two machines is measured, and
+is `None` rather than `0.0` when nothing was compared; a failed reading never reaches the
+renderer and never clears the previous one; and a recovered feed stops showing why it was down.
+
+### `tests/viewer/test_viewer_screen.py`
+
+What a remote screen says about itself. A viewer draws numbers it did not measure, so the moment
+the collector goes quiet all of them describe the past while looking exactly as current as they
+did a second earlier.
+
+Defends: a silent collector turns the whole frame, not one line inside it, and carries the clock
+time and the age of the last reading; a viewer that has never read anything says so instead of
+inventing a time; the machine being drawn is named; a clock disagreement is shown; an unknown
+price precision prints the value as measured rather than rounding ADAUSD's 0.2103 / 0.2104 to a
+stated spread of zero; file progress is measured against the **collector's** configured limit
+and shows no denominator when none was reported — read from the local config it rendered a
+production file as 241 % of a boundary that instance does not have; and the viewer never writes
+its own render cost into statistics that describe the collector, while the in-process display
+still measures its own frames, which is the number that identified the 2026-09-21 stall.
+
+### `tests/viewer/test_endpoints.py`
+
+Which collector to watch, read out of the overlay. This file was a note to whoever was working
+here until the viewer became the first program to read it.
+
+Defends: an unknown name lists the ones that exist; a missing file says what to copy; an entry
+without a token names the entry; the refresh rate follows from where the collector is; and a
+parse error is reported **without the file's contents**, because the token sits three lines from
+whatever the error is.
+
+### `tests/utils/test_alert_policy.py`
+
+When a restored connection is worth interrupting somebody. Measured over the night of
+2026-09-21: seven reconnects, recorded at 1.3 to 7.2 s each - figures that ran from noticing the
+drop to the handshake and left out the 10-11 s before it was noticed. Even counted in full they
+were not among the longest gaps of their files, and six alerts arrived on a phone for them.
+
+Defends: a short self-healed reconnect stays in the log and off the phone; a gap past 30 s still
+reaches it, and carries its length (not because a file would be refused - an outage shortens a
+file - but because a drop now costs seconds, and thirty means reconnecting is failing); the threshold includes its own
+value; a cluster inside one hour is worth saying even when each was short, because a host that
+blips every two hours is weather and one that blips four times an hour is degrading; and the
+duration is never rendered as whole minutes — that turned a 7.22 s outage into "0m downtime", a
+field asserting less than the code knew, printed on a phone.
+
+### `tests/utils/test_reconnect_reporting.py`
+
+Where an outage record goes. Until 2026-10-08 the history lived in memory, capped at 100 and
+emptied after every weekly report and every Telegram `/report`; the log carried a sentence per
+drop and no record; and the alert judged the window from noticing a drop to the handshake.
+
+Defends: a record moves from in progress into the history and the totals, counted once - also one
+a shutdown ended before it was restored; the history is capped and the count is not; the daily
+count keeps fourteen dates and the uncapped outage times a week and a day; the totals'
+dictionaries are replaced rather than changed in place, because the status route serialises them
+in another thread; no totals means no count rather than a zero; each outage is written to the log
+as an `[OUTAGE]` line when restored and again when resolved, in exactly the shape `/v1/status`
+serves, and a value JSON cannot hold does not cost the line; the alert reads the data gap, and a
+cluster is counted whole rather than off the twenty-record ring - a threshold above twenty could
+never fire; and a weekly report leaves the history in place, renders seconds, counts and lists
+the same rolling seven days - whole UTC dates for the count left about 18 hours a week in no
+report - and from a process younger than a week says 'Since Start' rather than 'This Week',
+turning one hour either side of the week.
+
 ## What is not covered
 
-The **live display** has no tests beyond a render pass with populated values. Its formatters
-(`_format_quote_age`, `_format_last_tick`, `_digits_for`) are pure functions and would be cheap
-to pin.
+The **live display's** remaining formatters (`_format_quote_age`, `_format_last_tick`) are pure
+functions and would be cheap to pin. `_digits_for` and the file-progress line are covered by
+`tests/viewer/test_viewer_screen.py`, which renders real frames to text.
 
 The **Windows paths** cannot be exercised here: the dev container is Linux, the production
 machine is Windows Server. The signal handling, the console encoding and the start script are

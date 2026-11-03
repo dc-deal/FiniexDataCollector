@@ -40,7 +40,9 @@ REDACTED = "<redacted>"
 SECRET_MARKERS = ("token", "secret", "password", "passwd", "credential", "apikey")
 
 # Not a secret, but it identifies a person's chat and has no diagnostic use.
-ALSO_REDACT = ("chat_id",)
+# heartbeat_url carries no marker, and whoever holds it can report this collector
+# healthy to its outside check.
+ALSO_REDACT = ("chat_id", "heartbeat_url")
 
 
 def is_secret_key(key: str) -> bool:

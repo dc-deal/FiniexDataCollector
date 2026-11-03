@@ -167,3 +167,104 @@ def test_release_without_acquire_is_harmless(tmp_path: Path, live_foreign_proces
     InstanceLock(tmp_path).release()
 
     assert (tmp_path / LOCK_FILENAME).exists(), "released a foreign lock"
+
+
+# =============================================================================
+# WHEN THE REFUSAL HAPPENS, WHICH MATTERS UNDER A SERVICE MANAGER
+# =============================================================================
+
+def test_a_refused_start_announces_nothing_and_binds_nothing(
+    tmp_path: Path, live_foreign_process, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The lock is taken before anything with a side effect, not after.
+
+    It used to be claimed deep inside the collector setup - after Telegram, the
+    scheduler, the monitoring tasks and the API bind. A second instance therefore
+    sent "Collector Started" to the operator's phone, started a scheduler and
+    reached for the status port, and only then found out it was not allowed to
+    run. Under a service manager that restarts on exit that is one phone alert
+    per restart cycle, for as long as somebody has a console instance open.
+
+    Args:
+        tmp_path: pytest temp directory
+        live_foreign_process: A process that really is running
+        monkeypatch: pytest patching helper
+    """
+    import asyncio
+
+    import python.main as main_module
+    from python.utils.config_loader import ConfigLoader
+    from python.utils.logging_setup import remove_log_listener
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    pid, create_time = live_foreign_process
+    write_lock(raw_dir, pid, create_time)
+
+    announced = []
+
+    class LoudTelegram:
+        """Anything constructing this has already gone too far."""
+
+        def __init__(self, *args, **kwargs):
+            announced.append("telegram")
+
+    class LoudScheduler:
+        def __init__(self, *args, **kwargs):
+            announced.append("scheduler")
+
+        def set_report_callback(self, callback):
+            pass
+
+        def start(self):
+            announced.append("scheduler started")
+
+    monkeypatch.setattr(main_module, "TelegramAlertProvider", LoudTelegram)
+    monkeypatch.setattr(main_module, "WeeklyJobScheduler", LoudScheduler)
+
+    config = ConfigLoader().load()
+    config.paths.raw_data_dir = str(raw_dir)
+    config.telegram.enabled = True
+
+    collector = main_module.FiniexDataCollector(config, show_display=False)
+    try:
+        with pytest.raises(ConfigurationError):
+            asyncio.run(collector.start_collection())
+    finally:
+        remove_log_listener(collector._stats.record_logged)
+
+    assert not announced, (
+        f"a start that was refused still did this first: {announced}")
+
+
+def test_a_failure_a_restart_cannot_fix_gets_its_own_exit_code(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A service manager restarts on exit by default, and that is usually right.
+
+    It is wrong for exactly two failures: a malformed configuration and a
+    directory another live collector owns. Neither improves by being retried, so
+    both leave through a code the manager can be told to treat as final - while a
+    genuine crash keeps exit 1, where an automatic restart is the whole point of
+    running under a manager at all.
+
+    Args:
+        monkeypatch: pytest patching helper
+    """
+    import python.main as main_module
+
+    def refuse(*args, **kwargs):
+        raise ConfigurationError("another collector owns that directory")
+
+    monkeypatch.setattr(main_module, "cmd_collect", refuse)
+    monkeypatch.setattr(sys, "argv", ["main.py", "collect", "--no-display"])
+
+    with pytest.raises(SystemExit) as raised:
+        main_module.main()
+
+    assert raised.value.code == main_module.EXIT_CONFIGURATION
+    assert main_module.EXIT_CONFIGURATION == 2, (
+        "the service definition names this number; changing it silently "
+        "reinstates the restart loop it exists to prevent")

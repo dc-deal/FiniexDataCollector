@@ -11,18 +11,22 @@ Location: python/main.py
 
 import argparse
 import asyncio
+import json
 import signal
 import sys
 import os
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import psutil
 
 from python.api.api_app import create_api
 from python.api.build_info import sample_build_info
-from python.api.stats_serializer import health_payload, serialize_stats
+from python.alerts.heartbeat import Heartbeat
+from python.utils.memory_trail import MemoryTrail
+from python.api.stats_serializer import health_payload, plain, serialize_stats
 from python.api.token_loader import load_token_registry
 from python.collectors.kraken.quote_cache import QuoteCache
 from python.utils.collection_clock import CollectionClock
@@ -33,10 +37,16 @@ from python.utils.instance_identity import (
 )
 from python.utils.instance_lock import InstanceLock
 from python.utils.config_loader import ConfigLoader, AppConfig
-from python.utils.logging_setup import setup_logging, get_logger
-from python.utils.console_mode import disable_quick_edit
+from python.utils.logging_setup import (add_log_listener, describe_exception,
+                                        get_logger, setup_logging)
+from python.utils.console_mode import (disable_quick_edit, enable_ansi_colours,
+                                       enable_ctrl_c_handling)
+from python.viewer.endpoints import EndpointError, default_interval, load_endpoint
+from python.viewer.watch import run_viewer
+from python.utils.gc_watcher import GcWatcher
+from python.utils.stall_sampler import StallSampler
 from python.utils.live_display import LiveDisplay
-from python.types.collector_stats import CollectorStats
+from python.types.collector_stats import CollectorStats, ReconnectEvent
 from python.types.tick_types import OriginBlock
 from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.exceptions.collector_exceptions import ConfigurationError
@@ -71,6 +81,62 @@ def is_reconnect(old_status: str, new_status: str) -> bool:
         True when the connection has just come back
     """
     return new_status == "connected" and old_status in RECONNECT_FROM
+
+
+def reconnect_alert_text(duration_seconds: float, recent_within_hour: int,
+                         min_seconds: float, cluster_size: int,
+                         reason: str = "", attempts: int = 1) -> Optional[str]:
+    """
+    Decide whether a restored feed is worth a phone alert, and say what.
+
+    Measured over the night of 2026-09-21: seven reconnects, recorded at 1.3 to
+    7.2 s each and 19.9 s in total - figures that ran from the moment a drop was
+    noticed to the socket handshake, and so left out the 10-11 s of silence
+    before each was noticed. Even with that added the drops were not visible
+    among the longest gaps of the files they fell into, and six alerts reached
+    the operator's phone for them.
+
+    An alert nobody can act on is not free: it trains its reader to swipe, and
+    the next one that mattered is swiped with it. So a short, self-healed drop
+    stays in the log and on `/v1/status`, where its whole record is, and two
+    things still reach the phone:
+
+    - **A long outage**, measured as the data gap - last message before the drop
+      to the feed restored. Since 2026-10-08 a closed socket is noticed at once
+      and a normal drop costs a few seconds, so 30 s means reconnecting itself
+      is failing or the link stayed dead: something an operator can look at.
+      (An outage shortens a file; it does not get the file refused. Kraken
+      replays nothing after a reconnect, so the ticks that follow are fresh.)
+    - **A cluster**, because a host that blips every two hours is weather and one
+      that blips four times an hour is degrading - and that difference is the
+      only thing a short drop can still tell anybody.
+
+    Args:
+        duration_seconds: The data gap
+        recent_within_hour: Outages in the last hour, this one included
+        min_seconds: Gap that is worth an alert on its own
+        cluster_size: Outages per hour that are worth one regardless
+        reason: How the drop was detected, named in the text
+        attempts: Connection attempts the outage took
+
+    Returns:
+        The message body, or None when this one belongs in the log alone
+    """
+    how = ""
+    if reason:
+        how = f" ({reason}, {attempts} attempt{'' if attempts == 1 else 's'})"
+
+    if duration_seconds >= min_seconds:
+        return (f"Feed restored after {duration_seconds:.1f}s without data{how} "
+                f"- past the {min_seconds:.0f}s mark, so reconnecting itself "
+                f"was failing or the link stayed dead")
+
+    if recent_within_hour >= cluster_size:
+        return (f"{recent_within_hour} outages in the last hour, the latest "
+                f"{duration_seconds:.1f}s without data{how}. Short ones are "
+                f"normal on this host; this many in an hour is not")
+
+    return None
 
 
 def validate_symbols(symbols: List[str]) -> None:
@@ -180,7 +246,72 @@ async def serve_status_api(server: Any, logger: Any) -> None:
             f"Status API could not start (exit {e.code}) - the port is most "
             f"likely already in use. Collection continues without it.")
     except Exception as e:
-        logger.error(f"Status API stopped: {e}")
+        logger.error(f"Status API stopped: {describe_exception(e)}")
+
+
+# What CPython's proactor loop - Windows, 3.13 and 3.14 alike - hands the loop's
+# exception handler when accept() raises, immediately before it closes the
+# listening socket for good (BaseProactorEventLoop._start_serving). uvicorn is
+# not told: serve() keeps running, nothing listens, and the edge answers 502.
+ACCEPT_FAILED = "Accept failed on a socket"
+
+# The repository root, which is what `python -m python.writers.wal_archive`
+# needs as a working directory - derived from this file rather than from where
+# the collector happens to be started.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Exit code for a failure a restart cannot fix: a malformed configuration, or an
+# output directory another live collector already owns. Everything else exits 1,
+# where a service manager's default restart is the right response.
+EXIT_CONFIGURATION = 2
+
+# A file of 50,000 ticks took about 4 s to write on the production box. A child
+# still running after this has hung; its log stays on disk and the next start
+# recovers it, so the ceiling costs nothing but the wait.
+EXPORT_TIMEOUT_SECONDS = 300
+
+# How long a graceful stop waits for the archive writers it started. Their logs
+# are on disk either way, so this is about leaving a tidy archive, not about
+# keeping the data.
+EXPORT_SHUTDOWN_WAIT_SECONDS = 60
+
+# Ten samples a second: fine enough to catch a stall, far too little to matter.
+LOOP_LAG_INTERVAL_SECONDS = 0.1
+
+# Above this, a stall is written down with what was going on around it. Low
+# enough to catch what a consumer would notice, high enough that ordinary
+# scheduling jitter does not fill the list.
+STALL_ATTRIBUTION_MS = 250
+
+
+def report_loop_exception(logger: Any) -> Callable[[Any, Dict[str, Any]], None]:
+    """
+    Build the event loop's exception handler.
+
+    asyncio reports through the standard `logging` module, which this project
+    never connects, so without this the one event that silently kills the
+    status API went to stderr and never reached the log file. Everything else
+    keeps asyncio's default handling.
+
+    Args:
+        logger: Where the accept failure is recorded
+
+    Returns:
+        A handler for loop.set_exception_handler
+    """
+    def handler(loop: Any, context: Dict[str, Any]) -> None:
+        if context.get("message") == ACCEPT_FAILED:
+            error = context.get("exception")
+            cause = (describe_exception(error) if error
+                     else "no exception given")
+            logger.error(
+                f"Status API stopped listening: asyncio closed its socket after "
+                f"an accept failure ({cause}). It stays unreachable until the "
+                f"collector restarts; collection is unaffected.")
+            return
+        loop.default_exception_handler(context)
+
+    return handler
 
 
 class FiniexDataCollector:
@@ -206,14 +337,28 @@ class FiniexDataCollector:
         self._clock: Optional[CollectionClock] = None
         self._telegram: Optional[TelegramAlertProvider] = None
         self._instance_lock: Optional[InstanceLock] = None
+        self._last_reconnect_monotonic: Optional[float] = None
+        # name -> (monotonic reading it finished at, milliseconds it took)
+        self._offloop_work: Dict[str, Tuple[float, float]] = {}
         self._origin: Optional[OriginBlock] = None
         self._show_display = show_display
         self._api_server = None
         self._scheduler: Optional[WeeklyJobScheduler] = None
 
-        # Live monitoring
+        # Live monitoring. The error and warning counters follow the log: every
+        # WARNING and ERROR line counts, whoever wrote it.
         self._stats = CollectorStats()
+        add_log_listener(self._stats.record_logged)
         self._live_display: Optional[LiveDisplay] = None
+
+        # Times every garbage collection, so a loop stall can name its cause
+        # instead of being reasoned about afterwards.
+        self._gc_watcher = GcWatcher(self._stats)
+
+        # Reads the loop's own stack when it stops checking in. Every other arm
+        # answers for a candidate somebody instrumented; twenty stalls across
+        # two nights said `unknown` with all of them at zero.
+        self._stall_sampler = StallSampler()
 
         # State
         self._is_running = False
@@ -225,8 +370,13 @@ class FiniexDataCollector:
         # Monitoring tasks
         self._monitoring_tasks = []
 
+        # Archive writers running as subprocesses. Held so a graceful stop can
+        # wait for them: their logs are still on disk, so nothing is lost if it
+        # cannot, but a file finished after the process it belongs to has gone
+        # reads like a file nobody wrote.
+        self._export_tasks: set = set()
+
         # Reconnect tracking
-        self._disconnect_time: Optional[datetime] = None
         self._last_reconnect_alert: Optional[datetime] = None
 
     async def start_collection(self) -> None:
@@ -237,6 +387,29 @@ class FiniexDataCollector:
 
         # Setup signal handlers
         self._setup_signal_handlers()
+        self._gc_watcher.start()
+        # From the loop's thread: the sampler records the caller as the
+        # thread whose stack it reads, and the wrong one answers about an
+        # idle thread with complete confidence.
+        self._stall_sampler.start()
+        asyncio.get_running_loop().set_exception_handler(
+            report_loop_exception(self._logger))
+
+        # Claim the output directory FIRST, before anything with a side effect.
+        #
+        # Two reasons, and the second is what moved this call up here. Recovery
+        # cannot distinguish a crashed run's write-ahead log from a running
+        # instance's, and on Linux it would delete the live one - that ordering
+        # is why the lock exists at all.
+        #
+        # But it used to be taken after Telegram, the scheduler, the monitoring
+        # tasks and the API bind. A second instance therefore announced "Collector
+        # Started" to the operator's phone, started a scheduler and reached for
+        # port 8110, and only then discovered it was not allowed to run. Under a
+        # service manager that restarts on exit, that is one phone alert per
+        # restart cycle for as long as the conflict lasts.
+        self._instance_lock = InstanceLock(Path(self._config.paths.raw_data_dir))
+        self._instance_lock.acquire()
 
         # Initialize Telegram alerts
         if self._config.telegram.enabled:
@@ -289,14 +462,19 @@ class FiniexDataCollector:
                 "window can suspend collection - use --no-display, or uncheck "
                 "QuickEdit in the window's properties.")
 
+        # Whether or not a display follows: the log writes colour codes, and a
+        # Windows console shows them as text until this is on. With the display
+        # it happened by accident, because rich switches it on when it takes the
+        # console over; without it the operator read "<-[37mINFO" for an hour.
+        if enable_ansi_colours() is False:
+            self._logger.warning(
+                "This console will not interpret colour codes; log lines here "
+                "will carry escape sequences. The log file is unaffected.")
+
         # Start live display. Off is a supported way to run: the file log is the
         # record, and that is what a service-wrapped instance uses.
         if self._show_display:
-            self._live_display = LiveDisplay(
-                self._stats,
-                streams=self._config.kraken.streams,
-                clock=self._clock
-            )
+            self._live_display = LiveDisplay(self._stats)
             await self._live_display.start()
         else:
             self._logger.info("Live display off - the file log keeps the record")
@@ -350,7 +528,7 @@ class FiniexDataCollector:
 
         app = create_api(
             build=sample_build_info(self._config.version, DATA_FORMAT_VERSION),
-            health_provider=lambda: health_payload(self._stats),
+            health_provider=self._health,
             detail_provider=lambda: serialize_stats(self._stats),
             registry=load_token_registry(self._config.api.tokens),
             # Established here as well as in the collector path, because the API
@@ -384,6 +562,91 @@ class FiniexDataCollector:
             f"Status API on http://{self._config.api.host}:"
             f"{self._config.api.port}")
 
+    def _export_archive(self, wal_path: Path, archive_path: Path) -> None:
+        """
+        Hand a closed file to a subprocess that writes it.
+
+        Called by a writer from inside `write_tick`, so it must not block: it
+        only starts a task. Writing the file here cost about 1 s plus 66 us per
+        tick on the production box, on the collector's only event loop, nine
+        times in a row at the UTC day cut - measured 2026-09-20.
+
+        Args:
+            wal_path: The write-ahead log holding the ticks and the closing state
+            archive_path: The archive file that is owed
+        """
+        self._stats.record_export_started()
+        task = asyncio.create_task(self._run_export(wal_path, archive_path))
+        self._export_tasks.add(task)
+        task.add_done_callback(self._export_tasks.discard)
+
+    async def _run_export(self, wal_path: Path, archive_path: Path) -> None:
+        """
+        Run the archive writer for one file and report what it did.
+
+        A failure is left where it is: the log stays on disk, and the next start
+        recovers it. That is the whole reason the parent does not delete it.
+
+        Args:
+            wal_path: The write-ahead log to convert
+            archive_path: The archive file it becomes
+        """
+        started = time.monotonic()
+        name = archive_path.name
+
+        try:
+            # `communicate()` below awaits and yields; this does not. Nine or
+            # ten of these go out within one second at the UTC day cut, so
+            # whether that cut costs the loop the spawning or the writing is a
+            # question only a separate reading answers.
+            spawn_started = time.monotonic()
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "python.writers.wal_archive",
+                str(wal_path),
+                cwd=str(PROJECT_ROOT),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+            self._stats.record_export_spawn(
+                (time.monotonic() - spawn_started) * 1000)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=EXPORT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            self._stats.record_export_failed(name)
+            self._logger.error(
+                f"The archive writer for {name} did not finish within "
+                f"{EXPORT_TIMEOUT_SECONDS}s - its log stays on disk and the "
+                f"next start recovers it")
+            return
+        except Exception as e:
+            self._stats.record_export_failed(name)
+            self._logger.error(
+                f"Could not run the archive writer for {name}: "
+                f"{describe_exception(e)} - its log stays on disk and the next "
+                f"start recovers it")
+            return
+
+        duration_ms = (time.monotonic() - started) * 1000
+
+        if process.returncode != 0:
+            self._stats.record_export_failed(name)
+            self._logger.error(
+                f"The archive writer refused {name} "
+                f"(exit {process.returncode}): "
+                f"{stderr.decode('utf-8', 'replace').strip()[:200]} - its log "
+                f"stays on disk and the next start recovers it")
+            return
+
+        ticks = 0
+        try:
+            ticks = int(json.loads(stdout.decode("utf-8")).get("ticks", 0))
+        except Exception:
+            # The file is written; only the count for the report is missing.
+            pass
+
+        self._stats.record_export_finished(name, ticks, duration_ms)
+        self._logger.info(
+            f"Exported {name} ({ticks:,} ticks) in {duration_ms:.0f} ms")
+
     async def _start_monitoring_tasks(self) -> None:
         """Start background monitoring tasks."""
         # Disk space monitoring
@@ -392,13 +655,172 @@ class FiniexDataCollector:
         )
         self._monitoring_tasks.append(disk_task)
 
+        # How late this loop runs. It is the instrument for the one defect a
+        # tick file cannot show: a blocked loop stamps collected_msc late, and
+        # the consuming importer rejects a whole file beyond 30 s of lag.
+        lag_task = asyncio.create_task(self._monitor_loop_lag())
+        self._monitoring_tasks.append(lag_task)
+
         # Folder scanning
         folder_task = asyncio.create_task(
             self._monitor_folders()
         )
         self._monitoring_tasks.append(folder_task)
 
+        # One line every ten minutes that outlives the process, so a slope over
+        # weeks is readable from the log where /v1/status only has the present.
+        trail = MemoryTrail(
+            stats=self._stats,
+            ticks_provider=lambda: {
+                symbol: writer.ticks_written
+                for symbol, writer in list(self._writers.items())},
+            log=self._logger.info)
+        self._monitoring_tasks.append(asyncio.create_task(trail.run()))
+
+        # Off without an address. Off the same loop as everything else on purpose:
+        # a frozen loop must stop the heartbeat, that is one of the things it reports.
+        if self._config.monitoring.heartbeat_url:
+            heartbeat = Heartbeat(
+                url=self._config.monitoring.heartbeat_url,
+                interval_seconds=self._config.monitoring.heartbeat_interval_seconds,
+                health_provider=self._health,
+                stats=self._stats
+            )
+            self._monitoring_tasks.append(asyncio.create_task(heartbeat.run()))
+
         self._logger.info("Monitoring tasks started")
+
+    def _health(self) -> Dict[str, Any]:
+        """
+        What `/v1/health` answers, and what the heartbeat goes by.
+
+        Returns:
+            The health payload, derived now
+        """
+        return health_payload(
+            self._stats,
+            write_ahead_logs_lost=sum(
+                1 for writer in list(self._writers.values())
+                if writer.write_ahead_log_lost))
+
+    async def _await_pending_exports(self) -> None:
+        """
+        Let the archive writers still running finish before the process ends.
+
+        Nothing is lost if they do not: every one of them has its write-ahead
+        log on disk, and the next start recovers it. What the wait buys is a
+        stop that leaves the archive complete rather than a directory of logs
+        somebody has to trust a later start with.
+        """
+        if not self._export_tasks:
+            return
+
+        pending = list(self._export_tasks)
+        self._logger.info(
+            f"Waiting for {len(pending)} archive writer(s) to finish")
+
+        _finished, still_running = await asyncio.wait(
+            pending, timeout=EXPORT_SHUTDOWN_WAIT_SECONDS)
+
+        if still_running:
+            self._logger.warning(
+                f"{len(still_running)} archive writer(s) did not finish in "
+                f"{EXPORT_SHUTDOWN_WAIT_SECONDS}s - their logs stay on disk and "
+                f"the next start recovers them")
+
+    async def _monitor_loop_lag(self) -> None:
+        """
+        Measure how late the event loop runs its own timers.
+
+        Everything this collector does shares one loop, so a long piece of work
+        anywhere delays the stamping of every tick that arrives meanwhile. That
+        delay is invisible in a tick file - `collected_msc` simply reads later
+        than it should - until it passes the consumer's 30 s window and costs
+        the whole file. Ten samples a second cost nothing and make it visible
+        on `/v1/status` from off the machine.
+        """
+        while self._is_running:
+            asked_at = time.monotonic()
+            self._stall_sampler.note_alive()
+
+            # Read before the wait, subtract after: the difference is what the
+            # tick handler cost inside THIS window and nothing else. A rate held
+            # anywhere else would describe a window somebody else chose.
+            work_before = self._stats.tick_work.total_ms
+            ticks_before = self._stats.tick_work.ticks
+
+            await asyncio.sleep(LOOP_LAG_INTERVAL_SECONDS)
+            lateness = time.monotonic() - asked_at - LOOP_LAG_INTERVAL_SECONDS
+            lateness_ms = lateness * 1000
+            self._stats.record_loop_lag(lateness_ms)
+
+            # A stall worth explaining is asked what else happened in its own
+            # window, rather than attributed afterwards from reasoning. The
+            # first such attribution was wrong: the folder scan was blamed and
+            # then measured at 15 ms. The second left ten stalls saying
+            # `unknown` because nothing was measuring the tick handler.
+            if lateness_ms >= STALL_ATTRIBUTION_MS:
+                gc_ms, generation = self._gc_watcher.time_spent_since(asked_at)
+                self._stats.record_stall(
+                    duration_ms=lateness_ms,
+                    gc_ms=gc_ms,
+                    gc_generation=generation,
+                    render_ms=self._stats.scans.render_last_ms,
+                    exports_in_flight=self._stats.exports.in_flight,
+                    tick_ms=self._stats.tick_work.total_ms - work_before,
+                    ticks=self._stats.tick_work.ticks - ticks_before,
+                    reconnected=self._reconnected_between(asked_at),
+                    blocked_in=self._stall_sampler.blocked_in(asked_at),
+                    **dict(zip(("offloop_ms", "offloop_what"),
+                               self._offloop_in_window(asked_at))))
+
+    def _note_offloop(self, name: str, duration_ms: float) -> None:
+        """
+        Remember that a timed off-loop task just finished.
+
+        `asyncio.to_thread` moves the system calls off the loop; it does not move
+        the Python that walks their results, and that still holds the interpreter
+        lock. So a scan can be "off the loop" and delay it anyway - which is the
+        shape of nine stalls on 2026-09-23 that nothing could name.
+
+        Args:
+            name: What ran, as it should read in a stall record
+            duration_ms: How long it took
+        """
+        self._offloop_work[name] = (time.monotonic(), duration_ms)
+
+    def _offloop_in_window(self, since: float) -> Tuple[float, str]:
+        """
+        The longest timed off-loop task that finished inside a stall's window.
+
+        Args:
+            since: The monotonic reading the window started at
+
+        Returns:
+            (milliseconds, what it was), or (0.0, "") when none finished in it
+        """
+        inside = [(ms, name) for name, (ended, ms) in self._offloop_work.items()
+                  if ended >= since]
+        return max(inside) if inside else (0.0, "")
+
+    def _reconnected_between(self, since: float) -> bool:
+        """
+        Whether the socket came back inside the window that just ended.
+
+        Compared on the MONOTONIC clock, not the wall clock. The reconnect
+        events carry wall-clock stamps because a human reads them; correlating
+        a stall against those would mean subtracting two readings that a clock
+        correction can sit between, which this project treats as a defect rather
+        than a style question.
+
+        Args:
+            since: The monotonic reading the window started at
+
+        Returns:
+            True when a reconnect completed inside it
+        """
+        last = self._last_reconnect_monotonic
+        return last is not None and last >= since
 
     async def _monitor_disk_space(self) -> None:
         """Monitor disk space usage."""
@@ -410,14 +832,13 @@ class FiniexDataCollector:
 
         while self._is_running:
             try:
-                # Get disk usage for raw data directory
-                data_path = Path(self._config.paths.raw_data_dir).resolve()
-
-                self._logger.debug(
-                    f"[DISK_MONITOR] Checking path: {data_path}"
-                )
-
-                usage = psutil.disk_usage(str(data_path))
+                # In a thread for the same reason as the folder scan: on the
+                # production box a filesystem call is not free, and anything
+                # slow here lands in the next tick's stamp.
+                usage, duration_ms = await asyncio.to_thread(
+                    self._read_disk_usage)
+                self._stats.record_disk_check(duration_ms)
+                self._note_offloop("disk check", duration_ms)
 
                 self._stats.update_disk_space(
                     total=usage.total,
@@ -447,14 +868,95 @@ class FiniexDataCollector:
                     )
 
             except Exception as e:
-                self._logger.error(f"Disk space check failed: {e}")
+                self._logger.error(
+                    f"Disk space check failed: {describe_exception(e)}")
                 self._logger.debug(
                     f"[DISK_MONITOR] Exception details:", exc_info=True)
 
             await asyncio.sleep(interval)
 
+    def _read_disk_usage(self) -> Tuple[Any, float]:
+        """
+        Read the disk usage of the data directory, in a worker thread.
+
+        Returns:
+            The psutil usage record and how long the reading took, in ms
+        """
+        started = time.monotonic()
+        data_path = Path(self._config.paths.raw_data_dir).resolve()
+
+        self._logger.debug(f"[DISK_MONITOR] Checking path: {data_path}")
+
+        usage = psutil.disk_usage(str(data_path))
+
+        return usage, (time.monotonic() - started) * 1000
+
+    def _prepare_symbol_stats(self, symbol: str) -> None:
+        """
+        Put everything a screen needs about a symbol where a screen can read it.
+
+        The entry exists from here rather than from the first tick, which also
+        makes a configured symbol that never trades visible instead of absent.
+        The digit count comes from the broker specification: two fixed places
+        once rendered ADAUSD's 0.2103 and 0.2104 both as 0.21, a screen
+        asserting a spread the book did not have.
+
+        Args:
+            symbol: Normalized symbol
+        """
+        symbol_stats = self._stats.get_symbol_stats(symbol)
+
+        try:
+            symbol_stats.digits = BrokerConfig.get_digits(symbol)
+        except Exception as e:
+            # A missing specification is not worth refusing to collect over; the
+            # field stays None, which says "not known" rather than inventing 2.
+            self._logger.debug(
+                f"No digit count for {symbol}: {describe_exception(e)}")
+
+    def _reconcile_tick_counters(self) -> None:
+        """
+        Hold the displayed tick count against the one the writer wrote.
+
+        Two counters exist for one number: the writer counts what went into the
+        file, and the tick handler keeps a second one for the display, the
+        status API and the weekly report. They drifted by exactly one tick at
+        every UTC day cut until 2026-09-20 - invisible for weeks, because
+        nothing ever compared them.
+
+        The writer wins, because the writer is what the file says. The
+        disagreement is counted and logged rather than quietly repaired: a
+        resynchronisation nobody hears about would hide the next cause just as
+        well as the first one hid this one.
+        """
+        for symbol, writer in self._writers.items():
+            symbol_stats = self._stats.symbols.get(symbol)
+            if symbol_stats is None:
+                continue
+
+            counted = symbol_stats.current_file_ticks
+            written = writer.current_tick_count
+            self._stats.record_counter_check(symbol, counted, written)
+
+            if counted != written:
+                self._logger.warning(
+                    f"Tick counters disagree for {symbol}: the display says "
+                    f"{counted:,}, the writer holds {written:,} - taking the "
+                    f"writer's count")
+                symbol_stats.current_file_ticks = written
+
     async def _monitor_folders(self) -> None:
-        """Monitor folder file counts."""
+        """
+        Count the files on disk, off the event loop.
+
+        Counting files and measuring folders is file I/O, and on the production
+        box file I/O is expensive: measured 2026-09-21, this scan and the disk
+        check stalled the loop by up to 4.3 s about once a minute, which landed
+        in every tick's `collected_msc` as arrival lag that was ours rather than
+        the venue's. A thread is the right answer here, unlike for the JSON
+        encoder that used to write the archive files: these are syscalls, and a
+        syscall releases the GIL.
+        """
         interval = self._config.monitoring.folder_scan_interval_seconds
 
         self._logger.debug(
@@ -463,122 +965,140 @@ class FiniexDataCollector:
 
         while self._is_running:
             try:
-                scan_start = datetime.now(timezone.utc)
+                # Stays here: it compares two counters this loop owns, and
+                # touches no file.
+                self._reconcile_tick_counters()
 
-                # Kraken data folder
-                kraken_path = Path(self._config.paths.raw_data_dir) / "kraken"
-
-                self._logger.debug(
-                    f"[FOLDER_SCAN] Scanning Kraken: path={kraken_path}, "
-                    f"exists={kraken_path.exists()}"
-                )
-
-                if kraken_path.exists():
-                    # Check if files are in sub-folders (per symbol) or directly in kraken folder
-                    has_subfolders = any(
-                        item.is_dir()
-                        for item in kraken_path.iterdir()
-                    )
-
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Kraken structure: has_subfolders={has_subfolders}"
-                    )
-
-                    if has_subfolders:
-                        # Files organized in symbol sub-folders
-                        kraken_count = sum(
-                            count_files_in_folder(symbol_folder, "*_ticks.json")
-                            for symbol_folder in kraken_path.iterdir()
-                            if symbol_folder.is_dir()
-                        )
-
-                        # Update per-symbol folder counts
-                        symbol_scans = []
-                        for symbol_folder in kraken_path.iterdir():
-                            if symbol_folder.is_dir():
-                                symbol = symbol_folder.name
-                                if symbol in self._stats.symbols:
-                                    count = count_files_in_folder(
-                                        symbol_folder, "*_ticks.json")
-                                    self._stats.symbols[symbol].folder_file_count = count
-                                    symbol_scans.append(f"{symbol}={count}")
-
-                        self._logger.debug(
-                            f"[FOLDER_SCAN] Per-symbol counts: {', '.join(symbol_scans) if symbol_scans else 'none'}"
-                        )
-                    else:
-                        # Files directly in kraken folder (no sub-folders)
-                        kraken_count = count_files_in_folder(
-                            kraken_path, "*_ticks.json")
-
-                        self._logger.debug(
-                            f"[FOLDER_SCAN] Flat structure: {kraken_count} files directly in kraken folder"
-                        )
-
-                        # Cannot determine per-symbol counts in flat structure
-                        # Set folder_file_count to 0 for all symbols
-                        for symbol in self._stats.symbols:
-                            self._stats.symbols[symbol].folder_file_count = 0
-
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Kraken total: {kraken_count} files"
-                    )
-
-                    self._stats.update_folder_stats(
-                        "kraken", str(kraken_path), kraken_count)
-                else:
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Kraken path does not exist: {kraken_path}"
-                    )
-                    self._stats.update_folder_stats(
-                        "kraken", str(kraken_path), 0)
-
-                # MT5 folder
-                if self._config.mt5.enabled and self._config.mt5.raw_data_path:
-                    mt5_path = Path(self._config.mt5.raw_data_path)
-
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Scanning MT5: path={mt5_path}, "
-                        f"exists={mt5_path.exists()}"
-                    )
-
-                    if mt5_path.exists():
-                        mt5_count = count_files_in_folder(
-                            mt5_path, "*_ticks.json")
-                        self._logger.debug(
-                            f"[FOLDER_SCAN] MT5 total: {mt5_count} files"
-                        )
-                        self._stats.update_folder_stats(
-                            "mt5", str(mt5_path), mt5_count)
-
-                # Logs folder
-                logs_path = Path(self._config.paths.logs_dir)
-
-                self._logger.debug(
-                    f"[FOLDER_SCAN] Scanning Logs: path={logs_path}, "
-                    f"exists={logs_path.exists()}"
-                )
-
-                if logs_path.exists():
-                    logs_count = count_files_in_folder(logs_path, "*.log")
-                    self._logger.debug(
-                        f"[FOLDER_SCAN] Logs total: {logs_count} files"
-                    )
-                    self._stats.update_folder_stats(
-                        "logs", str(logs_path), logs_count)
-
-                scan_duration = (datetime.now(timezone.utc) -
-                                 scan_start).total_seconds()
-                self._logger.debug(
-                    f"[FOLDER_SCAN] Completed in {scan_duration:.2f}s"
-                )
-
+                scan_ms = await asyncio.to_thread(self._scan_folders)
+                self._stats.record_folder_scan(scan_ms)
+                self._note_offloop("folder scan", scan_ms)
             except Exception as e:
-                self._logger.error(f"Folder scan failed: {e}")
+                self._logger.error(
+                    f"Folder scan failed: {describe_exception(e)}")
                 self._logger.debug(
                     f"[FOLDER_SCAN] Exception details:", exc_info=True)
 
             await asyncio.sleep(interval)
+
+    def _scan_folders(self) -> float:
+        """
+        Walk the archive, the MT5 directory and the logs, and count what is there.
+
+        Runs in a worker thread; it only reads the filesystem and writes counts
+        into the stats object.
+
+        Returns:
+            How long the walk took, in milliseconds
+        """
+        scan_start = time.monotonic()
+
+        # Kraken data folder
+        kraken_path = Path(self._config.paths.raw_data_dir) / "kraken"
+
+        self._logger.debug(
+            f"[FOLDER_SCAN] Scanning Kraken: path={kraken_path}, "
+            f"exists={kraken_path.exists()}"
+        )
+
+        if kraken_path.exists():
+            # Check if files are in sub-folders (per symbol) or directly in kraken folder
+            has_subfolders = any(
+                item.is_dir()
+                for item in kraken_path.iterdir()
+            )
+
+            self._logger.debug(
+                f"[FOLDER_SCAN] Kraken structure: has_subfolders={has_subfolders}"
+            )
+
+            if has_subfolders:
+                # Files organized in symbol sub-folders
+                kraken_count = sum(
+                    count_files_in_folder(symbol_folder, "*_ticks.json")
+                    for symbol_folder in kraken_path.iterdir()
+                    if symbol_folder.is_dir()
+                )
+
+                # Update per-symbol folder counts
+                symbol_scans = []
+                for symbol_folder in kraken_path.iterdir():
+                    if symbol_folder.is_dir():
+                        symbol = symbol_folder.name
+                        if symbol in self._stats.symbols:
+                            count = count_files_in_folder(
+                                symbol_folder, "*_ticks.json")
+                            self._stats.symbols[symbol].folder_file_count = count
+                            symbol_scans.append(f"{symbol}={count}")
+
+                self._logger.debug(
+                    f"[FOLDER_SCAN] Per-symbol counts: {', '.join(symbol_scans) if symbol_scans else 'none'}"
+                )
+            else:
+                # Files directly in kraken folder (no sub-folders)
+                kraken_count = count_files_in_folder(
+                    kraken_path, "*_ticks.json")
+
+                self._logger.debug(
+                    f"[FOLDER_SCAN] Flat structure: {kraken_count} files directly in kraken folder"
+                )
+
+                # Cannot determine per-symbol counts in flat structure
+                # Set folder_file_count to 0 for all symbols
+                for symbol in self._stats.symbols:
+                    self._stats.symbols[symbol].folder_file_count = 0
+
+            self._logger.debug(
+                f"[FOLDER_SCAN] Kraken total: {kraken_count} files"
+            )
+
+            self._stats.update_folder_stats(
+                "kraken", str(kraken_path), kraken_count)
+        else:
+            self._logger.debug(
+                f"[FOLDER_SCAN] Kraken path does not exist: {kraken_path}"
+            )
+            self._stats.update_folder_stats(
+                "kraken", str(kraken_path), 0)
+
+        # MT5 folder
+        if self._config.mt5.enabled and self._config.mt5.raw_data_path:
+            mt5_path = Path(self._config.mt5.raw_data_path)
+
+            self._logger.debug(
+                f"[FOLDER_SCAN] Scanning MT5: path={mt5_path}, "
+                f"exists={mt5_path.exists()}"
+            )
+
+            if mt5_path.exists():
+                mt5_count = count_files_in_folder(
+                    mt5_path, "*_ticks.json")
+                self._logger.debug(
+                    f"[FOLDER_SCAN] MT5 total: {mt5_count} files"
+                )
+                self._stats.update_folder_stats(
+                    "mt5", str(mt5_path), mt5_count)
+
+        # Logs folder
+        logs_path = Path(self._config.paths.logs_dir)
+
+        self._logger.debug(
+            f"[FOLDER_SCAN] Scanning Logs: path={logs_path}, "
+            f"exists={logs_path.exists()}"
+        )
+
+        if logs_path.exists():
+            logs_count = count_files_in_folder(logs_path, "*.log")
+            self._logger.debug(
+                f"[FOLDER_SCAN] Logs total: {logs_count} files"
+            )
+            self._stats.update_folder_stats(
+                "logs", str(logs_path), logs_count)
+
+        duration_ms = (time.monotonic() - scan_start) * 1000
+        self._logger.debug(f"[FOLDER_SCAN] Completed in {duration_ms:.0f} ms")
+
+        return duration_ms
+
 
     async def _start_kraken_collector(self) -> None:
         """Initialize and start Kraken WebSocket collector."""
@@ -590,6 +1110,12 @@ class FiniexDataCollector:
         # rather than once per symbol.
         clock = CollectionClock()
         self._clock = clock
+        self._stats.streams = list(self._config.kraken.streams)
+
+        # The file boundary, reported rather than looked up. A screen elsewhere
+        # has no way to know it, and the one that used to read it off a local
+        # config file read the viewer's machine instead of this one.
+        self._stats.max_ticks_per_file = self._config.kraken.max_ticks_per_file
 
         # One cache for the session, like the clock: the ticker channel fills it
         # and every symbol's trade ticks read their own entry out of it.
@@ -597,12 +1123,6 @@ class FiniexDataCollector:
 
         # Create writers for each symbol
         raw_dir = Path(self._config.paths.raw_data_dir)
-
-        # Claim the directory before touching anything in it. Recovery below
-        # cannot distinguish a crashed run's write-ahead log from a running
-        # instance's, and on Linux it would delete the live one.
-        self._instance_lock = InstanceLock(raw_dir)
-        self._instance_lock.acquire()
 
         # Before recovery, because a recovered file carries the identity too.
         origin = self._establish_identity()
@@ -625,10 +1145,13 @@ class FiniexDataCollector:
                 broker_type=self._config.kraken.broker_type,
                 max_ticks_per_file=self._config.kraken.max_ticks_per_file,
                 origin=origin,
-                data_collector="kraken"
+                data_collector="kraken",
+                exporter=self._export_archive
             )
 
             self._writers[normalized] = writer
+
+            self._prepare_symbol_stats(normalized)
 
         # Create collector
         collector = KrakenWebSocketClient(
@@ -639,12 +1162,13 @@ class FiniexDataCollector:
             url=self._config.kraken.websocket_url,
             reconnect_initial_delay=self._config.kraken.reconnect_initial_delay_seconds,
             reconnect_max_delay=self._config.kraken.reconnect_max_delay_seconds,
-            heartbeat_interval=self._config.kraken.heartbeat_interval_seconds
+            stale_after=self._config.kraken.stale_after_seconds
         )
 
         # Set callbacks
         collector.set_tick_callback(self._on_tick_received)
         collector.set_status_callback(self._on_status_changed)
+        collector.set_outage_callback(self._on_outage)
 
         self._collectors.append(collector)
 
@@ -655,56 +1179,75 @@ class FiniexDataCollector:
         """
         Handle WebSocket connection status change.
 
+        The status is what the screens show; the outage itself is recorded by
+        _on_outage from the client's own timeline. Until 2026-10-08 this handler
+        built the reconnect record from two wall-clock readings - the status
+        turning 'reconnecting' and turning 'connected' again - which measured
+        from the moment a drop was noticed to the handshake, and missed the
+        10-11 s before the drop was noticed.
+
         Args:
             status: New status (connected, disconnected, reconnecting, failed)
         """
         old_status = self._stats.websocket_status
         self._stats.set_websocket_status(status)
 
-        self._logger.debug(
-            f"[STATUS] WebSocket status changed: {old_status} → {status}, "
-            f"disconnect_time={self._disconnect_time}"
-        )
-
-        # Track disconnects (including 'reconnecting' which means connection was lost)
-        if status in ["disconnected", "reconnecting"] and old_status == "connected":
-            self._disconnect_time = datetime.now(timezone.utc)
-            self._logger.debug(
-                f"[DISCONNECT] Tracked disconnect at {self._disconnect_time} (status={status})"
-            )
-
-        # Track reconnects
         if is_reconnect(old_status, status):
-            if self._disconnect_time:
-                duration = (datetime.now(timezone.utc) -
-                            self._disconnect_time).total_seconds()
+            # Stamped on the monotonic clock for the stall attribution, which
+            # asks whether a socket came back inside a stall's window.
+            self._last_reconnect_monotonic = time.monotonic()
 
-                self._logger.debug(
-                    f"[RECONNECT] Recording reconnect event: "
-                    f"duration={duration:.1f}s, "
-                    f"disconnect_time={self._disconnect_time}, "
-                    f"old_status={old_status}"
-                )
-
-                self._stats.record_reconnect("connection_restored", duration)
-
-                # Send alert if cooldown passed
-                asyncio.create_task(self._send_reconnect_alert(duration))
-
-                self._disconnect_time = None
-            else:
-                self._logger.debug(
-                    f"[RECONNECT] Connected but no disconnect_time tracked "
-                    f"(old_status={old_status}) - possible initial connection"
-                )
-
-    async def _send_reconnect_alert(self, duration_seconds: float) -> None:
+    def _on_outage(self, stage: str, event: ReconnectEvent) -> None:
         """
-        Send reconnect alert if cooldown allows.
+        Follow one outage record through its stages.
+
+        The record goes to /v1/status at every stage, and to the log as one
+        '[OUTAGE]' line when the feed is restored and again when the record is
+        resolved - so a kill in between still leaves the restored line. Both
+        are written through the converter /v1/status uses, so a session reading
+        either months later gets the same shape.
 
         Args:
-            duration_seconds: Downtime duration
+            stage: 'opened', 'restored' or 'resolved'
+            event: The record
         """
+        self._stats.record_outage(stage, event)
+
+        if stage in ("restored", "resolved"):
+            # default=str: a value the converter passes through unchanged must
+            # never cost the durable line, the one that outlives the process.
+            self._logger.info("[OUTAGE] " + json.dumps(
+                {"schema": 1, "stage": stage, **plain(event)}, default=str))
+
+        if stage == "restored":
+            asyncio.create_task(self._send_reconnect_alert(event))
+
+    def _reconnects_within_the_hour(self, now: datetime) -> int:
+        """
+        How many reconnects have happened in the last hour, this one included.
+
+        Read off the outage times the statistics keep for exactly this, so
+        there is no second counter to drift from them - and not off the ring of
+        detailed records, which holds twenty: a cluster threshold above twenty
+        could never fire, and 'N outages in the last hour' stopped at 20.
+
+        Args:
+            now: The moment being judged
+
+        Returns:
+            Count of reconnect events within the last hour
+        """
+        return self._stats.outages_since(now - timedelta(hours=1))
+
+    async def _send_reconnect_alert(self, event: ReconnectEvent) -> None:
+        """
+        Send an alert for a restored outage if it is worth one and the cooldown
+        allows.
+
+        Args:
+            event: The outage record, restored; its duration is the data gap
+        """
+        duration_seconds = event.duration_seconds or 0.0
         if not self._telegram:
             self._logger.debug(
                 "[RECONNECT_ALERT] No Telegram configured, skipping")
@@ -726,17 +1269,28 @@ class FiniexDataCollector:
                 )
                 return  # Still in cooldown
 
-        # Send alert
-        duration_minutes = int(duration_seconds / 60)
+        # Whole minutes rendered every one of these as "0m downtime", including
+        # a 7.2 s outage that was three times the others - a number that told
+        # the reader nothing it did not already assume.
+        recent = self._reconnects_within_the_hour(now)
+        body = reconnect_alert_text(
+            duration_seconds,
+            recent_within_hour=recent,
+            min_seconds=self._config.monitoring.reconnect_alert_min_seconds,
+            cluster_size=self._config.monitoring.reconnect_alert_cluster,
+            reason=event.reason,
+            attempts=event.attempts)
 
-        self._logger.debug(
-            f"[RECONNECT_ALERT] Sending alert: duration={duration_minutes}m"
-        )
+        if body is None:
+            self._logger.info(
+                f"No alert: data resumed {duration_seconds:.1f}s after the last "
+                f"message ({event.reason}), {recent} in the last hour. On "
+                f"/v1/status either way.")
+            return
 
-        await self._telegram.send_warning(
-            "🔌 Connection Restored",
-            f"WebSocket reconnected after {duration_minutes}m downtime"
-        )
+        self._logger.debug(f"[RECONNECT_ALERT] Sending alert: {body}")
+
+        await self._telegram.send_warning("🔌 Connection Restored", body)
 
         self._last_reconnect_alert = now
 
@@ -754,17 +1308,45 @@ class FiniexDataCollector:
         try:
             await collector.start()
         except Exception as e:
-            self._logger.error(f"Collector failed: {e}")
+            self._logger.error(f"Collector failed: {describe_exception(e)}")
 
             if self._telegram:
                 await self._telegram.send_error(
                     "Collector Failed",
-                    f"Kraken collector stopped: {e}"
+                    f"Kraken collector stopped: {describe_exception(e)}"
                 )
 
     def _on_tick_received(self, tick) -> None:
         """
-        Handle incoming tick from collector.
+        Handle incoming tick, and measure what handling it costs the loop.
+
+        The timing exists because of Befund 28: on 2026-09-21 the loop stalled
+        up to 738 ms with the display off, no export running and garbage
+        collection accounting for under a tenth of it. Everything the stall
+        attribution could name had been ruled out, which left a consumer nobody
+        was measuring - and this handler, running nine symbols with a flushed
+        write-ahead append per tick, is the largest candidate left.
+
+        Naming it required measuring it. Two `time.monotonic()` reads per tick
+        cost a fraction of the 66 microseconds the handler already spends.
+
+        Args:
+            tick: TickData instance
+        """
+        started = time.monotonic()
+        try:
+            self._handle_tick(tick)
+            self._stats.record_tick_handled(tick.symbol)
+        except Exception:
+            # The client logs it; this is what keeps it visible after the line.
+            self._stats.record_tick_failed(tick.symbol)
+            raise
+        finally:
+            self._stats.record_tick_work((time.monotonic() - started) * 1000)
+
+    def _handle_tick(self, tick) -> None:
+        """
+        Everything that happens to one arriving tick.
 
         Args:
             tick: TickData instance
@@ -804,6 +1386,13 @@ class FiniexDataCollector:
                 quote_age_ms=tick.quote_age_ms
             )
 
+            # The clock only moves when a tick is stamped, so this is the moment
+            # its counters can have changed - and where a screen outside this
+            # process gets to see them.
+            if self._clock is not None:
+                self._stats.record_clock(
+                    self._clock.resyncs, self._clock.max_correction_ms)
+
             # Get count AFTER increment - this is the FINAL count for this file
             count_after = self._stats.symbols[symbol].current_file_ticks
             self._logger.debug(
@@ -825,41 +1414,50 @@ class FiniexDataCollector:
             )
 
             if old_file and new_file and old_file != new_file:
-                # File was rotated!
-                # count_after contains the FINAL tick count for the OLD file
+                # Both numbers come from the writer, because only the writer
+                # knows which file this tick landed in. The day cut is checked
+                # BEFORE the tick is appended, so the tick that triggered it
+                # belongs to the NEW file; the count threshold fires after, so
+                # that trigger belongs to the old one. Counting along here got
+                # it wrong by exactly one, in either direction, and carried the
+                # error into the next file - measured on production: "File
+                # rotated: ... (47,369 ticks)" for a file holding 47,368, and
+                # "(49,999)" for one holding 50,000.
                 self._stats.record_file_created(
                     symbol=symbol,
                     filename=old_file.name,
-                    tick_count=count_after  # Final count of OLD file
+                    tick_count=writer.last_closed_tick_count
                 )
 
-                # CRITICAL: Reset tick count for NEW file
-                # The new file is empty (writer just started it)
-                self._stats.symbols[symbol].current_file_ticks = 0
+                # Not zero: after a day cut the new file already holds the tick
+                # that caused the cut.
+                self._stats.symbols[symbol].current_file_ticks = \
+                    writer.current_tick_count
 
                 self._logger.debug(
                     f"[ROTATION] Detected: symbol={symbol}, "
                     f"rotated_file={old_file.name}, "
-                    f"final_count={count_after}, "
+                    f"final_count={writer.last_closed_tick_count}, "
                     f"new_file={new_file.name}, "
-                    f"stats_reset=0"
+                    f"carried_over={writer.current_tick_count}"
                 )
 
                 self._logger.info(
-                    f"File rotated: {old_file.name} ({count_after:,} ticks)"
-                )
+                    f"File rotated: {old_file.name} "
+                    f"({writer.last_closed_tick_count:,} ticks)")
 
                 # Send rotation notification (if enabled)
                 if self._telegram and self._config.telegram.send_on_rotation:
                     self._logger.debug(
                         f"[TELEGRAM] Sending rotation alert: symbol={symbol}, "
-                        f"file={old_file.name}, count={count_after}"
+                        f"file={old_file.name}, "
+                        f"count={writer.last_closed_tick_count}"
                     )
                     asyncio.create_task(
                         self._telegram.send_file_rotation_notice(
                             symbol=symbol,
                             filename=old_file.name,
-                            tick_count=count_after
+                            tick_count=writer.last_closed_tick_count
                         )
                     )
         else:
@@ -917,12 +1515,25 @@ class FiniexDataCollector:
         mt5_stats = self._stats.folders.get("mt5")
         logs_stats = self._stats.folders.get("logs")
 
-        # Reconnects this week
-        reconnects = self._stats.get_reconnects_this_week()
+        # Outages in the last seven days - one window for the count and the
+        # list. The count comes from the uncapped outage times: the detailed
+        # records are capped at twenty and would undercount a busy week, and
+        # whole UTC dates left the part of a day seven days back to no report.
+        now = datetime.now(timezone.utc)
+        week_ago = now - timedelta(days=7)
+        reconnect_count = self._stats.outages_since(week_ago)
+        recent_outages = [event for event in self._stats.reconnect_events
+                          if event.timestamp >= week_ago]
 
         # Build report
         uptime_hours = self._stats.get_uptime_hours()
         disk = self._stats.disk_space
+
+        # The counts cover what this process saw. A deploy or a restart during
+        # the week starts them over, and 'This Week' above two days of counting
+        # would state a week's count the process does not hold.
+        window = ("This Week" if uptime_hours >= 7 * 24
+                  else f"Since Start ({uptime_hours:.0f} h)")
 
         if disk.status == "OK":
             disk_status = "✅"
@@ -952,15 +1563,16 @@ class FiniexDataCollector:
             f"• Free: {disk.free_gb:.1f} GB ({disk.percent_free:.0f}%) {disk_status}",
             "",
             "🔌 *Connection Health*",
-            f"• Reconnects This Week: {len(reconnects)}",
+            f"• Reconnects {window}: {reconnect_count}",
         ]
 
-        # Add reconnect details
-        if reconnects:
-            for event in reconnects[-3:]:  # Last 3
-                time_str = event.timestamp.strftime("%a %d.%m %H:%M")
-                duration = int(event.duration_seconds / 60)
-                report_lines.append(f"  - {time_str} ({duration}m downtime)")
+        # The latest three, in seconds: whole minutes rendered every drop as
+        # '0m downtime'.
+        for event in recent_outages[-3:]:
+            time_str = event.timestamp.strftime("%a %d.%m %H:%M")
+            gap = (f"{event.duration_seconds:.1f}s without data"
+                   if event.duration_seconds is not None else "not restored")
+            report_lines.append(f"  - {time_str} ({gap}, {event.reason})")
 
         report_lines.extend([
             f"• Current Status: {self._stats.websocket_status}",
@@ -975,17 +1587,27 @@ class FiniexDataCollector:
 
         report_text = "\n".join(report_lines)
 
-        success = await self._telegram.send_info("Weekly Report", report_text)
-
-        # Reset weekly reconnects after report
-        if success:
-            self._stats.reset_weekly_reconnects()
-
-        return success
+        # Nothing is reset after sending. The history used to be emptied here,
+        # which wiped the live record on /v1/status every Saturday and at every
+        # Telegram /report - on 2026-09-26 and 2026-10-03 among others - while
+        # the report only ever needed the last seven days, which it filters.
+        return await self._telegram.send_info("Weekly Report", report_text)
 
     def _setup_signal_handlers(self) -> None:
         """Setup graceful shutdown handlers (cross-platform)."""
         if sys.platform == "win32":
+            # Before registering anything: a parent process can leave Ctrl+C
+            # processing switched off, and the setting is inherited. Measured
+            # 2026-09-21 - the handler below never ran, the console accepted the
+            # event, and the collector kept collecting for a full minute with its
+            # archive unwritten. Under NSSM that is the difference between a stop
+            # and a kill.
+            if enable_ctrl_c_handling() is False:
+                self._logger.warning(
+                    "Could not re-enable Ctrl+C handling on this console. A stop "
+                    "signal may not reach the shutdown handler; the write-ahead "
+                    "logs still protect the data, and the next start recovers.")
+
             # Windows: use signal.signal (SIGTERM not available)
             def win_handler(signum, frame):
                 asyncio.create_task(self._signal_handler())
@@ -1010,6 +1632,9 @@ class FiniexDataCollector:
     async def _shutdown(self) -> None:
         """Graceful shutdown of all components."""
         self._logger.info("Shutting down...")
+
+        self._gc_watcher.stop()
+        self._stall_sampler.stop()
 
         # Stop live display first (so we can see logs)
         if self._live_display:
@@ -1043,6 +1668,8 @@ class FiniexDataCollector:
                     filename=filepath.name,
                     tick_count=tick_count
                 )
+
+        await self._await_pending_exports()
 
         # Ask the API to finish before the tasks are cancelled, so an in-flight
         # request is answered rather than dropped.
@@ -1116,6 +1743,64 @@ async def cmd_collect(config: AppConfig, show_display: bool = True) -> None:
 
 
 
+def cmd_watch(endpoint_name: str, interval: Optional[float]) -> int:
+    """
+    Draw a running collector, from outside it.
+
+    Deliberately free of the collector's configuration and of its logger: this is
+    a second program that reads one HTTP route, and the only thing it shares with
+    the collector is the renderer. It prints to stdout directly for that reason -
+    a viewer that wrote into the service's log file would corrupt the record it
+    exists to display.
+
+    Args:
+        endpoint_name: Entry in `user_configs/remote_endpoints.json`
+        interval: Seconds between readings, or None to decide from the URL
+
+    Returns:
+        Process exit code
+    """
+    try:
+        base_url, token = load_endpoint(endpoint_name)
+    except EndpointError as error:
+        print(f"Cannot watch '{endpoint_name}': {error}")
+        # The name alone is not enough: it has to arrive behind --endpoint,
+        # and a name printed without its flag reads like a command.
+        for name in error.alternatives:
+            print(f"  try: python -m python.main watch --endpoint {name}")
+        return 1
+
+    seconds = interval if interval else default_interval(base_url)
+
+    # QuickEdit belongs to whichever console carries a live display, and after
+    # issue #15 that is this one. In the service there is no console to protect;
+    # here a stray click would freeze the screen and, unlike before, nothing else.
+    disable_quick_edit()
+    enable_ansi_colours()
+
+    # The screen is full of box drawing and emoji, and a console still on a
+    # legacy code page cannot encode them. Rich then raises inside the update
+    # loop, where the handler swallows it and the screen simply stops moving -
+    # a viewer frozen by its own title, which reads exactly like a collector
+    # that died. A replacement character is a worse-looking screen and a true
+    # one. On a UTF-8 console this changes nothing.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+    # The URL, never the token. A command that needs the credential reads it from
+    # the overlay, so it never reaches a terminal, a screenshot or a bus message.
+    print(f"Watching {base_url} every {seconds:g}s - Ctrl+C to stop")
+
+    try:
+        asyncio.run(run_viewer(base_url, token, seconds))
+    except KeyboardInterrupt:
+        pass
+
+    return 0
+
+
 def cmd_status(config: AppConfig) -> None:
     """Show current status."""
     logger = get_logger("FiniexDataCollector")
@@ -1154,7 +1839,7 @@ def main():
 
     parser.add_argument(
         "command",
-        choices=["collect", "status"],
+        choices=["collect", "status", "watch"],
         help="Command to execute"
     )
 
@@ -1171,7 +1856,29 @@ def main():
         help="collect without the live display - the file log keeps the record"
     )
 
+    parser.add_argument(
+        "--endpoint",
+        type=str,
+        default="watch",
+        help="watch: which entry of user_configs/remote_endpoints.json to read"
+    )
+
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="watch: seconds between readings (default: 1 on loopback, 2 remote)"
+    )
+
     args = parser.parse_args()
+
+    # The viewer runs before any of this. It is a different program that happens
+    # to share an entry point: it must not load the collector's configuration and
+    # above all must not open the collector's log file, because on the production
+    # box the service already holds it and two writers on one log is how a record
+    # gets shredded by the thing that was watching it.
+    if args.command == "watch":
+        sys.exit(cmd_watch(args.endpoint, args.interval))
 
     # Load config
     try:
@@ -1183,7 +1890,7 @@ def main():
             print(f"Config not found: {config_path}")
             sys.exit(1)
     except Exception as e:
-        print(f"Failed to load config: {e}")
+        print(f"Failed to load config: {describe_exception(e)}")
         sys.exit(1)
 
     # Setup logging (from config - required section)
@@ -1201,11 +1908,16 @@ def main():
             cmd_status(config)
     except ConfigurationError as e:
         logger = get_logger("FiniexDataCollector")
-        logger.error(f"Configuration error: {e}")
-        sys.exit(1)
+        logger.error(f"Configuration error: {describe_exception(e)}")
+        # Deliberately not 1. A service manager restarts on exit by default, and
+        # restarting cannot fix a bad configuration or a directory another live
+        # instance already owns - it only produces the same failure at whatever
+        # interval the manager throttles to. Map this code to "stay stopped" and
+        # leave everything else on restart, where a restart is exactly the answer.
+        sys.exit(EXIT_CONFIGURATION)
     except Exception as e:
         logger = get_logger("FiniexDataCollector")
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal error: {describe_exception(e)}")
         sys.exit(1)
 
 

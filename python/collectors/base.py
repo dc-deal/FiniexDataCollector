@@ -7,10 +7,9 @@ Location: python/collectors/base.py
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import List, Optional, Callable
+from typing import Callable, List, Optional
 
 from python.types.tick_types import TickData
-from python.exceptions.collector_exceptions import CollectorHealthReport
 
 
 class AbstractCollector(ABC):
@@ -33,7 +32,6 @@ class AbstractCollector(ABC):
         self._is_running = False
         self._start_time: Optional[datetime] = None
         self._ticks_collected = 0
-        self._errors_count = 0
         self._on_tick_callback: Optional[Callable[[TickData], None]] = None
 
     @property
@@ -106,14 +104,4 @@ class AbstractCollector(ABC):
     @abstractmethod
     async def stop(self) -> None:
         """Stop tick collection gracefully."""
-        pass
-
-    @abstractmethod
-    def get_health_report(self) -> CollectorHealthReport:
-        """
-        Get current health status.
-
-        Returns:
-            CollectorHealthReport with current status
-        """
         pass

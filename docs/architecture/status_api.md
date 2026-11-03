@@ -20,7 +20,7 @@ anything — see *Boundaries* at the end.
 ## The routes
 
 ```
-GET /v1/health         open              is it alive, since when, is it connected
+GET /v1/health         open              is it alive, since when, is it collecting
 GET /v1/build          open              which code is running
 GET /openapi.json      open              the schema: every route and parameter
 GET /v1/status         status:detail     the complete live metrics
@@ -28,6 +28,7 @@ GET /v1/configs        config:effective  the settings actually in force
 GET /v1/archive        archive:index     what has been written, per file
 GET /v1/files/{name}   files:*           one finished archive file
 GET /v1/logs           logs:collector    one UTC day of the log, filtered
+GET /v1/outages        outages:history   every interruption of the feed in a window
 ```
 
 Three are open. That exemption is written down rather than implied, and the reasoning is
@@ -37,18 +38,42 @@ per route rather than a general policy — see below.
 
 ## `GET /v1/health` — open
 
-Liveness, uptime and connection state:
+Liveness, uptime and whether the collector is doing its job:
 
 ```json
 {
   "status": "ok",
+  "reasons": [],
   "websocket_status": "connected",
   "uptime_seconds": 241200,
   "started_at": "2026-09-12T05:00:00+00:00"
 }
 ```
 
-`status` is `ok` while the WebSocket is connected and `degraded` otherwise.
+`status` is derived on every call and never stored, and `reasons` names what it found:
+
+| `status` | `reasons` | Means |
+|---|---|---|
+| `failing` | `write_ahead_log_lost` | an open file has no write-ahead log; a hard stop would cost its buffer rather than one tick |
+| `failing` | `tick_handler_failing` | the latest tick of some symbol failed in the handler and is not in its file |
+| `degraded` | `not_connected` | the feed is down; a normal drop passes here for a few seconds |
+| `degraded` | `export_failed` | the last archive writer produced no file; its log is on disk and the next start recovers it |
+| `degraded` | `disk_low` | at most 20 % of the disk is free |
+| `ok` | none | none of the above |
+
+`failing` outranks `degraded`, and every reason that applies is listed. Until 2026-10-31 `status`
+was the WebSocket alone, so a full disk read `ok` for as long as the connection held.
+
+**A quiet market is not a reason.** A connected feed with no trade for an hour is a statement about
+the world, so no tick age enters this. A feed that really went silent needs no reason of its own:
+ticker and heartbeat traffic stop as well, and the watchdog turns that into `not_connected` within
+seconds.
+
+**A frozen event loop gives no answer at all**, because the route is served from that loop, and a
+probe's timeout is the correct reading of it.
+
+An outside check does not read this route directly: the [heartbeat](../operations/running_the_collector.md#the-outside-check)
+goes by the same answer from inside the process.
 
 **Open because an uptime probe carries no credential**, and a probe that needs one is a
 probe that stops working the day a token rotates.
@@ -66,6 +91,8 @@ asserts the absence rather than trusting the intent.
   "data_format_version": "<format version, from python/types/tick_types.py>",
   "commit": "0c2f88e",
   "python_version": "3.12.4",
+  "websockets_version": "16.0",
+  "websockets_client": "websockets.asyncio.client",
   "dirty": false,
   "started_at": "2026-09-15T10:00:00+00:00"
 }
@@ -92,6 +119,14 @@ Dockerfile pinned 3.12, CI ran 3.13, the development laptop had 3.13.7, and the 
 unknowable from anywhere, because no surface reported it. A suite green on a version
 production does not run proves less than it looks like.
 
+`websockets_version` and `websockets_client` say which websocket library answers the feed and
+which of its two client implementations `websockets.connect` resolves to. `requirements.txt`
+allows `websockets>=12.0`, and the two implementations end a connection differently where the
+drop detection lives - measured 2026-10-08, a close frame on a connection left open blocks
+`recv()` for 20 s in one and 10 s in the other, and a dead link's close takes 5 s or 15 s. How a
+drop is classified depends on which one runs; until these fields nothing said. A missing package
+metadata is reported as `null`, like a missing commit.
+
 Note `version` and `data_format_version` are different numbers and move for different
 reasons: the first is what this program is, the second is what its output files promise.
 
@@ -99,7 +134,16 @@ reasons: the first is what this program is, the second is what its output files 
 
 The schema: every route, every parameter, every response shape. FastAPI generates it, so
 it exists whether or not anyone decided on it — which is the reason it is named here.
-A consumer integrates against this rather than against a hand-kept list that drifts.
+
+**It is not reachable from outside, and this paragraph used to imply it was.** FastAPI mounts
+the schema at the application root, and the TLS edge forwards `/v1/*` only — so a consumer
+sees a 404 and cannot tell that apart from the schema being switched off. FiniexTestingIDE
+hit exactly that on 2026-09-17 and had recorded it as a gap on our side.
+
+The practical consequence: **the register and the architecture documents are the interface
+description** for anyone off the machine. Whether the schema should move under `/v1/` to
+become discoverable is an open decision, not an oversight — it lists route names, which tells
+a reader that an archive and a log exist.
 
 `/docs` and `/redoc`, the rendered consoles, are **off**. The schema is what a consumer
 needs; a try-it-out console on a diagnostic surface is a different thing and was never
@@ -128,6 +172,210 @@ Two deliberate exceptions:
   Those are computed properties, so a plain dataclass conversion drops them — and they are
   the part a monitor acts on.
 
+**`loop_lag` is the instrument for the one defect a tick file cannot show.** Everything the
+collector does shares one event loop, so a long piece of work anywhere delays the stamping of
+every tick that arrives meanwhile. In the file that reads as a `collected_msc` a few seconds
+later than it should — nothing says why — until the lag passes the importer's 30 s window and
+the whole file is refused. Ten samples a second measure how late the loop runs its own timers:
+`max_ms` with the moment it happened, `over_500ms`, the last reading and the sample count. On
+production 2026-09-20 the UTC day cut blocked the loop for 21 s; the archive writers now run as
+subprocesses because of it.
+
+**`exports` counts those subprocesses**: handed over, finished, failed, in flight, the last file
+with its tick count and duration, and the file a failure left owed. A failed export is not lost
+data — its write-ahead log stays on disk and the next start recovers it — but it is a file the
+archive does not have yet, and `last_failed_file` is what names it. `failed_in_a_row` falls back
+to zero when a writer next finishes a file, which is what lets `/v1/health` recover.
+
+**`heartbeat` says what the [outside check](../operations/running_the_collector.md#the-outside-check)
+cannot.** The check knows only that pings arrived. Here: `enabled`, `interval_seconds`, how many
+beats were `sent`, `withheld` because the collector was not `ok`, or `failed` on the way, and the
+time and text of the last withheld and the last failed one. An alarm with `withheld` rising is the
+collector; an alarm with `failed` rising is the network between it and the check. Neither field ever
+holds the address.
+
+**`streams`, `clock`, `max_ticks_per_file` and each symbol's `digits` are here so a screen can be
+drawn from this payload alone** — the first half of issue #15. The display used to read all four
+somewhere else: the subscribed streams, the `CollectionClock`'s correction counters and the
+broker specification's decimal places off live objects only a program inside the collector can
+reach, and the file limit out of the **local** `app_config.json`, on every frame. Both of those
+were defects rather than shortcuts. Two fixed places once rendered ADAUSD's 0.2103 and 0.2104
+both as 0.21, a screen asserting a spread the book did not have, so `digits` is `null` rather
+than `2` when the specification is unknown. And the file limit read locally was the wrong
+machine's: a laptop configured for 1,000 rendered a production file of 12,737 ticks as `1274 %`
+of a boundary that instance does not have.
+
+**This payload is a contract with the viewer**, not only a diagnostic. `python -m python.main
+watch` rebuilds the statistics object out of it and hands it to the same renderer the collector
+used to run itself — see [watching a collector](../operations/watching_a_collector.md). The
+conversion is structural in both directions, so a measurement added to `CollectorStats` reaches a
+remote screen without anyone editing a converter. The one thing that does need an entry is a
+field a freshly built object leaves empty, and a test names it rather than a screen.
+
+**`stalls` names what stopped the loop, and `gc` is usually the answer to that.** A stall above
+250 ms is written down with what was measured in its own window: how much of it was garbage
+collection and of which generation, how long the display's last redraw took, and how many archive
+writers were starting. The cause is stated only when one of those accounts for at least half of
+it — including, since 2026-09-21, what the tick handler itself cost inside that window and how
+many ticks it handled. That arm was added because ten production stalls said `unknown` with the
+display off, no export running and garbage collection accounting for under a tenth of them: every
+candidate the record could name had been ruled out, which left a consumer nobody was measuring.
+`tick_work` carries the running total those windows are differenced from, and since 2026-09-23
+also the longest **off-loop** task that finished inside the window. That arm exists because
+`asyncio.to_thread` moves the system calls off the loop and not the Python that walks their
+results: nine stalls of 285-395 ms carried no ticks, no collection, no export and no reconnect,
+against a folder scan whose worst reading the same day was 335 ms. Work can be off the loop and
+delay it anyway.
+
+**`exports` times the handover apart from the child.** `communicate()` awaits and yields;
+`create_subprocess_exec` does not, and nine or ten children go out inside one second at the UTC
+day cut. That cut cost 3397 ms of loop lag on 2026-09-23 against 856 ms the night before, and
+`spawn_max_ms` is what says whether the loop paid for the starting or the writing.
+
+The arms are checked most-specific first and they overlap on purpose — a collection triggered by
+an allocation inside the handler counts in both, and naming the collection is the more useful of
+the two answers. `exports_in_flight` is checked last because it is a presence count rather than a
+duration, and the weakest evidence must never outrank something that was timed. Otherwise the entry
+says `unknown`, because an attribution made from reasoning rather than
+measurement was wrong once already: the folder scan was blamed for 4.3 s stalls and then measured
+at 15 ms. `gc` carries the collections and worst pause per generation; the collector holds every
+tick of an open file in memory, which is what a generation-2 walk has to traverse.
+
+**`blocked_in` is the arm with no candidate list**, and it exists because every arm above answers
+for one suspect somebody thought to instrument. Twenty stalls across two production nights said
+`unknown` with all of them reading zero. A watchdog thread notices when the loop stops checking in
+and reads the loop thread's own stack while it is still stuck, so the entry names the file, line
+and function it was actually in, plus the caller that led there:
+
+```
+"blocked_in": "ssl.py:975 do_handshake < client_proto.py:88 connection_made < base_events.py:2050 _run_once"
+```
+
+It ranks **below every timed arm and above the two presence checks**. One sample says where the
+loop was at one moment inside the stall, not for how long — a stall made of many short operations
+can be sampled anywhere in it — so it is the strongest available hint and never a measurement.
+
+**And it is biased towards code that runs often.** Measured 2026-10-05: a 279 ms stall named
+`gc_watcher.py:106 time_spent_since`, which turned out to be a scan of a 64-entry deque - work that
+cannot take 279 ms. The lag monitor runs ten times a second, so when the cause is the process not
+being scheduled at all rather than one long operation, the sample lands on whatever runs most. Read
+a named frame as "the loop was here", not as "this is slow", and check the named code before
+believing it. The second reading of that week survived the check: `message_parser.is_heartbeat`
+really did decode every message a second time - removed 2026-10-08, when the receive loop began
+decoding each message once and dispatching on the result.
+
+**`worst_stalls` holds the session's largest, beside `stalls` which holds the latest.** A single
+recent-only ring discards the interesting entry first: measured 2026-09-24, the UTC day cut closed
+nine files at 00:00 and its stall was gone by 03:45, evicted by ten routine 300 ms stalls. The rare
+event is the one worth reading and the routine one is what overwrites it. Both lists are capped and
+a stall is normally in both.
+
+**`scans` says what the background work costs**, now that it no longer shows up as stamping
+lag: the folder walk and the disk reading run in a worker thread, and these are their last and
+worst durations. They were on the event loop until 2026-09-21, where they stalled it by up to
+4.3 s about once a minute — measured in the tick data itself, as arrival lag that was ours
+rather than the venue's. If `loop_lag` ever rises together with these, they are back on the
+loop.
+
+**`counter_check` is the guard on the tick counts this route serves.** The writer counts what
+goes into the file; the tick handler keeps a second count for the display, for `symbols[…]
+.current_file_ticks` here, and for the weekly report. Two counters for one number drift: these
+two disagreed by exactly one tick at every UTC day cut until 2026-09-20, and nothing compared
+them. Now they are compared once a minute — `mismatches` staying at zero is the evidence that
+the counts are sound, and anything else names the symbol and both numbers. The writer wins,
+because the writer is what the file will say.
+
+**`total_errors`, `total_warnings` and `recent_logs` count the log.** Every line written at
+ERROR or CRITICAL counts as an error, every WARNING as a warning, since the process started;
+`recent_logs` holds the most recent of them, as many as the display keeps. They are derived through a listener on the logger
+rather than raised by each error path, because the error paths never raised them: until
+2026-09-19 all three were constants — 0, 0 and empty — in every payload ever served, while the
+production log carried forced reconnects. Since 2026-10-08 a connection that ended is one
+WARNING line, `Connection ended: <how>` - except a silent link, whose only line is the silence
+watchdog's ERROR, `No messages for Ns`, and an end the code caused itself (`unexpected`, a
+detector that raised), which is that line at ERROR. Beyond that the Kraken client writes an ERROR
+for a subscription Kraken refused or left unanswered past 10 s, a stream that produced nothing at
+all (reconnected), a send that failed on a live connection, a failed connection attempt - one line
+per attempt, `Connection failed: <why>`, and none for an attempt a stop overtook - a failing tick
+handler, or the catch-all's `Unexpected error`. Until then every drop was the watchdog's ERROR and
+every failed attempt two, so `total_errors` counted reconnects and little else. Count drops from
+`reconnect_events` and the `[OUTAGE]` lines, not from log levels.
+
+**`reconnect_events` holds one record per interruption of the Kraken feed**, from the last message
+before it to the moment every subscription was answered again - or the 10 s deadline gave up on
+the stragglers - and on to the first trade per symbol. Until 2026-10-08 a record ran from the moment a drop was NOTICED to the socket handshake,
+by subtracting two wall-clock readings, with a reason that was always `connection_restored`: a drop
+recorded as 2.2 s had cost about 12 s of trades. In 136 of 137 drops between 2026-09-20 and
+2026-10-08 the socket was already closing when the 10 s silence watchdog found it. The four fields
+kept their names and got back the meaning their documentation always claimed:
+
+| Field | Meaning |
+|---|---|
+| `timestamp` | wall clock at the last message received before the drop |
+| `reconnected_at` | wall clock when every (stream, symbol) pair was settled again - acknowledged, refused, or delivering data - or when the 10 s subscription deadline gave up on the stragglers listed in `unconfirmed`; `null` while in progress |
+| `duration_seconds` | the data gap, last message to restored, on the monotonic clock; at a give-up it includes the wait for the deadline, while most pairs may have been back long before - `first_trade_after_ms` per symbol says when each was; `null` while in progress |
+| `reason` | how the drop was detected: `far_side_close`, `connection_lost`, `keepalive_timeout`, `library_failure`, `silence_watchdog`, `subscribe_unanswered`, `subscribe_send_failed` or `unexpected` |
+
+Beside them, every one defaulted so a viewer reading an older collector still draws:
+
+- `close_code`, `close_reason` - the frame Kraken sent; `null` when none arrived or it carried no
+  code, and `reason` `far_side_close` says a frame came. Never the 1006 the library reports for a
+  connection that ended without a frame, nor the 1005 it reports for a frame without a code: both
+  codes are the library's, and RFC 6455 forbids either on the wire.
+- `exception`, `cause` - what ended the connection and the error chained under it.
+- `detected_after_ms`, `handshake_after_ms`, `confirmed_after_ms` (per stream: the latest pair
+  acknowledged or confirmed by its data; a stream Kraken refused outright is absent) and
+  `first_trade_after_ms` - the timeline, each measured from the last message. `teardown_ms` is
+  the time spent dropping the old socket, about 0: a connection given up on is aborted rather
+  than closed politely for its 5 s timeout.
+- `attempts`, `backoff_s`, `last_failure` - one outage is one record however many attempts it
+  takes.
+- `rejected` - pairs Kraken refused; `unconfirmed` - pairs that neither answered nor delivered
+  data within 10 s and were listed rather than waited for.
+- `connection_age_s` - how long the dropped connection had been fully subscribed;
+  `kraken_connection_id` and `kraken_system` - from Kraken's status message on it.
+- `symbols[SYMBOL]` - `last_trade_id` before the drop, `first_trade_id` the first trade on the
+  connection that restored the feed, and `missing_trade_ids` - the ids in between that never
+  arrived: first - last - 1, less any trades an attempt that failed before the restoration
+  delivered in between (only possible with `attempts` above 1, in this outage or - with
+  `spans_previous_outage` - in the one before). Measured live and across file
+  boundaries. An **upper bound**: Kraken may allocate ids it never publishes as trades. `null`,
+  never 0, when an end is unknown - including a first trade that only came from an attempt that
+  never restored the feed. `ids_not_increasing` flags a replay anywhere in the outage, which
+  leaves the count unknown; `spans_previous_outage` flags a symbol whose first trade after the
+  previous outage was still unknown when that record closed - by the next drop, the deadline or a
+  refusal - and that did not trade before this drop: its gap starts at its last trade before that
+  outage and keeps what a failed attempt of it counted, so it covers both.
+- `resolved_by` - `all_symbols_traded`, `deadline` (15 minutes after restoration), `next_drop` or
+  `shutdown`; `''` while the record is still open.
+
+**`reconnect_in_progress`** is the outage whose feed is still down, until every subscription is
+answered again or the deadline gives up on the stragglers. A restored record still waiting for its
+first trades is already the newest entry in `reconnect_events`, with `resolved_by` `''`.
+**`reconnect_totals`** counts every outage since the process started - `count`, `by_reason`,
+`by_day` for the fourteen most recent UTC dates on which an outage occurred (not a calendar window:
+after a quiet stretch the oldest key can be weeks back, and the keys say how far),
+`gap_seconds_total`, `gap_seconds_max`, `missing_trade_ids_total`. The last adds what the records
+came to: a symbol whose first trade after an outage arrived only after its record had closed, with
+no new outage before it, adds nothing, and neither does what a failed attempt counted for a symbol
+whose first trade had not come when the process stopped - so on thin pairs it is lower than the
+ids actually missed.
+`reconnect_events` keeps only the latest twenty, because one record with
+nine symbols is about 3 KB and this payload is served every second while a viewer is open; its
+length stops being a count once it fills. `reconnect_totals` is `null` until the first outage -
+never a zero nobody measured. Nothing empties the history any more; until 2026-10-08 the weekly
+report and every Telegram `/report` did.
+
+**Every outage is also an `[OUTAGE]` line in the log, at INFO**: when the feed is restored
+(`"stage": "restored"`) and again when the record is resolved (`"stage": "resolved"`), through the
+same converter this route uses and with `"schema": 1`. The restored line survives a kill before the
+slowest symbol trades again; the resolved one is complete. An outage still open at a stop writes
+only the resolved line, with `reconnected_at` `null` and `resolved_by` `shutdown`. So an outage is
+counted by its resolved line, plus any restored line no resolved line followed - a kill. INFO
+means a file level of WARNING or above leaves the line out; the shipped level is INFO. History
+beyond what the process holds is `/v1/logs?day=...&contains=[OUTAGE]` - and a drop shortly before
+00:00 UTC can sit in the next day's file.
+
 Alongside the stats, the payload carries **`origin`** — the same block a tick file
 carries, field for field, so a consumer parses one structure and not two:
 
@@ -151,12 +399,18 @@ which the public repository already shows. An identity is the key a consumer's t
 registry is keyed on and names one machine's data directory; it belongs behind the same
 grant as the symbol names.
 
-The payload also carries **`process`** — resident memory, thread and socket counts and
+The payload also carries **`process`** — resident and private memory, thread and socket counts and
 consumed CPU time, sampled per request:
 
 ```json
-"process": {"available": true, "rss_mb": 118.4, "threads": 12, "open_sockets": 9, "cpu_seconds": 431.2}
+"process": {"available": true, "rss_mb": 118.4, "private_mb": 131.7, "threads": 12, "open_sockets": 9, "cpu_seconds": 431.2}
 ```
+
+**Two memory figures, because on Windows they disagree.** `rss_mb` is the working set, which the
+system trims under pressure; `private_mb` is what the process has committed. FiniexRAGEngine read
+5.2 GB of the first while its process held 7.2 GB. Where the platform does not report private
+memory, `private_mb` is `null`. Neither figure has a history here: the
+[memory trail](../operations/running_the_collector.md#the-memory-trail) is where the slope is.
 
 It is a reading rather than a record, which is why it is computed here and not stored in
 `CollectorStats`. It exists because the box is shared: three services on 8 GB with roughly 2.4 GB
@@ -195,7 +449,20 @@ in, in the body.
 ## `GET /v1/archive` — `archive:index`
 
 What the collector has written. Per file: symbol, tick count, the declared count from the
-summary, event and arrival bounds, format version, and the anchor counters.
+summary, event and arrival bounds, format version, the anchor counters — and **`instance_id`**,
+the identity that wrote it.
+
+The identity is in the register for the same reason `data_format_version` is: **a consumer has
+to be able to decide before transferring.** It costs nothing while one instance writes into a
+directory, and from the moment two have — which is what pointing a new deployment at an
+existing archive root does — "which files here did an identity I do not know write" would
+otherwise mean downloading the archive to read twelve characters out of each file. At 50,000
+ticks that is roughly 22 MB per answer. Requested by FiniexTestingIDE on 2026-09-17, with our
+own argument.
+
+It is **`null`** for anything below 1.7.0, and that is the honest answer rather than a gap:
+those files were written before provenance existed, and nothing can infer afterwards which
+instance wrote them.
 
 ```
 ?symbol=BTCUSD          one symbol
@@ -290,6 +557,52 @@ leaves the caller guessing. A malformed day is a 400.
 
 ---
 
+## `GET /v1/outages` — `outages:history`
+
+Every interruption of the Kraken feed that began in a window, oldest first. `/v1/status` keeps
+the latest twenty records, about two days at the October 2026 rate, and its totals start again
+with the process. A consumer comparing a month of its own feed against our capture needs every
+interruption in that month, and the trade ids each one cost.
+
+```
+GET /v1/outages?since=2026-11-24T00:00:00Z&until=2026-12-24T00:00:00Z
+```
+
+```json
+{
+  "since": "2026-11-24T00:00:00+00:00", "until": "2026-12-24T00:00:00+00:00",
+  "count": 241, "truncated": false, "next_since": null,
+  "days_read": ["2026-11-24", "..."], "days_missing": [], "unreadable_lines": 0,
+  "records": [
+    {"schema": 1, "stage": "resolved", "timestamp": "2026-11-24T03:12:07+00:00",
+     "reason": "connection_lost", "duration_seconds": 2.7, "detected_after_ms": 41.0,
+     "symbols": {"BTCUSD": {"last_trade_id": 1, "first_trade_id": 6, "missing_trade_ids": 4}},
+     "resolved_by": "all_symbols_traded", "logged_at": "2026-11-24T03:14:30+00:00"}
+  ]
+}
+```
+
+- **A record is the one `/v1/status` serves**, the same fields read back from the `[OUTAGE]` line
+  the log holds for it (see `reconnect_events` above). `stage` is the furthest the log reached:
+  `resolved` normally, `restored` when the process ended before the record was complete.
+  `logged_at` is when that line was written.
+- **The window is on the outage start.** `since` defaults to seven days before `until`, `until`
+  to now; both are UTC, and a time without a zone is taken as UTC. At most 62 days per request.
+  A reversed or longer window is a 400.
+- **Nothing is invented for a gap in the files.** `days_missing` names each day without a log
+  file. That is a day nothing can be said about, not a day without outages. A torn line, as a hard
+  stop leaves one, is counted in `unreadable_lines`.
+- **At most 2,000 records**; `truncated` says when there were more, and `next_since` is where the
+  next request starts.
+- **The history starts on 2026-10-10**, with the build that writes the lines, and reaches as far
+  back as the log files do: nothing deletes them.
+
+**Its own surface, `outages`.** The log says far more than a consumer needs, and a token that
+holds the history does not hold the log. A day that has ended does not change, so its records
+are parsed once per process and kept; only a file that grew is read again.
+
+---
+
 ## Transfer
 
 Responses above 1 KB are gzipped when the caller asks for it. Measured on a real archive
@@ -327,6 +640,14 @@ construction rather than by discipline.
 **It cannot take the collector down.** The server runs as a task on the collector's own
 event loop with its own exception guard. A status surface that stops the collection is
 worse than no status surface.
+
+**It can stop listening without stopping, on Windows.** When `accept()` raises, CPython's
+proactor loop (3.13 and 3.14 alike) closes the listening socket for good and tells only the
+loop's exception handler; uvicorn keeps running on a socket that no longer exists, and the edge
+answers 502. The collector installs a handler that writes this into the log file as an ERROR —
+asyncio's default would have printed it to stderr, outside the log — so the cause is on record.
+It does not bring the API back: that takes a collector restart. Not observed in production so
+far.
 
 **It is off unless `api.enabled` is set**, and it binds loopback. The port never gets a
 firewall rule; reaching it from elsewhere is the reverse proxy's job.

@@ -16,6 +16,7 @@ from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field, field_validator, ValidationError
 
 from python.exceptions.collector_exceptions import ConfigurationError
+from python.utils.logging_setup import describe_exception
 
 
 class LoggingConfig(BaseModel):
@@ -102,7 +103,8 @@ class KrakenCollectorConfig(BaseModel):
         streams: List of streams (ticker, trade)
         reconnect_max_delay_seconds: Maximum reconnect delay
         reconnect_initial_delay_seconds: Initial reconnect delay
-        heartbeat_interval_seconds: Heartbeat check interval
+        stale_after_seconds: Silence, heartbeats included, after which the
+            connection is closed and reopened; Kraken sends one every second
         max_ticks_per_file: Maximum ticks before file rotation
     """
     enabled: bool = True
@@ -113,7 +115,7 @@ class KrakenCollectorConfig(BaseModel):
     streams: List[str] = Field(default=["ticker"])
     reconnect_max_delay_seconds: int = Field(default=60, ge=1, le=300)
     reconnect_initial_delay_seconds: int = Field(default=1, ge=1, le=60)
-    heartbeat_interval_seconds: int = Field(default=30, ge=10, le=120)
+    stale_after_seconds: int = Field(default=10, ge=3, le=60)
     max_ticks_per_file: int = Field(default=50000, ge=100, le=1000000)
 
     @field_validator('symbols')
@@ -196,10 +198,33 @@ class MonitoringConfig(BaseModel):
         disk_space_check_interval_seconds: Disk space check interval
         folder_scan_interval_seconds: Folder file count scan interval
         reconnect_alert_cooldown_minutes: Minutes to wait before next reconnect alert
+        reconnect_alert_min_seconds: Data gap - last message before the drop to
+            the feed restored - below which an outage is logged and not
+            alerted. Since 2026-10-08 a closed socket is noticed at once and a
+            normal drop costs a few seconds - a silent link, which only the 10 s
+            watchdog finds, still well under 30 - so the default of 30 s means
+            reconnecting itself is failing or the link stayed dead. (Until then the threshold was justified as the lag
+            window that gets a whole file refused; that was wrong - an outage
+            shortens a file. The figures of 2026-09-21/22 behind it, 1.3 to
+            7.2 s per drop, left out the 10-11 s before each was noticed.)
+        reconnect_alert_cluster: How many reconnects inside one hour are worth
+            an alert whatever their length. A host that blips every two hours is
+            weather; one that blips four times an hour is degrading, and that
+            distinction is the only thing a short reconnect can still tell you.
+        heartbeat_url: Ping address of an outside check, such as healthchecks.io,
+            which alarms when the pings stop. Empty is off. It belongs in
+            user_configs/, never in the tracked file: whoever holds it can report
+            this collector healthy.
+        heartbeat_interval_seconds: Seconds between pings. Keep the check's period
+            well above it, so that one lost ping is not an alarm.
     """
     disk_space_check_interval_seconds: int = Field(default=60, ge=10, le=600)
     folder_scan_interval_seconds: int = Field(default=60, ge=10, le=600)
     reconnect_alert_cooldown_minutes: int = Field(default=30, ge=1, le=1440)
+    reconnect_alert_min_seconds: float = Field(default=30.0, ge=0.0, le=3600.0)
+    reconnect_alert_cluster: int = Field(default=4, ge=2, le=100)
+    heartbeat_url: str = ""
+    heartbeat_interval_seconds: int = Field(default=60, ge=30, le=3600)
 
 
 class AppConfig(BaseModel):
@@ -275,7 +300,7 @@ class ConfigLoader:
                 base_data = json.load(f)
         except json.JSONDecodeError as e:
             raise ConfigurationError(
-                f"Invalid JSON in config file: {e}",
+                f"Invalid JSON in config file: {describe_exception(e)}",
                 config_file=str(self._config_path)
             )
 
@@ -287,7 +312,7 @@ class ConfigLoader:
                     user_data = json.load(f)
             except json.JSONDecodeError as e:
                 raise ConfigurationError(
-                    f"Invalid JSON in user config: {e}",
+                    f"Invalid JSON in user config: {describe_exception(e)}",
                     config_file=str(self.USER_CONFIG_PATH)
                 )
 
