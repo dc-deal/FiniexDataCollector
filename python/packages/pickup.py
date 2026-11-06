@@ -80,7 +80,9 @@ def download(session: Any, url: str, headers: Dict[str, str], target: Path, size
                 handle.write(chunk)
 
     if have < size:
-        if hasattr(session, "stream"):
+        # httpx streams through a method; a requests.Session has a `stream`
+        # attribute too, but a flag - asking whether it can be called tells them apart.
+        if callable(getattr(session, "stream", None)):
             with session.stream("GET", url, headers=request_headers) as response:
                 write(response.status_code, response.iter_bytes())
         else:

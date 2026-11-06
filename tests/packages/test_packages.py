@@ -1280,6 +1280,46 @@ def test_a_dev_receipt_stands_on_nothing_not_even_a_real_one(
     assert receive(served, OPERATOR, download=False).status_code == 409
 
 
+def test_the_client_downloads_through_a_requests_session(served: Dict[str, Any], tmp_path: Path) -> None:
+    """
+    The client runs on `requests` outside the tests, and a requests.Session carries
+    a `stream` attribute that is a flag, not a method. Found by the first run against
+    production; the tests had only ever driven the httpx client.
+    """
+    import requests
+
+    from python.packages.pickup import download
+
+    whole = served["store"].find(served["id"])["zip"].read_bytes()
+    client = served["client"]
+
+    class Response:
+        def __init__(self, status: int, body: bytes) -> None:
+            self.status_code, self._body = status, body
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            pass
+
+        def iter_content(self, size: int) -> Any:
+            for at in range(0, len(self._body), size):
+                yield self._body[at:at + size]
+
+    class Session(requests.Session):
+        def get(self, url: str, **kwargs: Any) -> Any:
+            answer = client.get(url.replace("http://testserver", ""),
+                                headers=kwargs.get("headers"))
+            return Response(answer.status_code, answer.content)
+
+    target = tmp_path / "x.zip"
+    download(Session(), f"http://testserver/v1/packages/{served['id']}/zip",
+             bearer(READER), target, len(whole))
+
+    assert target.read_bytes() == whole
+
+
 def test_the_client_checks_every_file_not_only_the_zip(served: Dict[str, Any], tmp_path: Path) -> None:
     """A zip whose own hash is right but whose manifest names other bytes is not taken."""
     from python.packages.pickup import PickupError, verify
