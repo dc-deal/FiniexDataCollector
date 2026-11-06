@@ -484,6 +484,15 @@ format, and a consumer reimplementing it would be reimplementing ours.
 `.jsonl.part` without its archive file: the run that is collecting now, or a crashed one
 waiting for recovery.
 
+**But it parses every file it lists, inside the collector, on every call.** Metadata only is
+what the answer holds, not what the route reads: `json.loads` takes the whole file to reach the
+summary. Measured on 2026-11-05, when one unfiltered call met 165 files: the collector's event
+loop lagged over 500 ms 35 times in ten minutes, the longest 1.5 s, with 4.3 s of garbage
+collection, and ticks in those minutes were stamped up to 1.5 s late. Production has refused the
+route at the edge since that day. Until it reads each finished file once, and outside the
+collector's process, a consumer transferring the archive uses the
+[tick packages](../operations/tick_packages.md) instead.
+
 ## `GET /v1/files/{name}` — `files:*`
 
 Hands out one finished archive file. This is the transfer that replaces SFTP, which would

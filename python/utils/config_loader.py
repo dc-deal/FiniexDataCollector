@@ -10,10 +10,12 @@ Location: python/utils/config_loader.py
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
-from pydantic import BaseModel, Field, field_validator, ValidationError
+from pydantic import (BaseModel, Field, ValidationError, field_validator,
+                      model_validator)
 
 from python.exceptions.collector_exceptions import ConfigurationError
 from python.utils.logging_setup import describe_exception
@@ -190,6 +192,102 @@ class ApiConfig(BaseModel):
     tokens: Dict[str, Any] = Field(default_factory=dict)
 
 
+class PackageSourceConfig(BaseModel):
+    """
+    One collector whose finished files the package service seals.
+
+    Args:
+        root: The folder holding the collector's `instance.json`. It is what proves
+            the packer reads the right folder: no mint, no package
+        subdir: Where the `*_ticks.json` files lie, relative to `root`. Empty when
+            they lie in `root` itself, as MT5's do; `kraken` for this collector,
+            whose identity sits one level above its files
+        log_dir: The collector's own log folder, for the outage records and process
+            starts within a package's span. Empty when the producer writes no such
+            records, and then the manifest says `null` rather than "none"
+    """
+    root: str
+    subdir: str = ""
+    log_dir: str = ""
+
+    @field_validator("subdir")
+    @classmethod
+    def subdir_stays_inside_root(cls, value: str) -> str:
+        """A subdir that climbs out would read files the mint does not vouch for."""
+        parts = Path(value).parts
+        if Path(value).is_absolute() or ".." in parts:
+            raise ValueError(
+                f"subdir must be a folder inside root, got {value!r}")
+        return value
+
+
+class PackagesConfig(BaseModel):
+    """
+    The package service: weekly sealed zips of finished tick files, served to a
+    consumer. A program of its own beside the collector - it reads the collector's
+    files and never touches the process.
+
+    Args:
+        output_dir: Where packages are written. Outside every checkout, so a fresh
+            clone never meets it
+        host: Interface to bind. Loopback; the edge forwards `/v1/packages*` here
+        port: Loopback port, well clear of the collector's 8110
+        weekday: Day of the weekly run, UTC
+        hour: Hour of the weekly run, UTC
+        minute: Minute of the weekly run
+        min_free_percent: Free disk share that must remain after a package is
+            written. The collector reports `disk_low` at 20 %, so a package must
+            never be what pushes it there
+        sources: `name -> PackageSourceConfig`; the name becomes the package id's
+            first part, e.g. `kraken`, `mt5`
+        tokens: Consumer credentials, `name -> {token, grants, active, note}`, with
+            the surfaces `packages` and `receipts`. Belongs in user_configs/, never
+            in the tracked file
+    """
+    output_dir: str = ""
+    host: str = "127.0.0.1"
+    port: int = Field(default=8120, ge=1024, le=65535)
+    weekday: str = "monday"
+    hour: int = Field(default=1, ge=0, le=23)
+    minute: int = Field(default=0, ge=0, le=59)
+    min_free_percent: float = Field(default=30.0, ge=0.0, le=95.0)
+    sources: Dict[str, PackageSourceConfig] = Field(default_factory=dict)
+    tokens: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("weekday")
+    @classmethod
+    def weekday_is_a_day(cls, value: str) -> str:
+        """The schedule's day, by name."""
+        days = ("monday", "tuesday", "wednesday", "thursday", "friday",
+                "saturday", "sunday")
+        if value.lower() not in days:
+            raise ValueError(f"weekday must be one of {days}, got {value!r}")
+        return value.lower()
+
+    @field_validator("sources")
+    @classmethod
+    def source_names_are_ids(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        """A source name is part of every package id, so it is kept plain."""
+        for name in value:
+            if not re.fullmatch(r"[a-z0-9]+", name):
+                raise ValueError(
+                    f"source name must be lowercase letters and digits, got {name!r}")
+        return value
+
+    @model_validator(mode="after")
+    def not_in_the_quiet_minutes(self) -> "PackagesConfig":
+        """
+        23:55 to 00:15 UTC belongs to the day cut and to FiniexTestingIDE's daily
+        order; a weekly run is never scheduled into it.
+        """
+        minute_of_day = self.hour * 60 + self.minute
+        if minute_of_day >= 23 * 60 + 55 or minute_of_day <= 15:
+            raise ValueError(
+                f"the weekly run at {self.hour:02d}:{self.minute:02d} UTC falls "
+                f"into 23:55-00:15 UTC, which stays quiet")
+        return self
+
+
 class MonitoringConfig(BaseModel):
     """
     Monitoring configuration for disk space and folder scanning.
@@ -242,6 +340,8 @@ class AppConfig(BaseModel):
         scheduler: Scheduler configuration
         monitoring: Monitoring configuration
         api: Status API configuration
+        packages: The package service, a separate program; the collector never
+            reads this block
     """
     app_name: str = "FiniexDataCollector"
     version: str
@@ -254,6 +354,7 @@ class AppConfig(BaseModel):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
+    packages: PackagesConfig = Field(default_factory=PackagesConfig)
 
 
 class ConfigLoader:

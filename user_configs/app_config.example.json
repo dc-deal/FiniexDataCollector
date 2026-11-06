@@ -59,5 +59,31 @@
         "note": "Diagnostics from a session - archive listings, log excerpts, file transfers."
       }
     }
+  },
+  "packages": {
+    "_comment": "Read only by the package service (python -m python.packages), which runs from a checkout of its own. Put this block in THAT checkout's user_configs, with absolute paths; the collector never reads it. docs/operations/tick_packages.md.",
+    "output_dir": "C:\\FiniexPackages",
+    "port": 8120,
+    "weekday": "monday",
+    "hour": 1,
+    "minute": 0,
+    "min_free_percent": 30,
+    "sources": {
+      "kraken": {
+        "root": "<collector checkout>\\data\\raw",
+        "subdir": "kraken",
+        "log_dir": "<collector checkout>\\logs"
+      },
+      "mt5": {
+        "root": "<terminal data folder>\\MQL5\\Files"
+      }
+    },
+    "tokens": {
+      "<consumer>": {
+        "token": "<40 hex characters>",
+        "grants": ["packages:*", "receipts:*"],
+        "note": "Fetches and acknowledges packages. Its own vocabulary: a collector grant is refused here."
+      }
+    }
   }
 }
