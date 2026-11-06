@@ -61,13 +61,16 @@
     }
   },
   "packages": {
-    "_comment": "Read only by the package service (python -m python.packages), which runs from a checkout of its own. Put this block in THAT checkout's user_configs, with absolute paths; the collector never reads it. docs/operations/tick_packages.md.",
-    "output_dir": "C:\\FiniexPackages",
+    "_comment": "Read only by the package service (python -m python.packages), which runs from a checkout of its own. Put this block in THAT checkout's user_configs, with absolute source paths; the collector never reads it. Its own folders default to ./data/packages and ./data/originals. docs/operations/tick_packages.md, docs/operations/package_lifecycle.md.",
     "port": 8120,
-    "weekday": "monday",
-    "hour": 1,
+    "weekday": "sunday",
+    "hour": 20,
     "minute": 0,
     "min_free_percent": 30,
+    "receipt_overdue_days": 14,
+    "disposable_warn_gb": 10,
+    "purge_target_free_percent": 50,
+    "heartbeat_url": "",
     "sources": {
       "kraken": {
         "root": "<collector checkout>\\data\\raw",
@@ -83,6 +86,11 @@
         "token": "<40 hex characters>",
         "grants": ["packages:*", "receipts:*"],
         "note": "Fetches and acknowledges packages. Its own vocabulary: a collector grant is refused here."
+      },
+      "<operator>": {
+        "token": "<40 hex characters, a different one>",
+        "grants": ["packages:*", "purge:originals"],
+        "note": "Reads everything and may purge confirmed originals. Never give purge to a consumer."
       }
     }
   }

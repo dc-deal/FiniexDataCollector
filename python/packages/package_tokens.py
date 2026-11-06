@@ -21,11 +21,13 @@ class PackageToken(ConsumerTokenBase):
     """
     One consumer's credential for the package service.
 
-    `packages` reads: the list, a manifest, a zip. `receipts` writes the one thing
-    this service accepts from outside, an acknowledgement - a separate surface, so
-    a token can fetch packages without being able to mark them received.
+    `packages` reads: the list, a manifest, a zip, the ledger. `receipts` writes an
+    acknowledgement - a separate surface, so a token can fetch packages without
+    being able to mark them received. `purge` deletes confirmed originals - the
+    one destructive thing this service does, and the operator's alone: a consumer
+    that can confirm a package must not also be able to make the evidence go.
     """
-    GRANT_SURFACES = ("packages", "receipts")
+    GRANT_SURFACES = ("packages", "receipts", "purge")
 
 
 def load_package_tokens(configured: Optional[Dict[str, Any]] = None) -> TokenRegistry:

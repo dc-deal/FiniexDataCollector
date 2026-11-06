@@ -4,11 +4,16 @@ Where packages live, and the only record of which file went into which.
 
 One folder per collector under the output directory:
 
-    <output_dir>/<collector>/<id>.zip
-                            /<id>.manifest.json   the package's commit point
-                            /<id>.receipt.json    the consumer's acknowledgement
-                            /last_run.json        what the latest run did, and why
+    <output_dir>/<collector>/ready/<id>.zip                waiting for the consumer
+                                  /<id>.manifest.json      the package's commit point
+                            /delivered/<id>.zip            confirmed with the right hash
+                                      /<id>.manifest.json
+                                      /<id>.receipt.json   the consumer's acknowledgement
+                            /last_run.json                 what the latest run did, and why
                             /.pack.lock
+
+A package moves from `ready/` to `delivered/` once - zip first, manifest last, so
+that a move cut short is found and finished from either side.
 
 **The manifests are the ledger.** A file is packed when a manifest names it, and
 nowhere else is that recorded - so the record cannot disagree with the packages it
@@ -41,6 +46,8 @@ ZIP_SUFFIX = ".zip"
 PART_SUFFIX = ".part"
 LAST_RUN = "last_run.json"
 LOCK_NAME = ".pack.lock"
+READY = "ready"
+DELIVERED = "delivered"
 
 # psutil's creation time crosses a JSON round trip; see instance_lock.py for why the
 # window is this narrow.
@@ -155,6 +162,14 @@ class PackageStore:
         """The package folder of one collector."""
         return self._root / collector
 
+    def ready(self, collector: str) -> Path:
+        """Where a collector's packages wait for the consumer."""
+        return self.folder(collector) / READY
+
+    def delivered(self, collector: str) -> Path:
+        """Where a collector's confirmed packages are kept."""
+        return self.folder(collector) / DELIVERED
+
     # ------------------------------------------------------------------ reading
 
     def manifests(self, collector: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -167,16 +182,18 @@ class PackageStore:
         Returns:
             The manifests, ordered by collector and sequence
         """
-        folders = [self.folder(collector)] if collector else (
+        collectors = [self.folder(collector)] if collector else (
             sorted(p for p in self._root.iterdir() if p.is_dir()) if self._root.exists() else [])
-        found: List[Dict[str, Any]] = []
-        for folder in folders:
-            if not folder.exists():
-                continue
-            for path in folder.glob(f"*{MANIFEST_SUFFIX}"):
-                if PACKAGE_ID.match(path.name[:-len(MANIFEST_SUFFIX)]):
-                    found.append(self._read_manifest(path))
-        return sorted(found, key=lambda m: (m["collector"], m["sequence"]))
+        found: Dict[str, Dict[str, Any]] = {}
+        for folder in collectors:
+            for state in (READY, DELIVERED):
+                if not (folder / state).exists():
+                    continue
+                for path in (folder / state).glob(f"*{MANIFEST_SUFFIX}"):
+                    if PACKAGE_ID.match(path.name[:-len(MANIFEST_SUFFIX)]):
+                        manifest = self._read_manifest(path)
+                        found[manifest["package_id"]] = manifest
+        return sorted(found.values(), key=lambda m: (m["collector"], m["sequence"]))
 
     def _read_manifest(self, path: Path) -> Dict[str, Any]:
         """One manifest, from the cache while the file is unchanged."""
@@ -203,22 +220,56 @@ class PackageStore:
             package_id: e.g. `kraken-0003-20261116`
 
         Returns:
-            Paths of its zip, manifest and receipt, or None when there is no such
+            Paths of its zip, manifest and receipt, and its state (`ready` or
+            `delivered`, wherever the manifest is), or None when there is no such
             committed package - including any id that is not one, so a crafted
-            name never becomes a path
+            name never becomes a path. Mid-move, a zip or receipt already on the
+            other side is found there.
         """
         match = PACKAGE_ID.match(package_id or "")
         if match is None:
             return None
-        folder = self.folder(match["collector"])
-        paths = {
-            "zip": folder / f"{package_id}{ZIP_SUFFIX}",
-            "manifest": folder / f"{package_id}{MANIFEST_SUFFIX}",
-            "receipt": folder / f"{package_id}{RECEIPT_SUFFIX}",
-        }
-        if not paths["manifest"].exists() or not paths["zip"].exists():
-            return None
-        return paths
+        collector = match["collector"]
+        folders = {READY: self.ready(
+            collector), DELIVERED: self.delivered(collector)}
+        for state, folder in folders.items():
+            if not (folder / f"{package_id}{MANIFEST_SUFFIX}").exists():
+                continue
+            other = folders[DELIVERED if state == READY else READY]
+            paths: Dict[str, Any] = {"state": state,
+                                     "manifest": folder / f"{package_id}{MANIFEST_SUFFIX}"}
+            for key, suffix in (("zip", ZIP_SUFFIX), ("receipt", RECEIPT_SUFFIX)):
+                here, there = folder / \
+                    f"{package_id}{suffix}", other / f"{package_id}{suffix}"
+                paths[key] = there if not here.exists(
+                ) and there.exists() else here
+            if not paths["zip"].exists():
+                return None
+            return paths
+        return None
+
+    def deliver(self, package_id: str) -> bool:
+        """
+        Move a package from `ready/` to `delivered/`: zip, receipt, manifest last.
+
+        Idempotent, and it finishes a move a crash cut short.
+
+        Returns:
+            True when anything moved
+        """
+        match = PACKAGE_ID.match(package_id or "")
+        if match is None:
+            return False
+        source, target = self.ready(
+            match["collector"]), self.delivered(match["collector"])
+        target.mkdir(parents=True, exist_ok=True)
+        moved = False
+        for suffix in (ZIP_SUFFIX, RECEIPT_SUFFIX, MANIFEST_SUFFIX):
+            path = source / f"{package_id}{suffix}"
+            if path.exists():
+                os.replace(path, target / path.name)
+                moved = True
+        return moved
 
     def manifest(self, package_id: str) -> Optional[Dict[str, Any]]:
         """The manifest of one committed package, or None."""
@@ -276,7 +327,7 @@ class PackageStore:
         Returns:
             Names removed
         """
-        folder = self.folder(collector)
+        folder = self.ready(collector)
         removed: List[str] = []
         if not folder.exists():
             return removed
@@ -285,7 +336,9 @@ class PackageStore:
             removed.append(path.name)
         for path in folder.glob(f"*{ZIP_SUFFIX}"):
             stem = path.name[:-len(ZIP_SUFFIX)]
-            if not (folder / f"{stem}{MANIFEST_SUFFIX}").exists():
+            # A manifest on either side makes it a package, mid-move or not.
+            if not any((side / f"{stem}{MANIFEST_SUFFIX}").exists()
+                       for side in (folder, self.delivered(collector))):
                 path.unlink()
                 removed.append(path.name)
         return removed
@@ -297,7 +350,8 @@ class PackageStore:
         write_json_atomically(folder / LAST_RUN, record)
 
     def write_receipt(
-        self, package_id: str, consumer: str, note: str = ""
+        self, package_id: str, consumer: str, note: str = "",
+        zip_sha256: Optional[str] = None
     ) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
         Mark a package received. The first acknowledgement stands.
@@ -309,6 +363,8 @@ class PackageStore:
             package_id: The package
             consumer: The token name that acknowledged
             note: Free text from the consumer, kept as given
+            zip_sha256: The hash the consumer reported, already checked against the
+                manifest; None when it reported none
 
         Returns:
             (the receipt, True when this call created it), or (None, False) when
@@ -322,6 +378,7 @@ class PackageStore:
             "received_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "consumer": consumer,
             "note": note,
+            "zip_sha256": zip_sha256,
         }
         # Written in full under a name of its own, then linked into place. A link
         # refuses an existing target on every platform, so two acknowledgements

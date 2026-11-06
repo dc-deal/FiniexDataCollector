@@ -34,6 +34,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from python.api.log_reader import log_path
 from python.api.outage_history import MAX_DAYS, read_outages
+from python.packages.ledger import Ledger, packed_fields
+from python.packages.lifecycle import stage_package
 from python.packages.package_store import (MANIFEST_SUFFIX, PART_SUFFIX,
                                            ZIP_SUFFIX, PackageStore, PackLock,
                                            PackLockHeld, write_json_atomically)
@@ -230,7 +232,8 @@ def pack_source(
     cutoff: Optional[datetime] = None,
     now: Optional[datetime] = None,
     packer: Optional[Dict[str, Any]] = None,
-    log: Callable[[str], None] = lambda message: None
+    log: Callable[[str], None] = lambda message: None,
+    originals_root: Optional[Path] = None
 ) -> Dict[str, Any]:
     """
     Build the next package of one collector.
@@ -245,6 +248,8 @@ def pack_source(
         now: The current time, for tests
         packer: What built the package (version, commit), copied into the manifest
         log: Where progress lines go
+        originals_root: Where the packed originals go (stage A). None leaves them
+            in the collector's folder
 
     Returns:
         The run's record: `packed`, `nothing_new`, `refused` or `failed`, with the
@@ -278,7 +283,7 @@ def pack_source(
     try:
         with PackLock(store.folder(name)):
             return _pack_locked(name, config, store, min_free_percent, cutoff, now,
-                                packer or {}, record, finish, log)
+                                packer or {}, record, finish, log, originals_root)
     except PackLockHeld as e:
         return finish("refused", reason=str(e))
     except Exception as e:
@@ -295,20 +300,32 @@ def _pack_locked(
     packer: Dict[str, Any],
     record: Dict[str, Any],
     finish: Callable[..., Dict[str, Any]],
-    log: Callable[[str], None]
+    log: Callable[[str], None],
+    originals_root: Optional[Path]
 ) -> Dict[str, Any]:
     """The run itself, with the collector's lock held."""
     removed = store.clean_incomplete(name)
     if removed:
         record["removed_incomplete"] = removed
 
-    check = check_source(name, config, store, min_free_percent)
+    # Seeded under this collector's lock, so a package of it cannot be committed
+    # between the seed's look and its write - which would book it twice.
+    ledger = Ledger(store.root)
+    try:
+        late = ledger.seed(store.manifests(name))
+        if late:
+            record["entered_late"] = late
+    except OSError as e:
+        log(f"[LEDGER] {name}: could not seed: {describe_exception(e)}")
+
+    check = check_source(name, config, store, min_free_percent, originals_root)
     record["check"] = check.summary()
     if not check.ok:
         return finish("refused", reason=check.reason)
 
     package_id, previous_id, sequence = store.next_id(name, cutoff)
-    folder = store.folder(name)
+    folder = store.ready(name)
+    folder.mkdir(parents=True, exist_ok=True)
     zip_part = folder / f"{package_id}{ZIP_SUFFIX}{PART_SUFFIX}"
     zip_path = folder / f"{package_id}{ZIP_SUFFIX}"
     cutoff_msc = _msc(cutoff)
@@ -359,10 +376,18 @@ def _pack_locked(
             zip_part.unlink()
             return finish("nothing_new", excluded=excluded, held_for_next=len(held))
 
+        # The self-check: every member read back out of the finished zip must be
+        # the bytes that were hashed - not only a CRC that matches, the same SHA-256.
+        # The originals leave their folder on the strength of this.
+        expected = {m["name"]: m["sha256"] for m in members}
         with zipfile.ZipFile(zip_part) as archive:
-            broken = archive.testzip()
-        if broken is not None:
-            raise OSError(f"the written zip fails its own check at {broken}")
+            if sorted(archive.namelist()) != sorted(expected):
+                raise OSError(
+                    "the written zip does not hold exactly the packed files")
+            for info in archive.infolist():
+                if hashlib.sha256(archive.read(info)).hexdigest() != expected[info.filename]:
+                    raise OSError(
+                        f"the written zip gives back other bytes for {info.filename}")
         _fsync(zip_part)
         zip_sha256 = _sha256_of(zip_part)
         zip_size = zip_part.stat().st_size
@@ -414,5 +439,20 @@ def _pack_locked(
     }
     write_json_atomically(folder / f"{package_id}{MANIFEST_SUFFIX}", manifest)
 
+    # After the commit, never before: a ledger line for a package that does not
+    # exist would be worse than a late one. If this write fails, the next seed
+    # enters it from the manifest.
+    try:
+        ledger.append("packed", **packed_fields(manifest))
+    except OSError as e:
+        log(f"[LEDGER] {name}: could not book {package_id}: {describe_exception(e)}")
+
+    # Stage A: the originals leave the collector's folder for `awaiting/`. Moved,
+    # not deleted - until the consumer confirms, they and the zip are two copies.
+    staged: Dict[str, Any] = {}
+    if originals_root is not None:
+        staged = stage_package(name, config, manifest, originals_root, ledger)
+
     return finish("packed", package_id=package_id, member_count=len(members),
-                  zip_size_bytes=zip_size, excluded=len(excluded), held_for_next=len(held))
+                  zip_size_bytes=zip_size, excluded=len(excluded), held_for_next=len(held),
+                  staged=len(staged.get("moved", [])), not_staged=staged.get("skipped", []))

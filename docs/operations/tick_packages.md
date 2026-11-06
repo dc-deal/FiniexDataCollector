@@ -5,9 +5,12 @@ it, import it, file the zip unchanged as its raw source of truth, acknowledge it
 by hand is where the errors came from. The package service does the packing, once a week, for
 every collector on the machine, the Kraken collector and the MT5 terminal's collector alike.
 
-**Not in here:** the collector's own routes ([status_api.md](../architecture/status_api.md)),
-what a tick file states about itself ([output_contract.md](../architecture/output_contract.md)),
-and how the collector runs as a service ([running_as_a_service.md](running_as_a_service.md)).
+**Not in here:** what happens to a package and its original files after it is built - stage A,
+the receipt, stage B, `purge` - which is [package_lifecycle.md](package_lifecycle.md), with a
+walk through the folders; the collector's own routes
+([status_api.md](../architecture/status_api.md)); what a tick file states about itself
+([output_contract.md](../architecture/output_contract.md)); and how the collector runs as a
+service ([running_as_a_service.md](running_as_a_service.md)).
 
 ---
 
@@ -21,7 +24,8 @@ and how the collector runs as a service ([running_as_a_service.md](running_as_a_
 - **An id `<collector>-<sequence>-<cutoff date>`**, e.g. `kraken-0003-20261123`. Each manifest
   names its predecessor in `previous_package_id`, so a missing package shows as a broken chain.
 - **Nothing listed ever changes.** Not the zip, not the manifest. The consumer's
-  acknowledgement is a file of its own, and it deletes nothing.
+  acknowledgement is a file of its own. A confirmed package moves from `ready/` to
+  `delivered/`, its bytes unchanged, and stays listed.
 
 ## What goes in
 
@@ -31,7 +35,10 @@ time is not used for this: MT5 writes `time_msc`, and its file names, in the bro
 time, two or three hours ahead of UTC.
 
 - **The cutoff** is a UTC day boundary: by default the one at or before the run, so a package
-  covers whole days. The weekly run is Monday 01:00 UTC, which makes the cutoff Monday 00:00.
+  covers whole days. The weekly run is Sunday 20:00 UTC, which makes the cutoff Sunday 00:00.
+  Sunday evening because forex is closed until 21:00 or 22:00 UTC: the run meets an idle MT5
+  terminal. An MT5 file still open on Friday stays open over the weekend - no ticks arrive to
+  fill it - and goes into the package of the week it closes in.
 - **The cutoff bounds a package from above only.** A finished file that still reaches past it
   is held for the next package, and listed in `held_for_next`. A file that appears late (one
   recovered from a write-ahead log, or by hand) is taken by the next run, never skipped. So every
@@ -74,9 +81,11 @@ package service may run as another account. So a run first checks, and refuses w
 reason when anything fails:
 
 1. the source folder exists and its mint is readable, with a usable id;
-2. the files can be listed, and every new file can be opened for reading. The packer only
-   ever reads a source folder, so nothing is written there, not even a probe;
-3. the package folder takes a probe file: written, flushed, renamed, read back, deleted;
+2. the files can be listed, and every new file can be opened for reading;
+3. the package folder takes a probe file: written, flushed, renamed, read back, deleted. So do
+   the originals folder and the source folder, because stage A moves the packed originals out
+   of the one into the other, and a folder that refuses that has to be found before the zip is
+   written, not after;
 4. writing the new files' full size would still leave `min_free_percent` of the disk free
    (default 30). The collector shares the disk and reports `disk_low` at 20 % free, and a
    package must never be what gets it there.
@@ -111,15 +120,34 @@ loopback.
 
 | route | grant | |
 |---|---|---|
-| `GET /v1/packages` | `packages` | every package, oldest first, with `received_at`; `?collector=`, `?unacknowledged=true`; and each collector's last run |
+| `GET /v1/packages` | `packages` | every package, oldest first, with `state` (`ready`, `delivered`) and `received_at`; `?collector=`, `?unacknowledged=true`; the `health` verdict, `storage` (originals per stage, disk) and each collector's last run |
+| `GET /v1/packages/ledger` | `packages` | the ledger, below; `?package_id=`, `?event=` |
 | `GET /v1/packages/{package_id}` | `packages:<id>` | the manifest, and the receipt |
 | `GET /v1/packages/{package_id}/zip` | `packages:<id>` | the zip; repeatable, and resumable with `Range` |
-| `POST /v1/packages/{package_id}/receipt` | `receipts:<id>` | "received and imported"; body `{"note": "..."}` optional |
-| `GET /v1/packages/health` | open | alive, the next run, and what each collector's last run did |
+| `POST /v1/packages/{package_id}/receipt` | `receipts:<id>` | "received and imported"; body `{"note": "...", "zip_sha256": "..."}`, both optional |
+| `GET /v1/packages/purge` | `purge` | what a purge would delete now; `?target_free_percent=` |
+| `POST /v1/packages/purge` | `purge` | delete confirmed originals until the target; body `{"target_free_percent": 50}` optional |
+| `GET /v1/packages/health` | open | `status` `ok` or `degraded`, `reasons` as codes, the next run, each collector's last result |
+
+- **No route packs.** A package is built by the weekly schedule or by `pack` on the machine,
+  never because a request asked; `tests/packages/test_packages.py` holds the full list of
+  routes so that one added later is looked at.
+- **`purge` is the operator's, and a surface of its own.** A consumer that can confirm a package
+  must not also be able to make the evidence go. The remote purge always stops at the target;
+  a full purge is a command on the machine. [package_lifecycle.md](package_lifecycle.md) says
+  what a purge proves before it deletes.
+- **Health names reasons, not detail.** `disk_low`, `receipt_overdue`, `disposable_large`,
+  `last_run_failed`, `last_run_refused`; a refusal's text names paths on the machine, and that
+  is behind the token, in the list.
 
 - **The first acknowledgement stands.** It answers `201`; a repeated one answers `200` with the
   original date, so a consumer retrying after a lost answer cannot move it. An acknowledged
   package stays listed, and the acknowledgement deletes nothing.
+- **`zip_sha256` makes a receipt name the bytes.** It is the hash the consumer computed over
+  what it holds. Given, it must be the package's, or the acknowledgement is refused with `409`
+  and nothing is marked received: the consumer holds something other than this package. The
+  receipt keeps it, so "received" then means "these exact bytes", not only "a package of this
+  name".
 - **Fetching is not acknowledging.** `receipts` is a surface of its own, so a token can be
   given the downloads without the right to mark anything received.
 - **No route parses a tick file.** Each reads a manifest, a receipt or a zip that already
@@ -128,6 +156,34 @@ loopback.
   live in its own configuration. The collector validates every grant against its own
   surfaces at boot, so a `packages:*` in the collector's configuration would make a collector
   that restarts refuse to start.
+
+## The ledger
+
+The manifests say what each package holds. Nothing said who fetched which package, when, and
+whether all of it left, and when two parties disagree about a transfer, that is the question.
+`<output_dir>/ledger.jsonl` answers it: one JSON line per event, appended and never rewritten, no
+database.
+
+| event | written when | carries |
+|---|---|---|
+| `packed` | a package is committed, after its manifest | the zip's size and SHA-256, and every member's name, SHA-256 and tick count: a second record of the contents beside the manifests |
+| `served` | a download ends, finished or not | consumer, `range`, `status`, `content_length`, `bytes_sent`, `complete`, `disconnected` |
+| `received` | the first acknowledgement | consumer, note, `zip_sha256`, `verified` |
+| `receipt_refused` | an acknowledgement with another hash | consumer, the reported and the expected hash |
+
+- **`complete` means every byte was handed to the connection while the client was still there.**
+  That is all this side can know. The server buffers, so `bytes_sent` runs ahead of what the client
+  read; measured on 2026-11-06 with a client that read 64 KB and walked away, the line said 512 KB
+  of 8.9 MB, `complete: false`, `disconnected: true`. Whether the bytes arrived is what the receipt
+  says, and only the receipt.
+- **A package committed before the ledger existed**, or whose line a failed write lost, gets its
+  `packed` line from its manifest the next time the ledger is seeded: at every service start and
+  every run, marked `entered_late`.
+- **A record, not a gate.** A ledger that cannot be written stops no package and no download; the
+  error goes to the service's log.
+- **Several processes write it**, the service and a `pack` run by hand, so each append holds an
+  operating-system lock on `.ledger.lock` beside it. A line torn by a crash is counted as
+  `unreadable_lines` when the ledger is read, and the next event starts a line of its own.
 
 ## Why a program of its own
 
@@ -149,37 +205,51 @@ of its members' size.
 
 ## Running it
 
-The `packages` block in `user_configs/app_config.json` of the service's own checkout. Paths
-are absolute, because the service runs from a different directory than the collector:
+The `packages` block in `user_configs/app_config.json` of the service's own checkout. Source
+paths are absolute, because the service runs from a different directory than the collector;
+its own folders default to `./data/packages` and `./data/originals` under its checkout, where
+`data/` is gitignored:
 
 ```json
 {
-  "telegram": { "enabled": false },
+  "telegram": { "enabled": true, "bot_token": "<the collector's>", "chat_id": "<the collector's>" },
   "packages": {
-    "output_dir": "C:\\FiniexPackages",
     "port": 8120,
-    "weekday": "monday", "hour": 1, "minute": 0,
+    "weekday": "sunday", "hour": 20, "minute": 0,
     "min_free_percent": 30,
+    "receipt_overdue_days": 14,
+    "disposable_warn_gb": 10,
+    "purge_target_free_percent": 50,
+    "heartbeat_url": "<the outside check's ping address>",
     "sources": {
       "kraken": { "root": "<collector checkout>\\data\\raw", "subdir": "kraken",
                   "log_dir": "<collector checkout>\\logs" },
       "mt5":    { "root": "<terminal data folder>\\MQL5\\Files" }
     },
     "tokens": {
-      "<consumer>": { "token": "<40 hex characters>", "grants": ["packages:*", "receipts:*"] }
+      "<consumer>": { "token": "<40 hex characters>", "grants": ["packages:*", "receipts:*"] },
+      "<operator>": { "token": "<40 hex characters>", "grants": ["packages:*", "purge:originals"] }
     }
   }
 }
 ```
 
-`paths.logs_dir` stays at its default: the service's log is its own, under its own checkout,
-and never the collector's.
+- **Telegram is sending only.** The service warns through the collector's bot but never polls
+  it: the collector reads the bot's commands, and a second reader would take its updates. At
+  most one message per reason per day; a reason that clears and comes back is news again.
+- **The heartbeat** pings the outside check only while health is `ok`, the collector's pattern,
+  and is a credential like the bot token: `user_configs/` only.
+- `paths.logs_dir` stays at its default: the service's log is its own, under its own checkout,
+  and never the collector's.
 
 ```powershell
 python -m python.packages check                          # prove the access, pack nothing
 python -m python.packages pack                           # one run now, cutoff today 00:00 UTC
-python -m python.packages pack --source mt5 --cutoff 2026-11-09
-python -m python.packages serve                          # the API and the weekly schedule
+python -m python.packages pack --source mt5 --cutoff 2026-11-15
+python -m python.packages settle                         # bring the folders in line, now
+python -m python.packages purge                          # what a purge to the target would delete
+python -m python.packages purge --apply [--full] [--target 50]
+python -m python.packages serve                          # API, schedule, housekeeping, heartbeat
 ```
 
 `pack` takes the same lock as the service's scheduled run, so a run by hand while the

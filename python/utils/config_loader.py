@@ -228,29 +228,51 @@ class PackagesConfig(BaseModel):
     files and never touches the process.
 
     Args:
-        output_dir: Where packages are written. Outside every checkout, so a fresh
-            clone never meets it
+        output_dir: Where packages are written: `<collector>/ready/` until the
+            consumer confirms, `<collector>/delivered/` after. Relative to the
+            service's own checkout, under its gitignored `data/`
+        originals_dir: Where the original tick files go once packed:
+            `awaiting/` until the consumer confirms, `disposable/` after. Only
+            `purge` deletes from it, and only from `disposable/`
         host: Interface to bind. Loopback; the edge forwards `/v1/packages*` here
         port: Loopback port, well clear of the collector's 8110
-        weekday: Day of the weekly run, UTC
+        weekday: Day of the weekly run, UTC. Sunday: forex is closed until 21:00
+            or 22:00 UTC, so the run meets an idle MT5 terminal
         hour: Hour of the weekly run, UTC
         minute: Minute of the weekly run
         min_free_percent: Free disk share that must remain after a package is
-            written. The collector reports `disk_low` at 20 %, so a package must
-            never be what pushes it there
+            written, and below which the service reports `disk_low`. The
+            collector reports `disk_low` at 20 %, so the warning comes first
+        receipt_overdue_days: A package waiting longer than this for a verified
+            receipt makes the service report `receipt_overdue`
+        disposable_warn_gb: Confirmed originals above this size make the service
+            report `disposable_large` - a reminder to purge
+        purge_target_free_percent: `purge` without `--full` deletes confirmed
+            originals, oldest receipt first, until this much of the disk is free,
+            and nothing when it already is
+        heartbeat_url: Ping address of an outside check that alarms when the pings
+            stop. Pinged only while the service's health is `ok`. A credential:
+            user_configs/ only
+        heartbeat_interval_seconds: Seconds between pings
         sources: `name -> PackageSourceConfig`; the name becomes the package id's
             first part, e.g. `kraken`, `mt5`
         tokens: Consumer credentials, `name -> {token, grants, active, note}`, with
             the surfaces `packages` and `receipts`. Belongs in user_configs/, never
             in the tracked file
     """
-    output_dir: str = ""
+    output_dir: str = "./data/packages"
+    originals_dir: str = "./data/originals"
     host: str = "127.0.0.1"
     port: int = Field(default=8120, ge=1024, le=65535)
-    weekday: str = "monday"
-    hour: int = Field(default=1, ge=0, le=23)
+    weekday: str = "sunday"
+    hour: int = Field(default=20, ge=0, le=23)
     minute: int = Field(default=0, ge=0, le=59)
     min_free_percent: float = Field(default=30.0, ge=0.0, le=95.0)
+    receipt_overdue_days: int = Field(default=14, ge=1, le=365)
+    disposable_warn_gb: float = Field(default=10.0, ge=0.1)
+    purge_target_free_percent: float = Field(default=50.0, ge=1.0, le=95.0)
+    heartbeat_url: str = ""
+    heartbeat_interval_seconds: int = Field(default=60, ge=30, le=3600)
     sources: Dict[str, PackageSourceConfig] = Field(default_factory=dict)
     tokens: Dict[str, Any] = Field(default_factory=dict)
 

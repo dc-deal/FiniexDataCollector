@@ -11,11 +11,13 @@ anything fails:
      is the proof that this is the collector's folder; without it nothing is packed.
      (A stale or copied folder with a genuine mint is beyond what any check here can
      tell. The id in every member is the second half of the proof.)
-  2. the files can be listed, and each candidate can be opened for reading. Reading
-     is all the packer does to a source; it never writes there, so a write probe in
-     a source folder would test a permission nothing needs.
+  2. the files can be listed, and each candidate can be opened for reading.
   3. the package folder takes a probe file: written, flushed, renamed, read back,
-     deleted. That is every operation a package needs.
+     deleted. That is every operation a package needs. When the originals are to
+     leave their folder afterwards (stage A), the originals folder and the source
+     folder take the same probe: a move out of a folder needs the right to change
+     it, and finding that out after the zip is written would leave a package whose
+     originals cannot follow.
   4. writing the candidates' full size would still leave `min_free_percent` free.
      The collector shares the disk and calls 20 % free `disk_low`; a package must
      never be what pushes it there.
@@ -139,10 +141,14 @@ def check_source(
     name: str,
     config: PackageSourceConfig,
     store: PackageStore,
-    min_free_percent: float
+    min_free_percent: float,
+    originals_root: Optional[Path] = None
 ) -> SourceCheck:
     """
     Check one source and the package folder before a run.
+
+    With `originals_root`, the originals folder and the source folder are probed
+    for writing too: stage A moves files out of the one into the other.
 
     Args:
         name: The source's name, e.g. `kraken`
@@ -212,11 +218,20 @@ def check_source(
         first = next(iter(check.unreadable.items()))
         return _refuse(check, f"no new file is readable, e.g. {first[0]}: {first[1]}")
 
-    folder = store.folder(name)
+    folder = store.ready(name)
     try:
         _probe_write(folder)
     except OSError as e:
         return _refuse(check, f"package folder {folder} is not writable: {describe_exception(e)}")
+
+    if originals_root is not None:
+        for label, path in (("originals folder", Path(originals_root)),
+                            ("source folder", files_dir)):
+            try:
+                _probe_write(path)
+            except OSError as e:
+                return _refuse(check, f"{label} {path} is not writable, so the packed "
+                               f"originals could not leave it: {describe_exception(e)}")
 
     try:
         usage = shutil.disk_usage(folder)

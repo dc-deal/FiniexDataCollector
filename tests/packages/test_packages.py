@@ -26,9 +26,12 @@ from finiex_auth.route_walk import assert_no_identity_route_is_ungated
 from pydantic import ValidationError
 
 from python.api import outage_history
+from python.packages import lifecycle
 from python.packages import packer as packer_module
 from python.packages import preflight as preflight_module
-from python.packages.package_api import create_package_api
+from python.packages.ledger import Ledger
+from python.packages.package_api import (LedgeredFileResponse,
+                                         create_package_api)
 from python.packages.package_service import next_run
 from python.packages.package_store import LOCK_NAME, PackageStore
 from python.packages.package_tokens import load_package_tokens
@@ -82,16 +85,22 @@ def kraken(tmp_path: Path) -> Dict[str, Any]:
     write_mint(root)
     files = root / "kraken"
     files.mkdir()
-    return {"root": root, "files": files,
-            "config": PackageSourceConfig(root=str(root), subdir="kraken"),
-            "store": PackageStore(tmp_path / "packages")}
+    source = PackageSourceConfig(root=str(root), subdir="kraken")
+    return {"root": root, "files": files, "config": source,
+            "store": PackageStore(tmp_path / "packages"),
+            "originals": tmp_path / "originals",
+            "packages_config": PackagesConfig(
+                output_dir=str(tmp_path / "packages"), originals_dir=str(tmp_path / "originals"),
+                min_free_percent=0.0, sources={"kraken": source})}
 
 
 def pack(source: Dict[str, Any], cutoff: datetime = CUTOFF, now: Optional[datetime] = None,
-         name: str = "kraken", min_free: float = 0.0) -> Dict[str, Any]:
+         name: str = "kraken", min_free: float = 0.0, stage: bool = False) -> Dict[str, Any]:
+    """A packing run; `stage` moves the originals on to stage A, as the service does."""
     return pack_source(name, source["config"], source["store"], min_free,
                        cutoff=cutoff, now=now or cutoff + timedelta(hours=1),
-                       packer={"version": "test"})
+                       packer={"version": "test"},
+                       originals_root=source["originals"] if stage else None)
 
 
 def zip_members(store: PackageStore, package_id: str) -> Dict[str, bytes]:
@@ -279,7 +288,7 @@ def test_a_run_that_died_is_removed_and_built_again(kraken: Dict[str, Any]) -> N
     """A zip without its manifest was never a package."""
     tick_file(kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(
         2, 0), day(2, 23))
-    folder = kraken["store"].folder("kraken")
+    folder = kraken["store"].ready("kraken")
     folder.mkdir(parents=True)
     (folder / "kraken-0001-20261109.zip").write_bytes(b"half")
     (folder / "kraken-0001-20261109.manifest.json.part").write_bytes(b"{")
@@ -325,7 +334,30 @@ def test_the_preflight_proves_the_package_folder_takes_a_file(
 
     assert check.ok is False
     assert "not writable" in check.reason
-    assert not list(kraken["store"].folder("kraken").glob(".probe-*"))
+    assert not list(kraken["store"].ready("kraken").glob(".probe-*"))
+
+
+def test_staging_needs_the_right_to_change_the_source_folder(
+        kraken: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Found out after the zip, the package would exist with its originals unable to follow."""
+    tick_file(kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(
+        2, 0), day(2, 23))
+    real_probe = preflight_module._probe_write
+
+    def refusing_probe(folder: Path) -> None:
+        if folder == kraken["files"]:
+            raise PermissionError("access denied")
+        real_probe(folder)
+
+    monkeypatch.setattr(preflight_module, "_probe_write", refusing_probe)
+
+    without = preflight_module.check_source(
+        "kraken", kraken["config"], kraken["store"], 0.0)
+    staging = preflight_module.check_source("kraken", kraken["config"], kraken["store"], 0.0,
+                                            kraken["originals"])
+
+    assert without.ok is True
+    assert staging.ok is False and "source folder" in staging.reason
 
 
 def test_too_little_disk_is_refused(kraken: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -470,6 +502,7 @@ def test_the_next_run_is_the_coming_monday_at_one() -> None:
 READER = {"token": "r" * 40, "grants": ["packages:*", "receipts:*"]}
 FETCHER = {"token": "f" * 40, "grants": ["packages:*"]}
 NOBODY = {"token": "n" * 40, "grants": []}
+OPERATOR = {"token": "o" * 40, "grants": ["packages:*", "purge:originals"]}
 
 
 def bearer(token: Dict[str, Any]) -> Dict[str, str]:
@@ -478,14 +511,26 @@ def bearer(token: Dict[str, Any]) -> Dict[str, str]:
 
 @pytest.fixture
 def served(kraken: Dict[str, Any]) -> Dict[str, Any]:
+    """The API over one packed and staged package, settling after a receipt as the service does."""
     tick_file(kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(
         2, 0), day(2, 23))
-    package_id = pack(kraken)["package_id"]
+    tick_file(kraken["files"], "ETHUSD_20261103_000000_ticks.json", day(
+        3, 0), day(3, 23))
+    package_id = pack(kraken, stage=True)["package_id"]
     registry = load_package_tokens(
-        {"ide": READER, "fetcher": FETCHER, "nobody": NOBODY})
+        {"ide": READER, "fetcher": FETCHER, "nobody": NOBODY, "operator": OPERATOR})
+    ledger = Ledger(kraken["store"].root)
+    config = kraken["packages_config"]
+
+    def settle_after_receipt(collector: str) -> None:
+        lifecycle.settle_source(collector, config.sources[collector], kraken["store"],
+                                kraken["originals"], ledger)
+
     app = create_package_api(
-        kraken["store"], registry, lambda: {"next_run": None})
-    return {"client": TestClient(app), "app": app, "id": package_id, "store": kraken["store"]}
+        kraken["store"], registry, lambda: {"next_run": None}, ledger, config,
+        on_receipt=settle_after_receipt)
+    return {"client": TestClient(app), "app": app, "id": package_id, "store": kraken["store"],
+            "ledger": ledger, "kraken": kraken, "config": config}
 
 
 def test_the_list_needs_a_token_and_the_grant(served: Dict[str, Any]) -> None:
@@ -569,11 +614,35 @@ def test_fetching_is_not_acknowledging(served: Dict[str, Any]) -> None:
 
 
 def test_health_is_open_and_names_no_content(served: Dict[str, Any]) -> None:
+    """Codes only: a refusal's reason names paths on the machine, and that is behind the token."""
     body = served["client"].get("/v1/packages/health").json()
 
-    assert body["status"] == "ok"
-    assert body["last_runs"]["kraken"]["result"] == "packed"
-    assert "packages" not in body
+    assert body["status"] == "ok" and body["reasons"] == []
+    assert body["last_runs"]["kraken"] == {"result": "packed",
+                                           "at": body["last_runs"]["kraken"]["at"]}
+    assert "packages" not in body and "storage" not in body
+
+
+def test_no_route_can_pack_and_every_route_is_on_this_list(served: Dict[str, Any]) -> None:
+    """
+    Packing happens on the weekly schedule and by a command on the machine - never
+    because a request asked for it. A route added later fails here until it is
+    looked at and written into this list.
+    """
+    routes = sorted((route.path, method) for route in served["app"].routes
+                    for method in getattr(route, "methods", None) or []
+                    if route.path.startswith("/v1/"))
+
+    assert routes == sorted([
+        ("/v1/packages/health", "GET"),
+        ("/v1/packages", "GET"),
+        ("/v1/packages/ledger", "GET"),
+        ("/v1/packages/purge", "GET"),
+        ("/v1/packages/purge", "POST"),
+        ("/v1/packages/{package_id}", "GET"),
+        ("/v1/packages/{package_id}/zip", "GET"),
+        ("/v1/packages/{package_id}/receipt", "POST"),
+    ])
 
 
 def test_package_grants_are_their_own_vocabulary() -> None:
@@ -581,3 +650,508 @@ def test_package_grants_are_their_own_vocabulary() -> None:
     with pytest.raises(ValidationError):
         load_package_tokens(
             {"x": {"token": "x" * 40, "grants": ["status:detail"]}})
+
+
+# --------------------------------------------------------------------- the ledger
+
+
+def events(ledger: Ledger, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+    return ledger.read(event=kind)["events"]
+
+
+def test_a_committed_package_is_booked_with_its_members(served: Dict[str, Any]) -> None:
+    """A second record of the contents, independent of the manifest file."""
+    packed = events(served["ledger"], "packed")
+    manifest = served["store"].manifest(served["id"])
+
+    assert [e["package_id"] for e in packed] == [served["id"]]
+    assert packed[0]["zip"]["sha256"] == manifest["zip"]["sha256"]
+    assert packed[0]["members"] == [{"name": m["name"], "sha256": m["sha256"],
+                                     "tick_count": m["tick_count"]} for m in manifest["members"]]
+    assert "entered_late" not in packed[0]
+
+
+def test_packages_older_than_the_ledger_are_entered_late_and_once(kraken: Dict[str, Any]) -> None:
+    tick_file(kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(
+        2, 0), day(2, 23))
+    package_id = pack(kraken)["package_id"]
+    ledger = Ledger(kraken["store"].root)
+    ledger.path.unlink()
+
+    assert ledger.seed(kraken["store"].manifests()) == [package_id]
+    assert ledger.seed(kraken["store"].manifests()) == []
+    packed = events(ledger, "packed")
+    assert len(packed) == 1 and packed[0]["entered_late"] is True
+
+
+def test_a_whole_download_is_booked_complete(served: Dict[str, Any]) -> None:
+    size = served["store"].find(served["id"])["zip"].stat().st_size
+
+    served["client"].get(
+        f"/v1/packages/{served['id']}/zip", headers=bearer(FETCHER))
+
+    booked = events(served["ledger"], "served")
+    assert len(booked) == 1
+    assert booked[0]["consumer"] == "fetcher" and booked[0]["range"] is None
+    assert booked[0]["bytes_sent"] == size and booked[0]["complete"] is True
+
+
+def test_a_resumed_download_is_booked_with_its_range(served: Dict[str, Any]) -> None:
+    size = served["store"].find(served["id"])["zip"].stat().st_size
+
+    served["client"].get(f"/v1/packages/{served['id']}/zip",
+                         headers={**bearer(FETCHER), "Range": "bytes=100-"})
+
+    booked = events(served["ledger"], "served")[0]
+    assert booked["range"] == "bytes=100-" and booked["status"] == 206
+    assert booked["bytes_sent"] == size - 100 and booked["complete"] is True
+
+
+def test_a_download_the_client_abandons_is_booked_incomplete(tmp_path: Path) -> None:
+    """A gone client: the server would go on accepting bytes into the void."""
+    import anyio
+
+    path = tmp_path / "big.zip"
+    path.write_bytes(os.urandom(3 * 64 * 1024))
+    outcomes: List[Dict[str, Any]] = []
+    response = LedgeredFileResponse(path, media_type="application/zip",
+                                    on_finish=outcomes.append)
+    sent: List[Dict[str, Any]] = []
+    gone = anyio.Event()
+
+    async def receive() -> Dict[str, Any]:
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: Dict[str, Any]) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.body":
+            gone.set()
+            await anyio.sleep(0.05)
+
+    scope = {"type": "http", "method": "GET", "headers": [], "extensions": {}}
+    anyio.run(response, scope, receive, send)
+
+    assert outcomes[0]["disconnected"] is True
+    assert outcomes[0]["complete"] is False
+    assert outcomes[0]["bytes_sent"] < path.stat().st_size
+
+
+def test_a_receipt_with_the_right_hash_is_verified(served: Dict[str, Any]) -> None:
+    sha = served["store"].manifest(served["id"])["zip"]["sha256"]
+
+    response = served["client"].post(f"/v1/packages/{served['id']}/receipt",
+                                     headers=bearer(READER), json={"zip_sha256": sha.upper()})
+
+    assert response.status_code == 201 and response.json()["zip_sha256"] == sha
+    received = events(served["ledger"], "received")
+    assert len(received) == 1 and received[0]["verified"] is True
+
+
+def test_a_receipt_with_another_hash_is_refused_and_booked(served: Dict[str, Any]) -> None:
+    """The consumer holds other bytes than the package: it must not count as received."""
+    response = served["client"].post(f"/v1/packages/{served['id']}/receipt",
+                                     headers=bearer(READER), json={"zip_sha256": "0" * 64})
+
+    assert response.status_code == 409
+    assert served["store"].receipt(served["id"]) is None
+    refused = events(served["ledger"], "receipt_refused")
+    assert len(refused) == 1 and refused[0]["reported_sha256"] == "0" * 64
+    assert events(served["ledger"], "received") == []
+
+
+def test_a_receipt_without_a_hash_is_kept_unverified(served: Dict[str, Any]) -> None:
+    served["client"].post(
+        f"/v1/packages/{served['id']}/receipt", headers=bearer(READER))
+    served["client"].post(
+        f"/v1/packages/{served['id']}/receipt", headers=bearer(READER))
+
+    received = events(served["ledger"], "received")
+    assert len(received) == 1, "a repeated acknowledgement is not a second receipt"
+    assert received[0]["verified"] is False and received[0]["zip_sha256"] is None
+
+
+def test_the_ledger_route_needs_the_grant_and_filters(kraken: Dict[str, Any]) -> None:
+    """A token entitled to one package sees that package's lines, and no other's."""
+    tick_file(kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(
+        2, 0), day(2, 23))
+    mine = pack(kraken)["package_id"]
+    tick_file(kraken["files"], "BTCUSD_20261110_000000_ticks.json", day(
+        10, 0), day(10, 23))
+    other = pack(kraken, cutoff=CUTOFF + WEEK)["package_id"]
+    single = {"token": "s" * 40, "grants": [f"packages:{mine}"]}
+    registry = load_package_tokens(
+        {"fetcher": FETCHER, "single": single, "nobody": NOBODY})
+    client = TestClient(create_package_api(kraken["store"], registry, lambda: {},
+                                           Ledger(kraken["store"].root),
+                                           kraken["packages_config"]))
+    client.get(f"/v1/packages/{other}/zip", headers=bearer(FETCHER))
+
+    assert client.get("/v1/packages/ledger",
+                      headers=bearer(NOBODY)).status_code == 403
+    everything = client.get("/v1/packages/ledger",
+                            headers=bearer(FETCHER)).json()
+    assert {e["package_id"] for e in everything["events"]} == {mine, other}
+    assert client.get("/v1/packages/ledger", headers=bearer(FETCHER),
+                      params={"event": "served"}).json()["count"] == 1
+    narrow = client.get("/v1/packages/ledger", headers=bearer(single)).json()
+    assert {e["package_id"] for e in narrow["events"]} == {mine}
+    listed = client.get(
+        "/v1/packages", headers=bearer(single)).json()["packages"]
+    assert [p["package_id"] for p in listed] == [mine]
+
+
+def test_bytes_are_counted_where_a_server_offers_to_send_the_path(tmp_path: Path) -> None:
+    """With `pathsend` the body never passes through, and nothing would be counted."""
+    import anyio
+
+    path = tmp_path / "small.zip"
+    path.write_bytes(os.urandom(100_000))
+    outcomes: List[Dict[str, Any]] = []
+    response = LedgeredFileResponse(path, media_type="application/zip",
+                                    on_finish=outcomes.append)
+
+    async def receive() -> Dict[str, Any]:
+        await anyio.sleep_forever()
+
+    async def send(message: Dict[str, Any]) -> None:
+        assert message["type"] != "http.response.pathsend"
+
+    scope = {"type": "http", "method": "GET", "headers": [],
+             "extensions": {"http.response.pathsend": {}}}
+    anyio.run(response, scope, receive, send)
+
+    assert outcomes[0]["bytes_sent"] == 100_000 and outcomes[0]["complete"] is True
+
+
+def test_a_torn_line_is_counted_and_the_next_event_starts_a_line_of_its_own(tmp_path: Path) -> None:
+    """A crash mid-write leaves a line without its newline."""
+    ledger = Ledger(tmp_path)
+    ledger.append("packed", package_id="kraken-0001-20261109")
+    with ledger.path.open("a", encoding="utf-8") as handle:
+        handle.write('{"event": "served", "package_id": "kra')
+
+    ledger.append("received", package_id="kraken-0001-20261109")
+
+    book = ledger.read()
+    assert book["unreadable_lines"] == 1
+    assert [e["event"] for e in book["events"]] == ["packed", "received"]
+
+
+# --------------------------------------------------------------------- the lifecycle
+
+
+def awaiting(kraken: Dict[str, Any], package_id: str) -> Path:
+    return kraken["originals"] / "awaiting" / "kraken" / package_id
+
+
+def disposable(kraken: Dict[str, Any], package_id: str) -> Path:
+    return kraken["originals"] / "disposable" / "kraken" / package_id
+
+
+def receive(served: Dict[str, Any], token: Dict[str, Any] = READER, sha: Optional[str] = "") -> Any:
+    """Acknowledge the served package, with its own hash unless told otherwise."""
+    body = {} if sha is None else {
+        "zip_sha256": sha or served["store"].manifest(served["id"])["zip"]["sha256"]}
+    return served["client"].post(f"/v1/packages/{served['id']}/receipt",
+                                 headers=bearer(token), json=body)
+
+
+def test_stage_a_moves_the_packed_originals_out_and_keeps_two_copies(
+        kraken: Dict[str, Any]) -> None:
+    a = tick_file(
+        kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(2, 0), day(2, 23))
+    original = a.read_bytes()
+    late = tick_file(kraken["files"], "DOTUSD_20261108_000000_ticks.json",
+                     day(8, 20), CUTOFF + timedelta(minutes=30))
+
+    result = pack(kraken, stage=True)
+
+    moved = awaiting(kraken, result["package_id"]) / a.name
+    assert result["staged"] == 1 and not a.exists()
+    assert moved.read_bytes() == original
+    assert zip_members(kraken["store"], result["package_id"])[
+        a.name] == original
+    assert late.exists(), "a file held for the next package stays where it is"
+    staged = Ledger(kraken["store"].root).read(event="staged")["events"]
+    assert staged[0]["moved"] == [a.name]
+
+
+def test_a_zip_that_gives_back_other_bytes_is_no_package(
+        kraken: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The originals leave their folder on the strength of the self-check, so it must bite."""
+    a = tick_file(
+        kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(2, 0), day(2, 23))
+    real_writestr = zipfile.ZipFile.writestr
+
+    def corrupting(self: Any, info: Any, data: Any, *args: Any, **kwargs: Any) -> None:
+        real_writestr(self, info, data[:-1] + b"X", *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "writestr", corrupting)
+
+    result = pack(kraken, stage=True)
+
+    assert result["result"] == "failed" and "other bytes" in result["reason"]
+    assert kraken["store"].manifests("kraken") == []
+    assert a.exists(), "nothing leaves the folder for a zip that failed its check"
+
+
+def test_a_file_changed_since_packing_is_not_staged(kraken: Dict[str, Any]) -> None:
+    a = tick_file(
+        kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(2, 0), day(2, 23))
+    package_id = pack(kraken)["package_id"]
+    a.write_text(a.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+    staged = lifecycle.stage_package("kraken", kraken["config"],
+                                     kraken["store"].manifest(
+                                         package_id), kraken["originals"],
+                                     Ledger(kraken["store"].root))
+
+    assert staged["moved"] == [
+    ] and staged["skipped"][0]["reason"] == "changed since packing"
+    assert a.exists()
+
+
+def test_a_file_another_process_holds_stays_and_is_tried_again(
+        kraken: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows refuses to move a file someone has open; the next settle tries again."""
+    a = tick_file(
+        kraken["files"], "BTCUSD_20261102_000000_ticks.json", day(2, 0), day(2, 23))
+    real_replace = os.replace
+
+    def busy(source: Any, target: Any) -> None:
+        if Path(source) == a:
+            raise PermissionError("in use by another process")
+        real_replace(source, target)
+
+    monkeypatch.setattr(lifecycle.os, "replace", busy)
+    package_id = pack(kraken, stage=True)["package_id"]
+    assert a.exists()
+
+    monkeypatch.setattr(lifecycle.os, "replace", real_replace)
+    lifecycle.settle(kraken["packages_config"],
+                     kraken["store"], Ledger(kraken["store"].root))
+
+    assert not a.exists() and (awaiting(kraken, package_id) / a.name).exists()
+
+
+def test_a_verified_receipt_delivers_the_package_and_makes_its_originals_disposable(
+        served: Dict[str, Any]) -> None:
+    kraken, package_id = served["kraken"], served["id"]
+
+    assert receive(served).status_code == 201
+
+    paths = served["store"].find(package_id)
+    assert paths["state"] == "delivered"
+    assert {p.parent.name for p in (
+        paths["zip"], paths["manifest"], paths["receipt"])} == {"delivered"}
+    assert not awaiting(kraken, package_id).exists()
+    assert len(list(disposable(kraken, package_id).iterdir())) == 2
+    kinds = [e["event"]
+             for e in served["ledger"].read(package_id=package_id)["events"]]
+    assert kinds[-3:] == ["received", "delivered", "disposable"]
+    listed = served["client"].get(
+        "/v1/packages", headers=bearer(READER)).json()
+    assert listed["packages"][0]["state"] == "delivered"
+
+
+def test_a_receipt_without_the_hash_moves_nothing_on(served: Dict[str, Any]) -> None:
+    """Received is not proven: the originals wait - also when the housekeeping comes by."""
+    receive(served, sha=None)
+    lifecycle.settle(served["config"], served["store"], served["ledger"])
+
+    assert served["store"].find(served["id"])["state"] == "ready"
+    assert awaiting(served["kraken"], served["id"]).exists()
+    assert not disposable(served["kraken"], served["id"]).exists()
+    created = datetime.fromisoformat(served["store"].manifest(served["id"])["created_at"])
+    assert lifecycle.health(served["config"], served["store"],
+                            now=created + timedelta(days=15))["reasons"] == ["receipt_overdue"]
+
+
+def test_a_move_cut_short_is_finished_by_the_next_settle(served: Dict[str, Any]) -> None:
+    """Zip moved, manifest not: the package is still found, and settle finishes the move."""
+    store, package_id = served["store"], served["id"]
+    receive(served, sha=None)
+    paths = store.find(package_id)
+    store.delivered("kraken").mkdir(parents=True, exist_ok=True)
+    os.replace(paths["zip"], store.delivered("kraken") / paths["zip"].name)
+    sha = store.manifest(package_id)["zip"]["sha256"]
+    receipt = json.loads(paths["receipt"].read_text(encoding="utf-8"))
+    paths["receipt"].write_text(json.dumps(
+        {**receipt, "zip_sha256": sha}), encoding="utf-8")
+
+    mid = store.find(package_id)
+    assert mid["state"] == "ready" and mid["zip"].parent.name == "delivered"
+
+    lifecycle.settle(served["config"], store, served["ledger"])
+
+    assert store.find(package_id)["state"] == "delivered"
+    assert disposable(served["kraken"], package_id).exists()
+
+
+def fake_disk(monkeypatch: pytest.MonkeyPatch, free: int, total: int = 1000 * 10**6) -> None:
+    class Usage:
+        pass
+    Usage.free, Usage.total = free, total
+    monkeypatch.setattr(lifecycle.shutil, "disk_usage", lambda path: Usage)
+
+
+def test_purge_by_default_stops_at_the_target_and_touches_nothing_above_it(
+        served: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    receive(served)
+    store, ledger, config = served["store"], served["ledger"], served["config"]
+
+    fake_disk(monkeypatch, free=600 * 10**6)
+    above = lifecycle.purge(config, store, ledger, apply=True)
+    assert above["packages"] == [] and disposable(
+        served["kraken"], served["id"]).exists()
+
+    fake_disk(monkeypatch, free=100 * 10**6)
+    dry = lifecycle.purge(config, store, ledger, apply=False)
+    assert dry["packages"][0]["ok"] is True and dry["would_free_bytes"] > 0
+    assert disposable(served["kraken"], served["id"]
+                      ).exists(), "a dry run deletes nothing"
+
+    done = lifecycle.purge(config, store, ledger, apply=True)
+    assert done["packages"][0]["deleted"] is True
+    assert not disposable(served["kraken"], served["id"]).exists()
+    assert store.find(served["id"])["zip"].exists(), "our zip stays"
+    purged = ledger.read(event="purged")["events"][0]
+    assert {f["name"] for f in purged["files"]} == {
+        "BTCUSD_20261102_000000_ticks.json", "ETHUSD_20261103_000000_ticks.json"}
+    assert all(len(f["sha256"]) == 64 for f in purged["files"])
+
+
+def test_a_full_purge_ignores_the_target(served: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    receive(served)
+    fake_disk(monkeypatch, free=900 * 10**6)
+
+    done = lifecycle.purge(served["config"], served["store"], served["ledger"],
+                           apply=True, full=True)
+
+    assert done["packages"][0]["deleted"] is True
+
+
+@pytest.mark.parametrize("damage, expected", [
+    ("extra", "does not name"),
+    ("missing", "are not here"),
+    ("size", "bytes, the manifest says"),
+    ("content", "not the manifest's SHA-256"),
+    ("zip", "our zip no longer"),
+])
+def test_purge_proves_every_file_again_and_keeps_a_package_it_cannot(
+        served: Dict[str, Any], monkeypatch: pytest.MonkeyPatch, damage: str, expected: str) -> None:
+    receive(served)
+    folder = disposable(served["kraken"], served["id"])
+    first = sorted(folder.iterdir())[0]
+    if damage == "extra":
+        (folder / "stray.json").write_text("{}")
+    elif damage == "missing":
+        first.unlink()
+    elif damage == "size":
+        first.write_bytes(first.read_bytes() + b" ")
+    elif damage == "content":
+        data = bytearray(first.read_bytes())
+        data[10] = (data[10] + 1) % 256
+        first.write_bytes(bytes(data))
+    elif damage == "zip":
+        zip_path = served["store"].find(served["id"])["zip"]
+        zip_path.write_bytes(zip_path.read_bytes() + b"\0")
+
+    done = lifecycle.purge(served["config"], served["store"], served["ledger"],
+                           apply=True, full=True)
+
+    verdict = done["packages"][0]
+    assert verdict["ok"] is False and verdict["deleted"] is False
+    assert any(expected in problem for problem in verdict["problems"])
+    assert folder.exists()
+
+
+def test_a_package_put_into_disposable_without_a_verified_receipt_is_kept(
+        served: Dict[str, Any]) -> None:
+    """Only a receipt with the zip's hash makes originals disposable - moving them by hand does not."""
+    source = awaiting(served["kraken"], served["id"])
+    target = disposable(served["kraken"], served["id"])
+    target.parent.mkdir(parents=True)
+    os.replace(source, target)
+
+    done = lifecycle.purge(served["config"], served["store"], served["ledger"],
+                           apply=True, full=True)
+
+    assert "no receipt with the zip's hash" in done["packages"][0]["problems"]
+    assert target.exists()
+
+
+def test_remote_purge_is_its_own_grant_and_never_full(
+        served: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    client = served["client"]
+    receive(served)
+    fake_disk(monkeypatch, free=100 * 10**6)
+
+    assert client.get("/v1/packages/purge",
+                      headers=bearer(READER)).status_code == 403
+    assert client.post("/v1/packages/purge",
+                       headers=bearer(READER)).status_code == 403
+    preview = client.get("/v1/packages/purge", headers=bearer(OPERATOR)).json()
+    assert preview["applied"] is False and preview["packages"][0]["ok"] is True
+    assert client.post("/v1/packages/purge", headers=bearer(OPERATOR),
+                       json={"target_free_percent": 200}).status_code == 400
+    done = client.post("/v1/packages/purge", headers=bearer(OPERATOR),
+                       json={"target_free_percent": 5}).json()
+    assert done["packages"] == [], "10 % free is above a 5 % target"
+    done = client.post("/v1/packages/purge", headers=bearer(OPERATOR)).json()
+    assert done["full"] is False and done["packages"][0]["deleted"] is True
+    assert served["ledger"].read(event="purged")[
+        "events"][0]["by"] == "operator"
+
+
+def test_health_names_each_reason(served: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    store, config = served["store"], served["config"]
+    created = datetime.fromisoformat(
+        store.manifest(served["id"])["created_at"])
+
+    assert lifecycle.health(config, store, now=created +
+                            timedelta(days=1))["status"] == "ok"
+    late = lifecycle.health(config, store, now=created + timedelta(days=15))
+    assert late["reasons"] == [
+        "receipt_overdue"] and late["overdue"] == [served["id"]]
+
+    receive(served)
+    assert lifecycle.health(config, store, now=created +
+                            timedelta(days=15))["status"] == "ok"
+
+    tight = config.model_copy(
+        update={"disposable_warn_gb": 0.000001, "min_free_percent": 50.0})
+    fake_disk(monkeypatch, free=100 * 10**6)
+    assert lifecycle.health(tight, store)["reasons"] == [
+        "disk_low", "disposable_large"]
+
+    store.write_last_run(
+        "kraken", {"result": "refused", "reason": "no instance.json"})
+    assert "last_run_refused" in lifecycle.health(config, store)["reasons"]
+
+
+def test_the_operator_is_warned_once_a_day_per_reason(tmp_path: Path) -> None:
+    import asyncio
+
+    from python.packages.package_service import PackageService
+
+    service = PackageService(PackagesConfig(output_dir=str(tmp_path / "p"),
+                                            originals_dir=str(tmp_path / "o")), {})
+    sent: List[str] = []
+
+    class Telegram:
+        async def send_alert(self, alert: Any) -> bool:
+            sent.append(alert.title)
+            return True
+
+    service._telegram = Telegram()
+    degraded = {"status": "degraded", "reasons": ["disk_low"], "overdue": []}
+
+    asyncio.run(service._warn(degraded))
+    asyncio.run(service._warn(degraded))
+    assert sent == ["Tick packages: disk_low"]
+
+    asyncio.run(service._warn({"status": "ok", "reasons": [], "overdue": []}))
+    asyncio.run(service._warn(degraded))
+    assert len(sent) == 2, "a reason that cleared and came back is news again"

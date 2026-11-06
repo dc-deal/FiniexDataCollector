@@ -469,7 +469,25 @@ out and a schedule in the quiet minutes. On the API: a token and the grant are n
 identity route refuses a token holding nothing, the zip is served whole and resumed with `Range`,
 a crafted id is not found, the first receipt stands and a repeated one moves nothing, fetching is
 not acknowledging, health is open and names no content, and the grant vocabulary is the service's
-own.
+own. On the ledger: a committed package is booked with its members; packages older than the ledger
+are entered late, and once; a whole and a resumed download are booked complete with their range,
+and one the client abandons incomplete, with the disconnect; bytes are counted even where a server
+offers to send the path instead; a receipt with the right hash is verified, one with another hash is
+refused and booked, one without stays unverified, and a repeated one is not a second receipt; the
+ledger route needs the grant and shows a token only its own packages' lines; and a torn line is
+counted while the next event starts a line of its own. On the lifecycle
+([package_lifecycle.md](../operations/package_lifecycle.md)): stage A moves the packed originals
+out and keeps two copies, leaving held files where they are; a zip that gives back other bytes is
+no package and nothing moves; a file changed since packing is not staged; a file another process
+holds stays and is moved by the next settle; staging needs the right to change the source
+folder, checked before the zip; a verified receipt delivers the package and makes its originals
+disposable, one without the hash moves nothing on even when the housekeeping comes by; a move cut
+short is finished by the next settle; purge stops at its target and does nothing above it, a dry
+run deletes nothing, a full purge ignores the target; purge proves every file again and keeps a
+package with an extra, missing, resized or altered file or a damaged zip, and one put into
+`disposable` by hand without a verified receipt; the remote purge is its own grant and never
+full; health names each reason; the operator is warned once a day per reason; and no route can
+pack - the full list of routes is held in the test.
 
 ### `tests/utils/test_memory_trail.py`
 
