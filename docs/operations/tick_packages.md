@@ -148,6 +148,11 @@ loopback.
   and nothing is marked received: the consumer holds something other than this package. The
   receipt keeps it, so "received" then means "these exact bytes", not only "a package of this
   name".
+- **A receipt needs a complete download by the same token.** The list publishes the hash, so
+  knowing it proves nothing; the ledger has to show that every byte of the zip left for the
+  token that acknowledges - a resumed download adding up across its attempts. Otherwise `409`.
+  [package_lifecycle.md](package_lifecycle.md) has the detail, and the rehearsal mode for our
+  own pickup client.
 - **Fetching is not acknowledging.** `receipts` is a surface of its own, so a token can be
   given the downloads without the right to mark anything received.
 - **No route parses a tick file.** Each reads a manifest, a receipt or a zip that already
@@ -220,6 +225,7 @@ its own folders default to `./data/packages` and `./data/originals` under its ch
     "receipt_overdue_days": 14,
     "disposable_warn_gb": 10,
     "purge_target_free_percent": 50,
+    "dev_consumers": ["<operator>"],
     "heartbeat_url": "<the outside check's ping address>",
     "sources": {
       "kraken": { "root": "<collector checkout>\\data\\raw", "subdir": "kraken",
@@ -228,7 +234,8 @@ its own folders default to `./data/packages` and `./data/originals` under its ch
     },
     "tokens": {
       "<consumer>": { "token": "<40 hex characters>", "grants": ["packages:*", "receipts:*"] },
-      "<operator>": { "token": "<40 hex characters>", "grants": ["packages:*", "purge:originals"] }
+      "<operator>": { "token": "<40 hex characters>",
+                      "grants": ["packages:*", "receipts:*", "purge:originals"] }
     }
   }
 }
@@ -250,7 +257,11 @@ python -m python.packages settle                         # bring the folders in 
 python -m python.packages purge                          # what a purge to the target would delete
 python -m python.packages purge --apply [--full] [--target 50]
 python -m python.packages serve                          # API, schedule, housekeeping, heartbeat
+python -m python.packages pickup --endpoint live         # take packages as a consumer does, from anywhere
 ```
+
+The operator's token is in `dev_consumers`: its receipts from `pickup` are rehearsals that mark
+nothing. That is what lets the whole path be tried against production before the consumer does.
 
 `pack` takes the same lock as the service's scheduled run, so a run by hand while the
 service is packing is refused, not doubled. A lock left by a process that died is taken over.

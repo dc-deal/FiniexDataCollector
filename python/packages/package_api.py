@@ -32,7 +32,7 @@ from finiex_auth.token_registry import TokenRegistry
 from starlette.types import Message, Receive, Scope, Send
 
 from python.packages import lifecycle
-from python.packages.ledger import Ledger
+from python.packages.ledger import Ledger, downloaded_whole
 from python.packages.package_store import PackageStore
 from python.utils.config_loader import PackagesConfig
 from python.utils.logging_setup import describe_exception, get_logger
@@ -361,6 +361,32 @@ def create_package_api(
                 status_code=409,
                 detail=f"zip_sha256 {reported} is not {package_id}'s {expected}: "
                 f"what you hold is not this package. Fetch it again.")
+
+        # The hash alone proves knowledge, not possession: the list publishes it.
+        # So a receipt also needs the ledger to show that this token was handed
+        # every byte of the zip. A repeated acknowledgement passes on its original;
+        # a rehearsal is always checked, it never stands on anything.
+        dev = consumer in config.dev_consumers
+        if (dev or store.receipt(package_id) is None) and not downloaded_whole(
+                ledger.read(package_id=package_id, event="served")["events"],
+                consumer, manifest["zip"]["size_bytes"]):
+            book("receipt_refused", package_id=package_id, consumer=consumer,
+                 reported_sha256=reported, reason="no complete download by this token")
+            raise HTTPException(
+                status_code=409,
+                detail=f"no complete download of {package_id} by your token is on record. "
+                f"Fetch the whole zip, check it, then acknowledge.")
+
+        if dev:
+            # Every check above ran; nothing below happens. Our own pickup client
+            # rehearses the consumer's whole path without marking the package or
+            # moving a single file, and the consumer's real receipt stays open.
+            book("dev_received", package_id=package_id, consumer=consumer, note=note,
+                 zip_sha256=reported, verified=reported is not None)
+            return JSONResponse({"package_id": package_id, "consumer": consumer, "note": note,
+                                 "zip_sha256": reported, "dev": True, "created": False,
+                                 "detail": "dev receipt: every check passed, nothing was marked"},
+                                status_code=200)
 
         receipt, created = store.write_receipt(
             package_id, consumer, note, zip_sha256=reported)

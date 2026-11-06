@@ -250,6 +250,10 @@ class PackagesConfig(BaseModel):
         purge_target_free_percent: `purge` without `--full` deletes confirmed
             originals, oldest receipt first, until this much of the disk is free,
             and nothing when it already is
+        dev_consumers: Token names whose receipts are rehearsals: every check
+            runs - complete download, hash - and the ledger books `dev_received`,
+            but nothing is marked and nothing moves. Our own pickup client's,
+            never a consumer's
         heartbeat_url: Ping address of an outside check that alarms when the pings
             stop. Pinged only while the service's health is `ok`. A credential:
             user_configs/ only
@@ -271,6 +275,7 @@ class PackagesConfig(BaseModel):
     receipt_overdue_days: int = Field(default=14, ge=1, le=365)
     disposable_warn_gb: float = Field(default=10.0, ge=0.1)
     purge_target_free_percent: float = Field(default=50.0, ge=1.0, le=95.0)
+    dev_consumers: List[str] = Field(default_factory=list)
     heartbeat_url: str = ""
     heartbeat_interval_seconds: int = Field(default=60, ge=30, le=3600)
     sources: Dict[str, PackageSourceConfig] = Field(default_factory=dict)

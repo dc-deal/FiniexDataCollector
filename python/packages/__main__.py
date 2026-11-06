@@ -6,6 +6,8 @@ FiniexDataCollector - Package Service Entry Point
     python -m python.packages settle           bring the folders in line, now
     python -m python.packages purge [--apply] [--full] [--target 50]
     python -m python.packages serve            the API, the schedule, the housekeeping
+    python -m python.packages pickup [--endpoint live] [--out DIR] [--package ID] [--no-ack]
+                                               take packages as a consumer does - from anywhere
 
 A program of its own: it loads the same configuration files as the collector but
 reads only the `packages` and `telegram` blocks, and it writes its log under its
@@ -110,12 +112,36 @@ def cmd_purge(config: AppConfig, apply: bool, full: bool, target: float) -> int:
     return 0 if all(p["ok"] for p in report["packages"]) else 1
 
 
+def cmd_pickup(endpoint: str, out_dir: Path, package_id: str, acknowledge: bool) -> int:
+    """Take packages the way a consumer does, from the address and token of an endpoint."""
+    from python.packages.pickup import pickup
+    from python.viewer.endpoints import EndpointError, load_endpoint
+
+    try:
+        base_url, token = load_endpoint(endpoint)
+    except EndpointError as e:
+        print(f"Endpoint {endpoint!r}: {describe_exception(e)}")
+        return EXIT_CONFIGURATION
+    results = pickup(base_url, token, out_dir, package_id=package_id or None,
+                     acknowledge=acknowledge)
+    print(json.dumps(results, indent=2))
+    return 0 if all(r["ok"] for r in results) else 1
+
+
 def main() -> None:
     """Entry point."""
     parser = argparse.ArgumentParser(
         description="FiniexDataCollector - tick packages")
     parser.add_argument("command", choices=[
-                        "check", "pack", "settle", "purge", "serve"])
+                        "check", "pack", "settle", "purge", "serve", "pickup"])
+    parser.add_argument("--endpoint", default="live",
+                        help="pickup: entry of user_configs/remote_endpoints.json")
+    parser.add_argument("--out", default="./data/pickup",
+                        help="pickup: where the zips are kept")
+    parser.add_argument("--package", default="",
+                        help="pickup: only this package id")
+    parser.add_argument("--no-ack", action="store_true",
+                        help="pickup: download and check, do not acknowledge")
     parser.add_argument("--config", default="./configs/app_config.json")
     parser.add_argument("--source", default="", help="pack: only this source")
     parser.add_argument("--cutoff", default="",
@@ -127,6 +153,12 @@ def main() -> None:
     parser.add_argument("--target", type=float, default=None,
                         help="purge: free disk percent to reach; default from the configuration")
     args = parser.parse_args()
+
+    # The pickup client is the consumer's side, run from anywhere - the laptop
+    # included, where there are no package sources and nothing to configure.
+    if args.command == "pickup":
+        sys.exit(cmd_pickup(args.endpoint, Path(
+            args.out), args.package, not args.no_ack))
 
     try:
         config = ConfigLoader(Path(args.config)).load()

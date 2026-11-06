@@ -70,6 +70,7 @@
     "receipt_overdue_days": 14,
     "disposable_warn_gb": 10,
     "purge_target_free_percent": 50,
+    "dev_consumers": ["<operator>"],
     "heartbeat_url": "",
     "sources": {
       "kraken": {
@@ -89,8 +90,8 @@
       },
       "<operator>": {
         "token": "<40 hex characters, a different one>",
-        "grants": ["packages:*", "purge:originals"],
-        "note": "Reads everything and may purge confirmed originals. Never give purge to a consumer."
+        "grants": ["packages:*", "receipts:*", "purge:originals"],
+        "note": "Reads everything, rehearses receipts (listed in dev_consumers, so they mark nothing) and may purge confirmed originals. Never give purge to a consumer, never list one in dev_consumers."
       }
     }
   }

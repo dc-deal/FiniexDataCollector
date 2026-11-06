@@ -36,6 +36,7 @@ from python.packages.package_service import next_run
 from python.packages.package_store import LOCK_NAME, PackageStore
 from python.packages.package_tokens import load_package_tokens
 from python.packages.packer import pack_source
+from python.packages.pickup import pickup
 from python.utils.config_loader import PackagesConfig, PackageSourceConfig
 
 MINT = "ab6381efd498"
@@ -91,7 +92,8 @@ def kraken(tmp_path: Path) -> Dict[str, Any]:
             "originals": tmp_path / "originals",
             "packages_config": PackagesConfig(
                 output_dir=str(tmp_path / "packages"), originals_dir=str(tmp_path / "originals"),
-                min_free_percent=0.0, sources={"kraken": source})}
+                min_free_percent=0.0, sources={"kraken": source},
+                dev_consumers=["operator"])}
 
 
 def pack(source: Dict[str, Any], cutoff: datetime = CUTOFF, now: Optional[datetime] = None,
@@ -502,7 +504,8 @@ def test_the_next_run_is_the_coming_monday_at_one() -> None:
 READER = {"token": "r" * 40, "grants": ["packages:*", "receipts:*"]}
 FETCHER = {"token": "f" * 40, "grants": ["packages:*"]}
 NOBODY = {"token": "n" * 40, "grants": []}
-OPERATOR = {"token": "o" * 40, "grants": ["packages:*", "purge:originals"]}
+OPERATOR = {"token": "o" * 40, "grants": [
+    "packages:*", "receipts:*", "purge:originals"]}
 
 
 def bearer(token: Dict[str, Any]) -> Dict[str, str]:
@@ -587,9 +590,18 @@ def test_an_unknown_or_crafted_id_is_not_found(served: Dict[str, Any]) -> None:
             f"/v1/packages/{package_id}", headers=bearer(READER)).status_code == 404
 
 
+def fetch(served: Dict[str, Any], token: Dict[str, Any] = None, byte_range: str = "") -> Any:
+    """Download the served package's zip, as the consumer does before it acknowledges."""
+    headers = bearer(token or READER)
+    if byte_range:
+        headers["Range"] = byte_range
+    return served["client"].get(f"/v1/packages/{served['id']}/zip", headers=headers)
+
+
 def test_a_receipt_marks_once_and_deletes_nothing(served: Dict[str, Any]) -> None:
     client, package_id = served["client"], served["id"]
     url = f"/v1/packages/{package_id}/receipt"
+    fetch(served)
 
     first = client.post(url, headers=bearer(READER),
                         json={"note": "imported 1 file"})
@@ -739,6 +751,7 @@ def test_a_download_the_client_abandons_is_booked_incomplete(tmp_path: Path) -> 
 
 def test_a_receipt_with_the_right_hash_is_verified(served: Dict[str, Any]) -> None:
     sha = served["store"].manifest(served["id"])["zip"]["sha256"]
+    fetch(served)
 
     response = served["client"].post(f"/v1/packages/{served['id']}/receipt",
                                      headers=bearer(READER), json={"zip_sha256": sha.upper()})
@@ -749,18 +762,26 @@ def test_a_receipt_with_the_right_hash_is_verified(served: Dict[str, Any]) -> No
 
 
 def test_a_receipt_with_another_hash_is_refused_and_booked(served: Dict[str, Any]) -> None:
-    """The consumer holds other bytes than the package: it must not count as received."""
+    """
+    The consumer holds other bytes than the package: it must not count as received -
+    even after a complete download, so that it is the hash check that refuses.
+    """
+    fetch(served)
     response = served["client"].post(f"/v1/packages/{served['id']}/receipt",
                                      headers=bearer(READER), json={"zip_sha256": "0" * 64})
 
-    assert response.status_code == 409
+    assert response.status_code == 409 and "is not this package" in response.json()[
+        "detail"]
     assert served["store"].receipt(served["id"]) is None
     refused = events(served["ledger"], "receipt_refused")
     assert len(refused) == 1 and refused[0]["reported_sha256"] == "0" * 64
+    assert refused[0]["expected_sha256"] == served["store"].manifest(served["id"])[
+        "zip"]["sha256"]
     assert events(served["ledger"], "received") == []
 
 
 def test_a_receipt_without_a_hash_is_kept_unverified(served: Dict[str, Any]) -> None:
+    fetch(served)
     served["client"].post(
         f"/v1/packages/{served['id']}/receipt", headers=bearer(READER))
     served["client"].post(
@@ -849,12 +870,68 @@ def disposable(kraken: Dict[str, Any], package_id: str) -> Path:
     return kraken["originals"] / "disposable" / "kraken" / package_id
 
 
-def receive(served: Dict[str, Any], token: Dict[str, Any] = READER, sha: Optional[str] = "") -> Any:
-    """Acknowledge the served package, with its own hash unless told otherwise."""
+def receive(served: Dict[str, Any], token: Dict[str, Any] = READER, sha: Optional[str] = "",
+            download: bool = True) -> Any:
+    """Download the served package, then acknowledge it with its own hash unless told otherwise."""
+    if download:
+        fetch(served, token)
     body = {} if sha is None else {
         "zip_sha256": sha or served["store"].manifest(served["id"])["zip"]["sha256"]}
     return served["client"].post(f"/v1/packages/{served['id']}/receipt",
                                  headers=bearer(token), json=body)
+
+
+def test_a_receipt_needs_a_complete_download_by_the_same_token(served: Dict[str, Any]) -> None:
+    """The list publishes the hash; knowing it is not holding the bytes."""
+    response = receive(served, download=False)
+
+    assert response.status_code == 409 and "no complete download" in response.json()[
+        "detail"]
+    assert served["store"].receipt(served["id"]) is None
+    refused = served["ledger"].read(event="receipt_refused")["events"]
+    assert refused[0]["reason"] == "no complete download by this token"
+
+    fetch(served, FETCHER)
+    assert receive(served, download=False).status_code == 409, \
+        "another token's download is not this token's"
+
+    fetch(served)
+    assert receive(served, download=False).status_code == 201
+
+
+def test_a_resumed_download_counts_when_its_ranges_cover_the_zip(served: Dict[str, Any]) -> None:
+    size = served["store"].find(served["id"])["zip"].stat().st_size
+
+    fetch(served, byte_range="bytes=100-")
+    assert receive(
+        served, download=False).status_code == 409, "the first 100 bytes are missing"
+
+    fetch(served, byte_range="bytes=0-99")
+    assert receive(served, download=False).status_code == 201
+    assert size > 100
+
+
+def test_an_abandoned_download_and_its_resumption_count_together(served: Dict[str, Any]) -> None:
+    """
+    A resumed download's first attempt was abandoned by definition. It counts for
+    the bytes it handed over; the rest comes from the resumption; the hash in the
+    receipt proves the client holds them all.
+    """
+    size = served["store"].find(served["id"])["zip"].stat().st_size
+    half = size // 2
+    served["ledger"].append("served", package_id=served["id"], consumer="ide", range=None,
+                            status=200, content_length=size, bytes_sent=half,
+                            complete=False, disconnected=True)
+
+    assert receive(
+        served, download=False).status_code == 409, "half is not the whole"
+
+    fetch(served, byte_range=f"bytes={half + 10}-")
+    assert receive(
+        served, download=False).status_code == 409, "ten bytes never left"
+
+    fetch(served, byte_range=f"bytes={half}-")
+    assert receive(served, download=False).status_code == 201
 
 
 def test_stage_a_moves_the_packed_originals_out_and_keeps_two_copies(
@@ -963,7 +1040,8 @@ def test_a_receipt_without_the_hash_moves_nothing_on(served: Dict[str, Any]) -> 
     assert served["store"].find(served["id"])["state"] == "ready"
     assert awaiting(served["kraken"], served["id"]).exists()
     assert not disposable(served["kraken"], served["id"]).exists()
-    created = datetime.fromisoformat(served["store"].manifest(served["id"])["created_at"])
+    created = datetime.fromisoformat(
+        served["store"].manifest(served["id"])["created_at"])
     assert lifecycle.health(served["config"], served["store"],
                             now=created + timedelta(days=15))["reasons"] == ["receipt_overdue"]
 
@@ -1155,3 +1233,107 @@ def test_the_operator_is_warned_once_a_day_per_reason(tmp_path: Path) -> None:
     asyncio.run(service._warn({"status": "ok", "reasons": [], "overdue": []}))
     asyncio.run(service._warn(degraded))
     assert len(sent) == 2, "a reason that cleared and came back is news again"
+
+
+# --------------------------------------------------------------------- the pickup client
+
+
+def take(served: Dict[str, Any], token: Dict[str, Any], out: Path, **kwargs: Any) -> Dict[str, Any]:
+    """Run the pickup client against the served API, as a consumer would."""
+    results = pickup("http://testserver", token["token"], out, session=served["client"],
+                     log=lambda line: None, **kwargs)
+    assert len(results) == 1
+    return results[0]
+
+
+def test_the_pickup_client_rehearses_with_a_dev_token(served: Dict[str, Any], tmp_path: Path) -> None:
+    """Every check runs on both sides; nothing is marked, nothing moves, the real receipt stays open."""
+    result = take(served, OPERATOR, tmp_path / "pickup")
+
+    assert result["ok"] is True and result["files"] == 2
+    assert result["receipt_status"] == 200 and result["receipt"]["dev"] is True
+    assert served["store"].receipt(served["id"]) is None
+    assert served["store"].find(served["id"])["state"] == "ready"
+    assert awaiting(served["kraken"], served["id"]).exists()
+    assert len(served["ledger"].read(event="dev_received")["events"]) == 1
+    assert served["ledger"].read(event="received")["events"] == []
+
+    real = take(served, READER, tmp_path / "ide")
+    assert real["receipt_status"] == 201
+    assert served["store"].find(served["id"])["state"] == "delivered"
+
+
+def test_a_dev_receipt_still_needs_the_download_and_the_hash(served: Dict[str, Any]) -> None:
+    assert receive(served, OPERATOR, download=False).status_code == 409
+    assert receive(served, OPERATOR, sha="0" * 64).status_code == 409
+    assert receive(served, OPERATOR).status_code == 200
+
+
+def test_a_dev_receipt_stands_on_nothing_not_even_a_real_one(
+        served: Dict[str, Any], tmp_path: Path) -> None:
+    """A repeated real receipt passes on its original; a rehearsal is checked every time."""
+    assert receive(served).status_code == 201
+    other = tmp_path / "fresh-ledger"
+    served["ledger"]._path = other / "ledger.jsonl"
+    served["ledger"]._lock_path = other / ".ledger.lock"
+
+    assert receive(served, OPERATOR, download=False).status_code == 409
+
+
+def test_the_client_checks_every_file_not_only_the_zip(served: Dict[str, Any], tmp_path: Path) -> None:
+    """A zip whose own hash is right but whose manifest names other bytes is not taken."""
+    from python.packages.pickup import PickupError, verify
+
+    manifest = json.loads(json.dumps(served["store"].manifest(served["id"])))
+    manifest["members"][0]["sha256"] = "0" * 64
+
+    with pytest.raises(PickupError, match="not the manifest's SHA-256"):
+        verify(served["store"].find(served["id"])["zip"], manifest)
+
+
+def test_the_pickup_client_takes_a_package_for_real(served: Dict[str, Any], tmp_path: Path) -> None:
+    result = take(served, READER, tmp_path / "ide")
+
+    kept = tmp_path / "ide" / \
+        served["store"].manifest(served["id"])["zip"]["name"]
+    assert result["ok"] is True and result["receipt_status"] == 201
+    assert hashlib.sha256(
+        kept.read_bytes()).hexdigest() == result["zip_sha256"]
+    assert disposable(served["kraken"], served["id"]).exists()
+
+
+def test_the_pickup_client_resumes_a_cut_download(served: Dict[str, Any], tmp_path: Path) -> None:
+    """The first attempt left half the zip; the next run asks for the rest and is accepted."""
+    whole = served["store"].find(served["id"])["zip"].read_bytes()
+    name = served["store"].manifest(served["id"])["zip"]["name"]
+    out = tmp_path / "ide"
+    out.mkdir()
+    half = len(whole) // 2
+    (out / f"{name}.part").write_bytes(whole[:half])
+    served["ledger"].append("served", package_id=served["id"], consumer="ide", range=None,
+                            status=200, content_length=len(whole), bytes_sent=half,
+                            complete=False, disconnected=True)
+
+    result = take(served, READER, out)
+
+    assert result["resumed_from"] == half
+    assert result["ok"] is True and result["receipt_status"] == 201
+    assert (out / name).read_bytes() == whole
+    asked = served["ledger"].read(event="served")["events"][-1]
+    assert asked["range"] == f"bytes={half}-" and asked["status"] == 206
+
+
+def test_the_pickup_client_does_not_acknowledge_what_does_not_match(
+        served: Dict[str, Any], tmp_path: Path) -> None:
+    """A part file that was not this package's beginning makes a zip with another hash."""
+    whole = served["store"].find(served["id"])["zip"].read_bytes()
+    name = served["store"].manifest(served["id"])["zip"]["name"]
+    out = tmp_path / "ide"
+    out.mkdir()
+    (out / f"{name}.part").write_bytes(b"\0" * (len(whole) // 2))
+
+    result = take(served, READER, out)
+
+    assert result["ok"] is False and "SHA-256" in result["error"]
+    assert "receipt_status" not in result
+    assert served["store"].receipt(served["id"]) is None

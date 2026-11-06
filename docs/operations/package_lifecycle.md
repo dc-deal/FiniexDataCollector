@@ -38,8 +38,15 @@ instant, and never a copy.
    describes. Moved, not deleted: the zip and the originals are two copies on our side.
 3. **Fetch.** On the consumer's schedule, not ours. Every download is booked in the ledger.
 4. **Receipt.** The consumer acknowledges the package with the SHA-256 it computed over the zip.
-   A matching hash makes it **confirmed**; another hash is refused with `409` and changes
-   nothing; a receipt without a hash is kept but proves nothing, and nothing moves on.
+   Two things must hold, or the receipt is refused with `409` and nothing changes:
+   - **(a) the ledger shows that every byte of the zip left for this very token.** Each
+     download counts for the bytes it handed over, from where it began, so a download that was
+     cut and resumed adds up. Another token's download does not count. This is needed because
+     the hash alone proves knowledge, not possession: the list publishes it.
+   - **(b) the reported hash is the zip's.** It proves that what left also arrived intact.
+
+   Both holding makes the package **confirmed**. A receipt without a hash is kept but proves
+   nothing, and nothing moves on.
 5. **Stage B.** A confirmed package moves to `delivered/`, and its originals from `awaiting/` to
    `disposable/`. The bytes now exist on two machines.
 6. **Purge.** The only step that deletes, only from `disposable/`, and only what it proves again
@@ -50,6 +57,20 @@ packing run, right after a receipt, every ten minutes in the service, and at its
 crash cut short - zip already in `delivered/`, manifest not yet - is found from either side and
 finished. A file another process holds open (Windows refuses to move it) stays where it is and
 is tried again next time.
+
+## Rehearsing the consumer's path
+
+`python -m python.packages pickup` is the consumer's side, run from anywhere with an endpoint
+from `user_configs/remote_endpoints.json`: it lists what waits, downloads each zip (resuming a
+cut download from its `.part`), checks the zip's hash, unpacks into a temporary folder, checks
+every member's name, size and hash against the manifest, and only then acknowledges with the
+hash it computed. It is the reference for the consumer's importer, step for step.
+
+Run with a token listed in `packages.dev_consumers`, its receipt is a **rehearsal**: the server
+runs every check - complete download, hash - and books `dev_received`, but marks nothing and
+moves nothing, so the package stays `ready` and the consumer's real receipt stays open. A
+rehearsal is checked every time and never stands on an earlier receipt. A consumer's token is
+never in that list; ours can stay there as a test rig.
 
 ## Purge
 
@@ -158,6 +179,8 @@ hashes. `purge --apply` - if the disk is below the target - deletes the two file
 
 - The consumer reports another hash: `409`, nothing moves; the package stays in `ready\`, the
   originals in `awaiting\`, and the ledger has `receipt_refused`.
+- The consumer acknowledges without having downloaded the whole zip with its own token:
+  `409`, `receipt_refused` with the reason, nothing moves.
 - The consumer acknowledges without a hash: kept, proves nothing; nothing moves, and after
   14 days the package is `receipt_overdue`.
 - No receipt for 14 days: a Telegram message, health `degraded`, the outside check alarms.

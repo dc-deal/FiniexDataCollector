@@ -75,6 +75,58 @@ def _exclusive(lock_path: Path) -> Iterator[None]:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _range_start(header: Optional[str], size: int) -> Optional[int]:
+    """Where a single `Range: bytes=...` began; None for anything else."""
+    if not header or not header.startswith("bytes=") or "," in header:
+        return None
+    first, _, last = header[len("bytes="):].partition("-")
+    try:
+        if first == "":
+            return max(0, size - int(last))
+        return int(first)
+    except ValueError:
+        return None
+
+
+def downloaded_whole(events: List[Dict[str, Any]], consumer: str, size: int) -> bool:
+    """
+    Did every byte of a file of this size leave for this consumer, by the ledger?
+
+    Each download counts for the bytes it handed over, from where it began: a whole
+    one from the first byte, a ranged one from its range's start. An abandoned
+    download counts too - that is what makes a resumed download work, whose first
+    attempt was abandoned by definition - and what it handed over covers what the
+    client resumed from, since a client resumes from what it holds. Whether the
+    bytes arrived intact is not this function's question: the hash in the receipt
+    answers it.
+
+    Args:
+        events: The package's `served` events
+        consumer: The token name that wants to acknowledge
+        size: The zip's size
+
+    Returns:
+        True when the handed-over spans cover the file from first byte to last
+    """
+    spans = []
+    for event in events:
+        if event.get("event") != "served" or event.get("consumer") != consumer:
+            continue
+        sent = int(event.get("bytes_sent") or 0)
+        if event.get("status") == 200:
+            spans.append((0, sent))
+        elif event.get("status") == 206:
+            start = _range_start(event.get("range"), size)
+            if start is not None:
+                spans.append((start, start + sent))
+    reached = 0
+    for start, end in sorted(spans):
+        if start > reached:
+            break
+        reached = max(reached, end)
+    return size > 0 and reached >= size
+
+
 def packed_fields(manifest: Dict[str, Any]) -> Dict[str, Any]:
     """The `packed` event of a committed package, from its manifest."""
     return {

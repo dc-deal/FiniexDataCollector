@@ -487,7 +487,14 @@ run deletes nothing, a full purge ignores the target; purge proves every file ag
 package with an extra, missing, resized or altered file or a damaged zip, and one put into
 `disposable` by hand without a verified receipt; the remote purge is its own grant and never
 full; health names each reason; the operator is warned once a day per reason; and no route can
-pack - the full list of routes is held in the test.
+pack - the full list of routes is held in the test. On receipts and the pickup client: a receipt
+needs a complete download by the same token, another token's does not count; a resumed download
+counts when its ranges cover the zip, an abandoned attempt and its resumption together; the hash
+check refuses on its own after a complete download; the pickup client rehearses with a dev token -
+every check runs, nothing is marked, the real receipt stays open - and a dev receipt needs the
+download and the hash every time, never standing on a real one; the client takes a package for
+real, resumes a cut download with `Range`, does not acknowledge a zip that does not match, and
+checks every file, not only the zip.
 
 ### `tests/utils/test_memory_trail.py`
 
