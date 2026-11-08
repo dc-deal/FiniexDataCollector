@@ -15,6 +15,8 @@ Links only. Order within a section is reading priority — the first entry is wh
 - [Running the collector](operations/running_the_collector.md)
 - [Watching a collector](operations/watching_a_collector.md)
 - [Running as a service](operations/running_as_a_service.md)
+- [Tick packages](operations/tick_packages.md)
+- [Package lifecycle](operations/package_lifecycle.md)
 
 ## Tests
 

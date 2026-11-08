@@ -449,6 +449,56 @@ days; a reversed or too long window is a 400; a naive time is UTC; a finished da
 a grown file again; a credential in a record is masked; the route needs its own grant, which a
 status token does not hold.
 
+### `tests/packages/test_packages.py`
+
+A consumer imports a week as one step and files the zip as its raw source of truth, so every
+finished file has to be in exactly one package, unchanged, and described truthfully.
+[tick_packages.md](../operations/tick_packages.md) is the reference.
+
+Defends: the members are the files byte for byte, Deflate, and the manifest's checksums are of
+those bytes; the next package takes only new files and names its predecessor; a file reaching
+past the cutoff waits whole, and one that appears late is taken by the next run, never skipped;
+no file is in two packages; no mint, no package; a member with another identity, an unparseable
+file and every open `.part` (including a complete MT5 orphan) stay out and are named; nothing new
+makes no package; a run that died is removed and built again; the package folder must take a
+probe file; a package may not push the disk below its free share; the quiet minutes and a future
+cutoff are refused; a live lock refuses a second packer and a stale one is taken over; MT5 is cut
+on collected time, not broker time; outages and process starts ride along from the collector's
+log, and are `null` for a producer without one; the configuration refuses a `subdir` that climbs
+out and a schedule in the quiet minutes. On the API: a token and the grant are needed, every
+identity route refuses a token holding nothing, the zip is served whole and resumed with `Range`,
+a crafted id is not found, the first receipt stands and a repeated one moves nothing, fetching is
+not acknowledging, health is open and names no content, and the grant vocabulary is the service's
+own. On the ledger: a committed package is booked with its members; packages older than the ledger
+are entered late, and once; a whole and a resumed download are booked complete with their range,
+and one the client abandons incomplete, with the disconnect; bytes are counted even where a server
+offers to send the path instead; a receipt with the right hash is verified, one with another hash is
+refused and booked, one without stays unverified, and a repeated one is not a second receipt; the
+ledger route needs the grant and shows a token only its own packages' lines; and a torn line is
+counted while the next event starts a line of its own. On the lifecycle
+([package_lifecycle.md](../operations/package_lifecycle.md)): stage A moves the packed originals
+out and keeps two copies, leaving held files where they are; a zip that gives back other bytes is
+no package and nothing moves; a file changed since packing is not staged; a file another process
+holds stays and is moved by the next settle; staging needs the right to change the source
+folder, checked before the zip; a verified receipt delivers the package and makes its originals
+disposable, one without the hash moves nothing on even when the housekeeping comes by; a move cut
+short is finished by the next settle; purge stops at its target and does nothing above it, a dry
+run deletes nothing, a full purge ignores the target; purge proves every file again and keeps a
+package with an extra, missing, resized or altered file or a damaged zip, and one put into
+`disposable` by hand without a verified receipt; the remote purge is its own grant and never
+full; health names each reason; the operator is warned once a day per reason; and no route can
+pack - the full list of routes is held in the test. On receipts and the pickup client: a receipt
+needs a complete download by the same token, another token's does not count; a resumed download
+counts when its ranges cover the zip, an abandoned attempt and its resumption together; the hash
+check refuses on its own after a complete download; the pickup client rehearses with a dev token -
+every check runs, nothing is marked, the real receipt stays open - and a dev receipt needs the
+download and the hash every time, never standing on a real one; the client takes a package for
+real, resumes a cut download with `Range`, does not acknowledge a zip that does not match, and
+checks every file, not only the zip. On the weekly report: it says what each collector's run came
+to, as INFO when all went well and as a WARNING with the reason and any original left unmoved
+otherwise; the service sends it after every run, and says so when a run produced nothing at all;
+and the schedule reports right after it packs.
+
 ### `tests/utils/test_memory_trail.py`
 
 The memory trail exists for the slope, so every figure in a line has to be a delta over its own
