@@ -4,7 +4,7 @@
 
 > ⚠️ **No financial advice.** This software is for educational and research purposes only.
 
-> **Version:** 1.2.1  
+> **Version:** 1.3.0  
 > **Status:** Production Ready  
 > **Target:** Developers who need reliable tick data for backtesting systems
 
@@ -62,6 +62,19 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 - **Off by default** - `api.enabled` in the configuration; it binds loopback and the port
   never reaches the internet directly
 - See [docs/architecture/status_api.md](docs/architecture/status_api.md)
+
+### Tick Packages
+- **A program of its own beside the collector** (`python -m python.packages`) - once a week it
+  seals every finished tick file, the collector's and the MT5 terminal's, into one Deflate zip
+  per collector with a manifest: per file its SHA-256, tick count and time bounds
+- **Fetched, not pushed** - a consumer downloads a package (resumable), checks it and
+  acknowledges it with the zip's hash; the receipt counts only after a complete download by
+  the same token
+- **The originals leave only after that** - packed files move to a holding folder, become
+  disposable once confirmed, and are deleted only by an operator's `purge`, which proves every
+  file again first. A ledger books every step
+- See [docs/operations/tick_packages.md](docs/operations/tick_packages.md) and
+  [docs/operations/package_lifecycle.md](docs/operations/package_lifecycle.md)
 
 ### Monitoring & Health
 - **Live Display** - Real-time status with Rich TUI interface
