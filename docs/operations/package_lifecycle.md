@@ -109,7 +109,8 @@ The service takes its verdict every ten minutes. `degraded`, with a reason:
 | `disposable_large` | confirmed originals take more than `disposable_warn_gb` (10): time to purge |
 | `last_run_failed`, `last_run_refused` | a collector's latest packing run failed, or refused to start |
 
-The operator hears of it by Telegram, at most once a day per reason. The consumer hears of it
+The operator hears of it by Telegram, at most once a day per reason - and of every weekly run
+anyway, in a summary sent right after it. The consumer hears of it
 through the outside check: the service pings it only while healthy, so a `degraded` service
 goes quiet there, and an outside check that alarms is what the consumer's basic check reads.
 `/v1/packages/health` shows the status and the reason codes to anyone.

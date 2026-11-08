@@ -244,6 +244,11 @@ its own folders default to `./data/packages` and `./data/originals` under its ch
 - **Telegram is sending only.** The service warns through the collector's bot but never polls
   it: the collector reads the bot's commands, and a second reader would take its updates. At
   most one message per reason per day; a reason that clears and comes back is news again.
+- **Every weekly run reports to Telegram**, whatever it came to: per collector the new package
+  with its files, zip size, originals moved and files held for next week, or `nothing new`, or
+  the reason it was refused or failed; then the room the originals take and the disk's free
+  share. INFO when all went well, WARNING otherwise. Every week, so that silence is never the
+  only sign of a run. A `pack` by hand reports to its console, not to Telegram.
 - **The heartbeat** pings the outside check only while health is `ok`, the collector's pattern,
   and is a credential like the bot token: `user_configs/` only.
 - `paths.logs_dir` stays at its default: the service's log is its own, under its own checkout,

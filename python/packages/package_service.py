@@ -138,6 +138,41 @@ def alert_text(reason: str, verdict: Dict[str, Any], config: PackagesConfig,
     return f"The last packing run {wanted}. " + " | ".join(which)
 
 
+def run_report(results: List[Dict[str, Any]], space: Dict[str, Any]) -> Alert:
+    """
+    The weekly run, in one message: what each collector's run came to, and the room left.
+
+    INFO when every collector packed or had nothing new; WARNING when one was
+    refused or failed - the reason is in the message, and the health warning
+    follows on its own.
+    """
+    lines = []
+    for result in results:
+        name, outcome = result.get("source"), result.get("result")
+        if outcome == "packed":
+            held = result.get("held_for_next", 0)
+            not_staged = len(result.get("not_staged") or [])
+            lines.append(
+                f"{result['package_id']}: {result.get('member_count')} files, "
+                f"{result.get('zip_size_bytes', 0) / 1e6:.1f} MB zip, "
+                f"{result.get('staged', 0)} originals to awaiting"
+                + (f", {not_staged} NOT moved" if not_staged else "")
+                + (f", {held} held for next week" if held else ""))
+        elif outcome == "nothing_new":
+            lines.append(f"{name}: nothing new")
+        else:
+            lines.append(f"{name}: {outcome} - {result.get('reason', '')}")
+    disk = space["disk"]
+    lines.append(f"originals awaiting {space['awaiting']['bytes'] / 1e9:.2f} GB, "
+                 f"disposable {space['disposable']['bytes'] / 1e9:.2f} GB; "
+                 f"disk {disk['free_percent']} % free")
+    trouble = any(r.get("result") not in ("packed", "nothing_new")
+                  for r in results)
+    return Alert(level=AlertLevel.WARNING if trouble else AlertLevel.INFO,
+                 title="Tick packages: weekly run", message="\n".join(lines),
+                 timestamp=datetime.now(timezone.utc), source="FiniexPackages")
+
+
 class PackageService:
     """The API, the weekly schedule and the housekeeping."""
 
@@ -197,8 +232,32 @@ class PackageService:
                 remaining = (self._next_run -
                              datetime.now(timezone.utc)).total_seconds()
                 await asyncio.sleep(max(1.0, min(remaining, 300.0)))
-            await self.run_once()
+            results = await self.run_once()
+            await self.report(results)
             await self.housekeeping()
+
+    async def report(self, results: List[Dict[str, Any]]) -> bool:
+        """
+        The weekly run's summary to the operator's phone - every week, not only
+        when something went wrong, so that silence is never the only sign of a run.
+
+        Returns:
+            True when it was sent
+        """
+        if self._telegram is None:
+            return False
+        if results:
+            alert = run_report(results, lifecycle.storage(self._config))
+        else:
+            alert = Alert(level=AlertLevel.WARNING, title="Tick packages: weekly run",
+                          message="The run produced no result at all - see the service's log.",
+                          timestamp=datetime.now(timezone.utc), source="FiniexPackages")
+        try:
+            return await self._telegram.send_alert(alert)
+        except Exception as e:
+            self._logger.warning(
+                f"[PACKAGE] could not report the run: {describe_exception(e)}")
+            return False
 
     async def run_once(self) -> List[Dict[str, Any]]:
         """One packing run, off the event loop."""

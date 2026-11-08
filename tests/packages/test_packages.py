@@ -1377,3 +1377,104 @@ def test_the_pickup_client_does_not_acknowledge_what_does_not_match(
     assert result["ok"] is False and "SHA-256" in result["error"]
     assert "receipt_status" not in result
     assert served["store"].receipt(served["id"]) is None
+
+
+# --------------------------------------------------------------------- the weekly report
+
+
+SPACE = {"awaiting": {"bytes": 300_000_000}, "disposable": {"bytes": 2_860_000_000},
+         "disk": {"free_percent": 60.8}}
+
+
+def test_the_weekly_report_says_what_each_run_came_to() -> None:
+    from python.alerts.base import AlertLevel
+    from python.packages.package_service import run_report
+
+    report = run_report([
+        {"source": "kraken", "result": "packed", "package_id": "kraken-0002-20261108",
+         "member_count": 22, "zip_size_bytes": 18_300_000, "staged": 22, "not_staged": [],
+         "held_for_next": 1},
+        {"source": "mt5", "result": "nothing_new"},
+    ], SPACE)
+
+    assert report.level == AlertLevel.INFO
+    assert "kraken-0002-20261108: 22 files, 18.3 MB zip, 22 originals to awaiting, " \
+           "1 held for next week" in report.message
+    assert "mt5: nothing new" in report.message
+    assert "disk 60.8 % free" in report.message
+
+
+def test_a_run_that_went_wrong_is_reported_as_a_warning_with_its_reason() -> None:
+    from python.alerts.base import AlertLevel
+    from python.packages.package_service import run_report
+
+    report = run_report([
+        {"source": "kraken", "result": "packed", "package_id": "kraken-0002-20261108",
+         "member_count": 22, "zip_size_bytes": 18_300_000, "staged": 21,
+         "not_staged": [{"name": "x", "reason": "in use"}], "held_for_next": 0},
+        {"source": "mt5", "result": "refused",
+            "reason": "no instance.json in the folder"},
+    ], SPACE)
+
+    assert report.level == AlertLevel.WARNING
+    assert "1 NOT moved" in report.message
+    assert "mt5: refused - no instance.json in the folder" in report.message
+
+
+def test_the_service_reports_every_run_and_says_so_when_there_was_none(tmp_path: Path) -> None:
+    """Every week, not only on failure: silence is never the only sign of a run."""
+    import asyncio
+
+    from python.packages.package_service import PackageService
+
+    service = PackageService(PackagesConfig(output_dir=str(tmp_path / "p"),
+                                            originals_dir=str(tmp_path / "o")), {})
+    assert asyncio.run(service.report(
+        [{"source": "mt5", "result": "nothing_new"}])) is False
+
+    sent: List[Any] = []
+
+    class Telegram:
+        async def send_alert(self, alert: Any) -> bool:
+            sent.append(alert)
+            return True
+
+    service._telegram = Telegram()
+    assert asyncio.run(service.report(
+        [{"source": "mt5", "result": "nothing_new"}])) is True
+    assert asyncio.run(service.report([])) is True
+
+    assert "mt5: nothing new" in sent[0].message
+    assert "no result at all" in sent[1].message
+
+
+def test_the_weekly_schedule_reports_after_it_packs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from python.packages import package_service as service_module
+    from python.packages.package_service import PackageService
+
+    service = PackageService(PackagesConfig(output_dir=str(tmp_path / "p"),
+                                            originals_dir=str(tmp_path / "o")), {})
+    order: List[str] = []
+    monkeypatch.setattr(service_module, "next_run",
+                        lambda *args: datetime.now(timezone.utc) - timedelta(seconds=1))
+
+    async def packed() -> List[Dict[str, Any]]:
+        order.append("pack")
+        return [{"source": "mt5", "result": "nothing_new"}]
+
+    async def reported(results: List[Dict[str, Any]]) -> bool:
+        order.append(f"report {results[0]['result']}")
+        return True
+
+    async def stop() -> None:
+        order.append("housekeeping")
+        raise asyncio.CancelledError()
+
+    service.run_once, service.report, service.housekeeping = packed, reported, stop
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(service._schedule())
+
+    assert order == ["pack", "report nothing_new", "housekeeping"]

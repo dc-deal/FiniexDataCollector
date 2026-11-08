@@ -494,7 +494,10 @@ check refuses on its own after a complete download; the pickup client rehearses 
 every check runs, nothing is marked, the real receipt stays open - and a dev receipt needs the
 download and the hash every time, never standing on a real one; the client takes a package for
 real, resumes a cut download with `Range`, does not acknowledge a zip that does not match, and
-checks every file, not only the zip.
+checks every file, not only the zip. On the weekly report: it says what each collector's run came
+to, as INFO when all went well and as a WARNING with the reason and any original left unmoved
+otherwise; the service sends it after every run, and says so when a run produced nothing at all;
+and the schedule reports right after it packs.
 
 ### `tests/utils/test_memory_trail.py`
 
