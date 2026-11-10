@@ -1,6 +1,7 @@
 # Package lifecycle
 
-A package is built once a week, but the original tick files it was built from have to go
+A package is built on a schedule, weekly and on special dates, but the original tick files it
+was built from have to go
 somewhere, and the disk they fill is the collector's. Deleting them after packing would leave
 one copy, on the same disk, until the consumer has fetched it. Keeping them forever fills the
 disk. This document is the path in between: where a package and its originals are at each
@@ -30,7 +31,9 @@ instant, and never a copy.
 
 ## The steps
 
-1. **Pack.** The weekly run builds the zip, reads every member back out of it and compares its
+1. **Pack.** A run of the schedule - the weekly one, or a special one
+   ([tick_packages.md](tick_packages.md#the-schedule)) - builds the zip, reads every member back
+   out of it and compares its
    SHA-256 with the original's, and writes the manifest. The package is in `ready/`. A zip that
    gives back other bytes is no package, and nothing moves.
 2. **Stage A.** Right after, the originals move from the collector's folder to
@@ -109,8 +112,8 @@ The service takes its verdict every ten minutes. `degraded`, with a reason:
 | `disposable_large` | confirmed originals take more than `disposable_warn_gb` (10): time to purge |
 | `last_run_failed`, `last_run_refused` | a collector's latest packing run failed, or refused to start |
 
-The operator hears of it by Telegram, at most once a day per reason - and of every weekly run
-anyway, in a summary sent right after it. The consumer hears of it
+The operator hears of it by Telegram, at most once a day per reason - and of every run,
+weekly or special, anyway, in a summary sent right after it. The consumer hears of it
 through the outside check: the service pings it only while healthy, so a `degraded` service
 goes quiet there, and an outside check that alarms is what the consumer's basic check reads.
 `/v1/packages/health` shows the status and the reason codes to anyone.

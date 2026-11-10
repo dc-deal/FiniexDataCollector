@@ -26,8 +26,10 @@ class PackageToken(ConsumerTokenBase):
     being able to mark them received. `purge` deletes confirmed originals - the
     one destructive thing this service does, and the operator's alone: a consumer
     that can confirm a package must not also be able to make the evidence go.
+    `schedule` plans special runs and sets the weekly run aside - the operator's
+    too: a consumer that could order packages could pile them up.
     """
-    GRANT_SURFACES = ("packages", "receipts", "purge")
+    GRANT_SURFACES = ("packages", "receipts", "purge", "schedule")
 
 
 def load_package_tokens(configured: Optional[Dict[str, Any]] = None) -> TokenRegistry:

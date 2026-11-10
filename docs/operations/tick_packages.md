@@ -2,8 +2,9 @@
 
 A consumer that imports our ticks wants the transfer to be one step: fetch a package, check
 it, import it, file the zip unchanged as its raw source of truth, acknowledge it. Packing files
-by hand is where the errors came from. The package service does the packing, once a week, for
-every collector on the machine, the Kraken collector and the MT5 terminal's collector alike.
+by hand is where the errors came from. The package service does the packing on a schedule -
+weekly, and on special dates the operator plans - for every collector on the machine, the
+Kraken collector and the MT5 terminal's collector alike.
 
 **Not in here:** what happens to a package and its original files after it is built - stage A,
 the receipt, stage B, `purge` - which is [package_lifecycle.md](package_lifecycle.md), with a
@@ -38,7 +39,8 @@ time, two or three hours ahead of UTC.
   covers whole days. The weekly run is Sunday 20:00 UTC, which makes the cutoff Sunday 00:00.
   Sunday evening because forex is closed until 21:00 or 22:00 UTC: the run meets an idle MT5
   terminal. An MT5 file still open on Friday stays open over the weekend - no ticks arrive to
-  fill it - and goes into the package of the week it closes in.
+  fill it - and goes into the package of the week it closes in. A special run packs to a day
+  boundary of its own; see [the schedule](#the-schedule).
 - **The cutoff bounds a package from above only.** A finished file that still reaches past it
   is held for the next package, and listed in `held_for_next`. A file that appears late (one
   recovered from a write-ahead log, or by hand) is taken by the next run, never skipped. So every
@@ -58,6 +60,48 @@ time, two or three hours ahead of UTC.
 The orphan case is real for MT5: it writes a file's footer and then renames it, so a failed
 rename leaves a complete, valid file under the `.part` name. Whether that file is done is a
 judgement for a person, not for the packer.
+
+## The schedule
+
+Nothing is packed because a request asked for it. Packages come from the schedule, and the
+schedule says in advance what will come when: a consumer reads it on an open route and plans its
+pickups. Only the operator's `schedule` grant changes it.
+
+- **The weekly run** is the configured rule, Sunday 20:00 UTC. It stays as configured, and it can
+  be **set aside**: the next run only, or every run before a date. A run set aside packs nothing
+  and books `weekly_set_aside`; the next one takes everything since, because a package takes every
+  finished file no earlier package holds. `resume` lifts both.
+- **A special run** packs one collector, or `all`, to a cutoff the operator names. Every cutoff is
+  a UTC day boundary: the collector seals each day at 00:00 UTC, its Kraken files at the day cut
+  and the MT5 terminal's at the same moment, so a cutoff in the middle of a day would leave every
+  quiet symbol's file open and the package close to empty. For the same reason a second run on
+  the same day would find nothing new.
+- **When it packs:** by default at `special_hour:special_minute` UTC on its cutoff day, 01:00, or a
+  few minutes from now when that has passed. Never earlier than `special_after_seal_minutes` (30)
+  after its cutoff, when the sealed files are certainly written, and never in the quiet minutes.
+
+**Limits, checked on every change and refused with `409` and the rule:**
+
+| rule | why |
+|---|---|
+| one special run per collector per cutoff day | a second finds nothing new |
+| at most `special_max_per_week` (2) per collector per ISO week, cancelled ones not counted | packages must not pile up |
+| none within `special_blackout_hours` (24) before a weekly run that is not set aside | the weekly run would come out almost empty |
+| none to the weekly run's own cutoff, before it or after it | one of the two would find nothing |
+| `run_at` in the past, before the seal, or in 23:55-00:15 UTC | |
+
+A run for `all` counts for every collector. A weekly run set aside neither blocks a special run
+before it nor covers its cutoff.
+
+**How it runs.** The service looks at the schedule every 30 seconds, so a special run planned
+meanwhile starts within that much of its time. Special runs that are due run first, then the
+weekly run when its time has come; nothing starts in the quiet minutes. A special run whose time
+passed while the service was down runs at its next start; a weekly run missed that way is not
+made up, and the next one takes what it would have. Each run reports to Telegram like the weekly
+run, titled with its cutoff.
+
+The schedule is kept in `<output_dir>/schedule.json`, written atomically. Every change is booked
+in the ledger with the token's name; the open route names none.
 
 ## The mint
 
@@ -127,11 +171,17 @@ loopback.
 | `POST /v1/packages/{package_id}/receipt` | `receipts:<id>` | "received and imported"; body `{"note": "...", "zip_sha256": "..."}`, both optional |
 | `GET /v1/packages/purge` | `purge` | what a purge would delete now; `?target_free_percent=` |
 | `POST /v1/packages/purge` | `purge` | delete confirmed originals until the target; body `{"target_free_percent": 50}` optional |
-| `GET /v1/packages/health` | open | `status` `ok` or `degraded`, `reasons` as codes, the next run, each collector's last result |
+| `GET /v1/packages/health` | open | `status` `ok` or `degraded`, `reasons` as codes, the next weekly run and whether it is set aside, the next special run, each collector's last result and how long that run took |
+| `GET /v1/packages/schedule` | open | the next four weekly runs with cutoff and `set_aside`, the special runs planned or run in the last 14 days, and the limits |
+| `POST /v1/packages/schedule` | `schedule` | plan a special run; body `{"collector": "kraken", "cutoff": "2026-11-18"}`, optional `"run_at"` with its offset; `201`, or `409` with the rule |
+| `DELETE /v1/packages/schedule/{special_id}` | `schedule:<id>` | cancel a planned special run |
+| `POST /v1/packages/schedule/weekly` | `schedule` | `{"action": "set_aside"}`, optional `"until": "2026-12-01"`; or `{"action": "resume"}` |
 
-- **No route packs.** A package is built by the weekly schedule or by `pack` on the machine,
-  never because a request asked; `tests/packages/test_packages.py` holds the full list of
+- **No route packs.** A package is built by the schedule or by `pack` on the machine, never
+  because a request asked. The schedule routes plan a run, under the operator's grant and the
+  limits above; none starts one. `tests/packages/test_packages.py` holds the full list of
   routes so that one added later is looked at.
+- **`schedule` is the operator's.** A consumer that could order packages could pile them up.
 - **`purge` is the operator's, and a surface of its own.** A consumer that can confirm a package
   must not also be able to make the evidence go. The remote purge always stops at the target;
   a full purge is a command on the machine. [package_lifecycle.md](package_lifecycle.md) says
@@ -157,7 +207,8 @@ loopback.
   given the downloads without the right to mark anything received.
 - **No route parses a tick file.** Each reads a manifest, a receipt or a zip that already
   exists. The parsing happens once per file, when its package is built.
-- **The grant vocabulary is the service's own**, `packages` and `receipts`, and its tokens
+- **The grant vocabulary is the service's own**, `packages`, `receipts`, `purge` and
+  `schedule`, and its tokens
   live in its own configuration. The collector validates every grant against its own
   surfaces at boot, so a `packages:*` in the collector's configuration would make a collector
   that restarts refuse to start.
@@ -174,7 +225,11 @@ database.
 | `packed` | a package is committed, after its manifest | the zip's size and SHA-256, and every member's name, SHA-256 and tick count: a second record of the contents beside the manifests |
 | `served` | a download ends, finished or not | consumer, `range`, `status`, `content_length`, `bytes_sent`, `complete`, `disconnected` |
 | `received` | the first acknowledgement | consumer, note, `zip_sha256`, `verified` |
-| `receipt_refused` | an acknowledgement with another hash | consumer, the reported and the expected hash |
+| `receipt_refused` | an acknowledgement with another hash, or without a complete download | consumer, the reported and the expected hash, or the reason |
+| `schedule_added`, `schedule_refused`, `schedule_cancelled` | a special run is planned, refused or cancelled | consumer, `special_id`, collector, cutoff, `run_at`; the rule for a refusal |
+| `schedule_weekly_set_aside`, `schedule_weekly_resumed` | the weekly run is set aside or resumed | consumer, `skip_run_at`, `suspended_until` |
+| `special_ran` | a special run finished | `special_id`, collector, cutoff, each collector's result |
+| `weekly_set_aside` | a weekly run's time came while it was set aside | `run_at` |
 
 - **`complete` means every byte was handed to the connection while the client was still there.**
   That is all this side can know. The server buffers, so `bytes_sent` runs ahead of what the client
@@ -221,6 +276,8 @@ its own folders default to `./data/packages` and `./data/originals` under its ch
   "packages": {
     "port": 8120,
     "weekday": "sunday", "hour": 20, "minute": 0,
+    "special_hour": 1, "special_minute": 0, "special_after_seal_minutes": 30,
+    "special_max_per_week": 2, "special_blackout_hours": 24,
     "min_free_percent": 30,
     "receipt_overdue_days": 14,
     "disposable_warn_gb": 10,
@@ -235,7 +292,7 @@ its own folders default to `./data/packages` and `./data/originals` under its ch
     "tokens": {
       "<consumer>": { "token": "<40 hex characters>", "grants": ["packages:*", "receipts:*"] },
       "<operator>": { "token": "<40 hex characters>",
-                      "grants": ["packages:*", "receipts:*", "purge:originals"] }
+                      "grants": ["packages:*", "receipts:*", "purge:originals", "schedule:*"] }
     }
   }
 }
@@ -244,7 +301,7 @@ its own folders default to `./data/packages` and `./data/originals` under its ch
 - **Telegram is sending only.** The service warns through the collector's bot but never polls
   it: the collector reads the bot's commands, and a second reader would take its updates. At
   most one message per reason per day; a reason that clears and comes back is news again.
-- **Every weekly run reports to Telegram**, whatever it came to: per collector the new package
+- **Every run reports to Telegram**, weekly or special, whatever it came to: per collector the new package
   with its files, zip size, originals moved and files held for next week, or `nothing new`, or
   the reason it was refused or failed; then the room the originals take and the disk's free
   share. INFO when all went well, WARNING otherwise. Every week, so that silence is never the
@@ -263,7 +320,16 @@ python -m python.packages purge                          # what a purge to the t
 python -m python.packages purge --apply [--full] [--target 50]
 python -m python.packages serve                          # API, schedule, housekeeping, heartbeat
 python -m python.packages pickup --endpoint live         # take packages as a consumer does, from anywhere
+python -m python.packages schedule --endpoint live       # the schedule, from anywhere
+python -m python.packages schedule --add kraken --cutoff 2026-11-18 [--run-at 2026-11-18T02:00:00+00:00]
+python -m python.packages schedule --cancel <special_id>
+python -m python.packages schedule --set-aside [--until 2026-12-01]
+python -m python.packages schedule --resume
 ```
+
+`schedule` reads the address and token from `user_configs/remote_endpoints.json`, like
+`pickup`, and never prints the token. A change goes through the routes and their limits like
+any other caller's.
 
 The operator's token is in `dev_consumers`: its receipts from `pickup` are rehearsals that mark
 nothing. That is what lets the whole path be tried against production before the consumer does.

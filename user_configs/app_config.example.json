@@ -66,6 +66,11 @@
     "weekday": "sunday",
     "hour": 20,
     "minute": 0,
+    "special_hour": 1,
+    "special_minute": 0,
+    "special_after_seal_minutes": 30,
+    "special_max_per_week": 2,
+    "special_blackout_hours": 24,
     "min_free_percent": 30,
     "receipt_overdue_days": 14,
     "disposable_warn_gb": 10,
@@ -90,8 +95,8 @@
       },
       "<operator>": {
         "token": "<40 hex characters, a different one>",
-        "grants": ["packages:*", "receipts:*", "purge:originals"],
-        "note": "Reads everything, rehearses receipts (listed in dev_consumers, so they mark nothing) and may purge confirmed originals. Never give purge to a consumer, never list one in dev_consumers."
+        "grants": ["packages:*", "receipts:*", "purge:originals", "schedule:*"],
+        "note": "Reads everything, rehearses receipts (listed in dev_consumers, so they mark nothing), may purge confirmed originals and changes the schedule. Never give purge or schedule to a consumer, never list one in dev_consumers."
       }
     }
   }

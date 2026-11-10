@@ -15,11 +15,20 @@ built, in a run of its own.
   GET  /v1/packages/purge                 purge      what a purge would delete
   POST /v1/packages/purge                 purge      delete confirmed originals to the target
   GET  /v1/packages/health                open       verdict and reasons, as codes
+  GET  /v1/packages/schedule              open       the weekly runs and the special runs to come
+  POST /v1/packages/schedule              schedule   plan a special run; 409 names the rule it breaks
+  DELETE /v1/packages/schedule/{id}       schedule   cancel a planned special run
+  POST /v1/packages/schedule/weekly       schedule   set the weekly run aside, or resume it
+
+No route packs. A package comes from the schedule, and only the `schedule` grant -
+the operator's - changes the schedule, within limits that keep packages from piling
+up (schedule.py).
 
 Location: python/packages/package_api.py
 """
 
 import re
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 import anyio
@@ -34,6 +43,7 @@ from starlette.types import Message, Receive, Scope, Send
 from python.packages import lifecycle
 from python.packages.ledger import Ledger, downloaded_whole
 from python.packages.package_store import PackageStore
+from python.packages.schedule import Schedule, ScheduleRefused
 from python.utils.config_loader import PackagesConfig
 from python.utils.logging_setup import describe_exception, get_logger
 
@@ -129,7 +139,9 @@ def create_package_api(
     ledger: Ledger,
     config: PackagesConfig,
     on_receipt: Optional[Callable[[str], None]] = None,
-    version: str = ""
+    version: str = "",
+    schedule: Optional[Schedule] = None,
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 ) -> FastAPI:
     """
     Build the package API.
@@ -143,11 +155,14 @@ def create_package_api(
         on_receipt: Called with the collector's name after a new receipt, so the
             service can move the package and its originals on without waiting
         version: The program's version, for the title
+        schedule: The schedule the service runs by; default one over the store's root
+        clock: The time the schedule routes judge by; tests drive it
 
     Returns:
         Configured FastAPI application
     """
     logger = get_logger("FiniexPackages")
+    schedule = schedule or Schedule(store.root, config)
 
     def book(event: str, **fields: Any) -> None:
         """A record, not a gate: a ledger that cannot be written stops nothing."""
@@ -174,7 +189,8 @@ def create_package_api(
         path and no package content - the reasons' detail is behind the token.
         """
         verdict = lifecycle.health(config, store)
-        runs = {name: {"result": run.get("result"), "at": run.get("at")}
+        runs = {name: {"result": run.get("result"), "at": run.get("at"),
+                       "duration_seconds": run.get("duration_seconds")}
                 for name, run in store.last_runs().items()}
         return {"status": verdict["status"], "reasons": verdict["reasons"],
                 **status_provider(), "last_runs": runs}
@@ -250,6 +266,117 @@ def create_package_api(
                            None) or "unauthenticated"
         return lifecycle.purge(config, store, ledger, apply=True,
                                target_free_percent=target, by=consumer)
+
+    @app.get("/v1/packages/schedule")
+    def read_schedule() -> Dict[str, Any]:
+        """
+        When packages will come: the next weekly runs, whether one is set aside,
+        and the special runs planned or recently run, each with its cutoff. Open,
+        so a consumer can plan its pickups; it names no token and no file.
+        """
+        return schedule.view(clock())
+
+    def _day(value: Any, name: str) -> date:
+        try:
+            return date.fromisoformat(value)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail=f"{name} must be a date, YYYY-MM-DD")
+
+    @app.post(
+        "/v1/packages/schedule",
+        dependencies=[Depends(verify_bearer), Security(
+            verify_grant, scopes=["schedule"])]
+    )
+    def add_special(
+        request: Request,
+        body: Optional[Dict[str, Any]] = Body(None)
+    ) -> JSONResponse:
+        """
+        Plan a special run: `collector` (a configured one, or `all`), `cutoff` (a
+        day; its 00:00 UTC is the cutoff), optionally `run_at` (ISO, UTC). Refused
+        with 409 and the rule when it would break one.
+        """
+        body = body or {}
+        consumer = getattr(request.state, "consumer",
+                           None) or "unauthenticated"
+        collector = body.get("collector")
+        if not isinstance(collector, str):
+            raise HTTPException(
+                status_code=400, detail="collector is required")
+        cutoff = _day(body.get("cutoff"), "cutoff")
+        run_at = None
+        if body.get("run_at") is not None:
+            try:
+                run_at = datetime.fromisoformat(body["run_at"])
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400, detail="run_at must be an ISO moment")
+            if run_at.tzinfo is None:
+                raise HTTPException(
+                    status_code=400, detail="run_at must carry its offset")
+        try:
+            special = schedule.add(
+                collector, cutoff, clock(), consumer, run_at=run_at)
+        except ScheduleRefused as e:
+            book("schedule_refused", consumer=consumer, collector=collector,
+                 cutoff=cutoff.isoformat(), reason=str(e))
+            raise HTTPException(status_code=409, detail=str(e))
+        book("schedule_added", consumer=consumer, special_id=special["id"],
+             collector=collector, cutoff=special["cutoff"], run_at=special["run_at"])
+        return JSONResponse(special, status_code=201)
+
+    @app.post(
+        "/v1/packages/schedule/weekly",
+        dependencies=[Depends(verify_bearer), Security(
+            verify_grant, scopes=["schedule"])]
+    )
+    def change_weekly(
+        request: Request,
+        body: Optional[Dict[str, Any]] = Body(None)
+    ) -> Dict[str, Any]:
+        """
+        `{"action": "set_aside"}` sets the next weekly run aside; with `until` (a
+        day), every one before it. `{"action": "resume"}` lifts both. The weekly
+        rule itself stays in the configuration.
+        """
+        body = body or {}
+        consumer = getattr(request.state, "consumer",
+                           None) or "unauthenticated"
+        action = body.get("action")
+        now = clock()
+        if action == "set_aside":
+            until = _day(body["until"], "until") if body.get(
+                "until") is not None else None
+            try:
+                weekly = schedule.set_aside(now, until)
+            except ScheduleRefused as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            book("schedule_weekly_set_aside", consumer=consumer, **weekly)
+        elif action == "resume":
+            weekly = schedule.resume()
+            book("schedule_weekly_resumed", consumer=consumer)
+        else:
+            raise HTTPException(
+                status_code=400, detail="action must be set_aside or resume")
+        return schedule.view(now)
+
+    @app.delete(
+        "/v1/packages/schedule/{special_id}",
+        dependencies=[Depends(verify_bearer), Security(
+            verify_grant, scopes=["schedule"])]
+    )
+    def cancel_special(special_id: str, request: Request) -> Dict[str, Any]:
+        """Cancel a planned special run. One that ran or was cancelled stays as it is."""
+        consumer = getattr(request.state, "consumer",
+                           None) or "unauthenticated"
+        special = schedule.cancel(special_id)
+        if special is None:
+            raise HTTPException(
+                status_code=404, detail=f"no planned special run {special_id}")
+        book("schedule_cancelled", consumer=consumer, special_id=special_id,
+             collector=special["collector"], cutoff=special["cutoff"])
+        return special
 
     @app.get(
         "/v1/packages/ledger",

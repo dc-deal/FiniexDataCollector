@@ -496,8 +496,30 @@ download and the hash every time, never standing on a real one; the client takes
 real, resumes a cut download with `Range`, does not acknowledge a zip that does not match, and
 checks every file, not only the zip. On the weekly report: it says what each collector's run came
 to, as INFO when all went well and as a WARNING with the reason and any original left unmoved
-otherwise; the service sends it after every run, and says so when a run produced nothing at all;
-and the schedule reports right after it packs.
+otherwise; the service sends it after every run, and says so when a run produced nothing at all.
+
+### `tests/packages/test_schedule.py`
+
+Packages come from the schedule, never from a request, and FiniexTestingIDE plans its pickups from
+it. Only the operator's token changes it, within limits that keep packages from piling up and that
+respect the collector's day cut. [tick_packages.md](../operations/tick_packages.md#the-schedule) is
+the reference.
+
+Defends: a special run packs the morning after its cutoff by default, or a few minutes from now when
+that has passed, and is kept across a restart; it waits 30 minutes for the seal, stays out of the
+quiet minutes (00:15 included), and is refused in the past or for an unknown collector; none comes
+within 24 hours before a weekly run, and none to the weekly run's own cutoff, before or after it,
+unless that weekly run is set aside; one per collector and day, at most two per collector and week,
+a run for `all` counting for each, a finished one still counting and a cancelled one not;
+cancelling touches only a planned run; the next weekly run, or every one before a date, is set
+aside and resumed; a special default time in the quiet minutes is a configuration error. In the
+service: a due special run packs its collector, or every one for `all`, to its own cutoff, once,
+reports with its cutoff in the title and is booked; the weekly run packs, reports and moves on to
+the next week; one set aside packs nothing, is booked, and the status says so beforehand; nothing
+starts in the quiet minutes. On the routes: the schedule is open and names no token; only the
+`schedule` grant changes it; a refusal is `409` with the rule; every change is booked with the
+token's name; malformed input is `400`. The client reads without sending a token and changes with
+one, and the command takes one change at a time.
 
 ### `tests/utils/test_memory_trail.py`
 

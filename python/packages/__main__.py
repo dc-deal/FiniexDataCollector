@@ -8,6 +8,13 @@ FiniexDataCollector - Package Service Entry Point
     python -m python.packages serve            the API, the schedule, the housekeeping
     python -m python.packages pickup [--endpoint live] [--out DIR] [--package ID] [--no-ack]
                                                take packages as a consumer does - from anywhere
+    python -m python.packages schedule [--endpoint live]
+                                               the schedule as the service reports it - from anywhere
+    python -m python.packages schedule --add kraken --cutoff 2026-11-18 [--run-at ISO]
+    python -m python.packages schedule --cancel ID
+    python -m python.packages schedule --set-aside [--until 2026-12-01]
+    python -m python.packages schedule --resume
+                                               change it; needs a token with the schedule grant
 
 A program of its own: it loads the same configuration files as the collector but
 reads only the `packages` and `telegram` blocks, and it writes its log under its
@@ -22,7 +29,7 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -128,12 +135,45 @@ def cmd_pickup(endpoint: str, out_dir: Path, package_id: str, acknowledge: bool)
     return 0 if all(r["ok"] for r in results) else 1
 
 
+def cmd_schedule(endpoint: str, add: str, cutoff: str, run_at: str, cancel: str,
+                 set_aside: bool, until: str, resume: bool) -> int:
+    """Show the schedule, or change it, through the API - never on the box's files."""
+    from python.packages.schedule_client import (ScheduleCallError,
+                                                 schedule_call)
+    from python.viewer.endpoints import EndpointError, load_endpoint
+
+    chosen = [name for name, on in (("add", add), ("cancel", cancel),
+                                    ("set_aside", set_aside), ("resume", resume)) if on]
+    if len(chosen) > 1:
+        print("one change at a time: --add, --cancel, --set-aside or --resume")
+        return EXIT_CONFIGURATION
+    action = chosen[0] if chosen else "show"
+    try:
+        base_url, token = load_endpoint(endpoint)
+        status, answer = schedule_call(
+            base_url, token, action, collector=add,
+            cutoff=date.fromisoformat(cutoff) if cutoff else None, run_at=run_at,
+            special_id=cancel, until=date.fromisoformat(until) if until else None)
+    except EndpointError as e:
+        print(f"Endpoint {endpoint!r}: {describe_exception(e)}")
+        return EXIT_CONFIGURATION
+    except ValueError as e:
+        print(f"Not a date: {describe_exception(e)}")
+        return EXIT_CONFIGURATION
+    except ScheduleCallError as e:
+        print(f"The service did not answer: {describe_exception(e)}")
+        return 1
+    print(f"HTTP {status}")
+    print(json.dumps(answer, indent=2))
+    return 0 if status < 300 else 1
+
+
 def main() -> None:
     """Entry point."""
     parser = argparse.ArgumentParser(
         description="FiniexDataCollector - tick packages")
     parser.add_argument("command", choices=[
-                        "check", "pack", "settle", "purge", "serve", "pickup"])
+                        "check", "pack", "settle", "purge", "serve", "pickup", "schedule"])
     parser.add_argument("--endpoint", default="live",
                         help="pickup: entry of user_configs/remote_endpoints.json")
     parser.add_argument("--out", default="./data/pickup",
@@ -142,10 +182,23 @@ def main() -> None:
                         help="pickup: only this package id")
     parser.add_argument("--no-ack", action="store_true",
                         help="pickup: download and check, do not acknowledge")
+    parser.add_argument("--add", default="",
+                        help="schedule: plan a special run for this collector, or all")
+    parser.add_argument("--run-at", default="",
+                        help="schedule --add: ISO moment with offset; default the service's")
+    parser.add_argument("--cancel", default="",
+                        help="schedule: cancel this planned special run")
+    parser.add_argument("--set-aside", action="store_true",
+                        help="schedule: set the next weekly run aside")
+    parser.add_argument("--until", default="",
+                        help="schedule --set-aside: every weekly run before this date")
+    parser.add_argument("--resume", action="store_true",
+                        help="schedule: the weekly rule applies again")
     parser.add_argument("--config", default="./configs/app_config.json")
     parser.add_argument("--source", default="", help="pack: only this source")
     parser.add_argument("--cutoff", default="",
-                        help="pack: UTC date, YYYY-MM-DD; default today 00:00 UTC")
+                        help="pack, schedule --add: UTC date, YYYY-MM-DD; "
+                        "pack's default today 00:00 UTC")
     parser.add_argument("--apply", action="store_true",
                         help="purge: delete; without it nothing is deleted")
     parser.add_argument("--full", action="store_true",
@@ -159,6 +212,9 @@ def main() -> None:
     if args.command == "pickup":
         sys.exit(cmd_pickup(args.endpoint, Path(
             args.out), args.package, not args.no_ack))
+    if args.command == "schedule":
+        sys.exit(cmd_schedule(args.endpoint, args.add, args.cutoff, args.run_at,
+                              args.cancel, args.set_aside, args.until, args.resume))
 
     try:
         config = ConfigLoader(Path(args.config)).load()

@@ -254,6 +254,15 @@ class PackagesConfig(BaseModel):
             runs - complete download, hash - and the ledger books `dev_received`,
             but nothing is marked and nothing moves. Our own pickup client's,
             never a consumer's
+        special_hour: Default packing hour of a special run, UTC, on its cutoff day
+        special_minute: Its minute
+        special_after_seal_minutes: The earliest a special run may pack after its
+            cutoff. The collector seals each day at 00:00 UTC and writes the closed
+            files within seconds; the margin makes "sealed" a certainty, not a race
+        special_max_per_week: Special runs per collector per ISO week - the guard
+            against packages piling up
+        special_blackout_hours: No special run this close before a weekly run,
+            which would otherwise come out almost empty
         heartbeat_url: Ping address of an outside check that alarms when the pings
             stop. Pinged only while the service's health is `ok`. A credential:
             user_configs/ only
@@ -276,6 +285,11 @@ class PackagesConfig(BaseModel):
     disposable_warn_gb: float = Field(default=10.0, ge=0.1)
     purge_target_free_percent: float = Field(default=50.0, ge=1.0, le=95.0)
     dev_consumers: List[str] = Field(default_factory=list)
+    special_hour: int = Field(default=1, ge=0, le=23)
+    special_minute: int = Field(default=0, ge=0, le=59)
+    special_after_seal_minutes: int = Field(default=30, ge=20, le=720)
+    special_max_per_week: int = Field(default=2, ge=0, le=7)
+    special_blackout_hours: int = Field(default=24, ge=0, le=72)
     heartbeat_url: str = ""
     heartbeat_interval_seconds: int = Field(default=60, ge=30, le=3600)
     sources: Dict[str, PackageSourceConfig] = Field(default_factory=dict)
@@ -305,13 +319,16 @@ class PackagesConfig(BaseModel):
     def not_in_the_quiet_minutes(self) -> "PackagesConfig":
         """
         23:55 to 00:15 UTC belongs to the day cut and to FiniexTestingIDE's daily
-        order; a weekly run is never scheduled into it.
+        order; neither the weekly run nor a special run's default time falls into it.
         """
-        minute_of_day = self.hour * 60 + self.minute
-        if minute_of_day >= 23 * 60 + 55 or minute_of_day <= 15:
-            raise ValueError(
-                f"the weekly run at {self.hour:02d}:{self.minute:02d} UTC falls "
-                f"into 23:55-00:15 UTC, which stays quiet")
+        for what, hour, minute in (("the weekly run", self.hour, self.minute),
+                                   ("a special run's default", self.special_hour,
+                                    self.special_minute)):
+            minute_of_day = hour * 60 + minute
+            if minute_of_day >= 23 * 60 + 55 or minute_of_day <= 15:
+                raise ValueError(
+                    f"{what} at {hour:02d}:{minute:02d} UTC falls "
+                    f"into 23:55-00:15 UTC, which stays quiet")
         return self
 
 

@@ -64,9 +64,12 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 - See [docs/architecture/status_api.md](docs/architecture/status_api.md)
 
 ### Tick Packages
-- **A program of its own beside the collector** (`python -m python.packages`) - once a week it
-  seals every finished tick file, the collector's and the MT5 terminal's, into one Deflate zip
+- **A program of its own beside the collector** (`python -m python.packages`) - on a schedule
+  it seals every finished tick file, the collector's and the MT5 terminal's, into one Deflate zip
   per collector with a manifest: per file its SHA-256, tick count and time bounds
+- **Scheduled, never on request** - weekly on Sunday evening, plus special runs to a day
+  boundary that only the operator plans, within limits that keep packages from piling up. The
+  schedule is public, so a consumer can plan its pickups
 - **Fetched, not pushed** - a consumer downloads a package (resumable), checks it and
   acknowledges it with the zip's hash; the receipt counts only after a complete download by
   the same token

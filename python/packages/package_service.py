@@ -1,7 +1,7 @@
 """
 FiniexDataCollector - Package Service
-Serve the package API, pack on a weekly schedule, and keep the folders in order -
-in one process.
+Serve the package API, pack by the schedule (schedule.py: the weekly rule and the
+special runs), and keep the folders in order - in one process.
 
 The process lowers its own priority at start. It shares a four-core box with the
 collector, and packing a week is seconds of Deflate and SHA-256 over hundreds of
@@ -34,37 +34,17 @@ from python.packages.package_api import create_package_api
 from python.packages.package_store import PackageStore, PackLock, PackLockHeld
 from python.packages.package_tokens import load_package_tokens
 from python.packages.packer import pack_source
+from python.packages.schedule import ALL, Schedule, in_quiet_minutes
 from python.types.collector_stats import CollectorStats
 from python.utils.config_loader import PackagesConfig, TelegramConfig
 from python.utils.logging_setup import describe_exception, get_logger
 
-WEEKDAYS = ("monday", "tuesday", "wednesday",
-            "thursday", "friday", "saturday", "sunday")
-
 HOUSEKEEPING_SECONDS = 600
 ALERT_REPEAT = timedelta(days=1)
 
-
-def next_run(now: datetime, weekday: str, hour: int, minute: int) -> datetime:
-    """
-    The next weekly run strictly after now, UTC.
-
-    Args:
-        now: The current time, UTC
-        weekday: Day name
-        hour: Hour, UTC
-        minute: Minute
-
-    Returns:
-        The moment of the next run
-    """
-    now = now.astimezone(timezone.utc)
-    target_day = WEEKDAYS.index(weekday)
-    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    candidate += timedelta(days=(target_day - now.weekday()) % 7)
-    if candidate <= now:
-        candidate += timedelta(days=7)
-    return candidate
+# How often the schedule loop looks again. A special run planned while the loop
+# sleeps starts within this much of its time.
+SCHEDULE_TICK_SECONDS = 30
 
 
 def lower_priority() -> str:
@@ -138,9 +118,10 @@ def alert_text(reason: str, verdict: Dict[str, Any], config: PackagesConfig,
     return f"The last packing run {wanted}. " + " | ".join(which)
 
 
-def run_report(results: List[Dict[str, Any]], space: Dict[str, Any]) -> Alert:
+def run_report(results: List[Dict[str, Any]], space: Dict[str, Any],
+               title: str = "weekly run") -> Alert:
     """
-    The weekly run, in one message: what each collector's run came to, and the room left.
+    A run, in one message: what each collector's run came to, and the room left.
 
     INFO when every collector packed or had nothing new; WARNING when one was
     refused or failed - the reason is in the message, and the health warning
@@ -169,12 +150,12 @@ def run_report(results: List[Dict[str, Any]], space: Dict[str, Any]) -> Alert:
     trouble = any(r.get("result") not in ("packed", "nothing_new")
                   for r in results)
     return Alert(level=AlertLevel.WARNING if trouble else AlertLevel.INFO,
-                 title="Tick packages: weekly run", message="\n".join(lines),
+                 title=f"Tick packages: {title}", message="\n".join(lines),
                  timestamp=datetime.now(timezone.utc), source="FiniexPackages")
 
 
 class PackageService:
-    """The API, the weekly schedule and the housekeeping."""
+    """The API, the schedule and the housekeeping."""
 
     def __init__(self, config: PackagesConfig, packer: Dict[str, Any],
                  telegram: Optional[TelegramConfig] = None):
@@ -190,7 +171,9 @@ class PackageService:
         self._ledger = Ledger(self._store.root)
         self._logger = get_logger("FiniexPackages")
         self._started_at = datetime.now(timezone.utc)
-        self._next_run: Optional[datetime] = None
+        self._plan = Schedule(self._store.root, config)
+        self._weekly_at: Optional[datetime] = self._plan.next_weekly(
+            self._started_at)
         self._running = False
         self._stats = CollectorStats()
         self._warned: Dict[str, datetime] = {}
@@ -202,9 +185,12 @@ class PackageService:
 
     def status(self) -> Dict[str, Any]:
         """The service's own state, for the API."""
+        special = self._plan.next_special_at()
         return {
             "started_at": self._started_at.isoformat(timespec="seconds"),
-            "next_run": self._next_run.isoformat() if self._next_run else None,
+            "next_run": self._weekly_at.isoformat() if self._weekly_at else None,
+            "next_run_set_aside": bool(self._weekly_at and self._plan.weekly_skipped(self._weekly_at)),
+            "next_special": special.isoformat() if special else None,
             "packing": self._running,
             "packer": self._packer,
             "heartbeat": {"enabled": bool(self._config.heartbeat_url),
@@ -219,27 +205,75 @@ class PackageService:
 
     # ----------------------------------------------------------- schedule
 
-    async def _schedule(self) -> None:
-        """Sleep to the next weekly run, pack, repeat."""
-        while True:
-            self._next_run = next_run(datetime.now(timezone.utc), self._config.weekday,
-                                      self._config.hour, self._config.minute)
-            self._logger.info(
-                f"[PACKAGE] next run {self._next_run.isoformat()}")
-            # Sleeping in slices rather than once: a sleep across a clock correction
-            # or a suspended VM wakes at the wrong time, and a slice re-reads it.
-            while datetime.now(timezone.utc) < self._next_run:
-                remaining = (self._next_run -
-                             datetime.now(timezone.utc)).total_seconds()
-                await asyncio.sleep(max(1.0, min(remaining, 300.0)))
-            results = await self.run_once()
-            await self.report(results)
-            await self.housekeeping()
+    @property
+    def plan(self) -> Schedule:
+        """The schedule the service runs by."""
+        return self._plan
 
-    async def report(self, results: List[Dict[str, Any]]) -> bool:
+    def _book(self, event: str, **fields: Any) -> None:
+        try:
+            self._ledger.append(event, **fields)
+        except OSError as e:
+            self._logger.error(
+                f"[LEDGER] could not book {event}: {describe_exception(e)}")
+
+    async def _schedule(self) -> None:
         """
-        The weekly run's summary to the operator's phone - every week, not only
-        when something went wrong, so that silence is never the only sign of a run.
+        Look at the schedule every tick and run what is due. In ticks rather than one
+        long sleep: a special run planned meanwhile is found, and a sleep across a
+        clock correction or a suspended VM cannot wake at the wrong time.
+        """
+        self._logger.info(
+            f"[PACKAGE] next weekly run {self._weekly_at.isoformat()}")
+        while True:
+            await self.step(datetime.now(timezone.utc))
+            await asyncio.sleep(SCHEDULE_TICK_SECONDS)
+
+    async def step(self, now: datetime) -> List[str]:
+        """
+        One look at the schedule: the special runs that are due, then the weekly
+        run if its time has come - unless it is set aside.
+
+        Returns:
+            What ran, for the log and the tests
+        """
+        # The packer refuses in the quiet minutes, and a special run refused there
+        # would be finished with nothing in it. A run that is due - one missed while
+        # the service was down, met at a start at 23:58 - waits for 00:16 instead.
+        if in_quiet_minutes(now):
+            return []
+        ran: List[str] = []
+        for special in self._plan.due(now):
+            only = None if special["collector"] == ALL else special["collector"]
+            cutoff = datetime.fromisoformat(special["cutoff"])
+            results = await self.run_once(only=only, cutoff=cutoff)
+            self._plan.finish(special["id"], results)
+            self._book("special_ran", special_id=special["id"], collector=special["collector"],
+                       cutoff=special["cutoff"],
+                       results={r.get("source"): r.get("result") for r in results})
+            await self.report(results, title=f"special run to {special['cutoff'][:10]}")
+            ran.append(f"special {special['id']}")
+        if self._weekly_at is not None and now >= self._weekly_at:
+            at, self._weekly_at = self._weekly_at, self._plan.next_weekly(now)
+            if self._plan.weekly_skipped(at):
+                self._book("weekly_set_aside", run_at=at.isoformat())
+                self._logger.info(
+                    f"[PACKAGE] weekly run {at.isoformat()} set aside")
+                ran.append("weekly set aside")
+            else:
+                results = await self.run_once()
+                await self.report(results)
+                ran.append("weekly")
+            self._logger.info(
+                f"[PACKAGE] next weekly run {self._weekly_at.isoformat()}")
+        if ran:
+            await self.housekeeping()
+        return ran
+
+    async def report(self, results: List[Dict[str, Any]], title: str = "weekly run") -> bool:
+        """
+        A run's summary to the operator's phone - every run, not only when something
+        went wrong, so that silence is never the only sign of a run.
 
         Returns:
             True when it was sent
@@ -247,9 +281,10 @@ class PackageService:
         if self._telegram is None:
             return False
         if results:
-            alert = run_report(results, lifecycle.storage(self._config))
+            alert = run_report(results, lifecycle.storage(
+                self._config), title=title)
         else:
-            alert = Alert(level=AlertLevel.WARNING, title="Tick packages: weekly run",
+            alert = Alert(level=AlertLevel.WARNING, title=f"Tick packages: {title}",
                           message="The run produced no result at all - see the service's log.",
                           timestamp=datetime.now(timezone.utc), source="FiniexPackages")
         try:
@@ -259,12 +294,20 @@ class PackageService:
                 f"[PACKAGE] could not report the run: {describe_exception(e)}")
             return False
 
-    async def run_once(self) -> List[Dict[str, Any]]:
-        """One packing run, off the event loop."""
+    async def run_once(self, only: Optional[str] = None,
+                       cutoff: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """
+        One packing run, off the event loop.
+
+        Args:
+            only: One collector; default every one
+            cutoff: The cutoff; default today's 00:00 UTC
+        """
         self._running = True
         try:
             return await asyncio.to_thread(
-                pack_all, self._config, self._store, self._packer, self._logger.info)
+                pack_all, self._config, self._store, self._packer, self._logger.info,
+                only, cutoff)
         except Exception as e:
             self._logger.error(
                 f"[PACKAGE] run failed: {describe_exception(e)}")
@@ -366,7 +409,8 @@ class PackageService:
         self._seed_ledger()
         app = create_package_api(self._store, registry, self.status, self._ledger,
                                  self._config, on_receipt=self.settle_one,
-                                 version=self._packer.get("version", ""))
+                                 version=self._packer.get("version", ""),
+                                 schedule=self._plan)
         server = uvicorn.Server(uvicorn.Config(
             app, host=self._config.host, port=self._config.port,
             log_level="warning", access_log=False))

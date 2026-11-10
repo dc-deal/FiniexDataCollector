@@ -27,6 +27,7 @@ Location: python/packages/packer.py
 import hashlib
 import json
 import os
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -257,6 +258,7 @@ def pack_source(
     """
     now = now or datetime.now(timezone.utc)
     cutoff = cutoff or default_cutoff(now)
+    started = time.monotonic()
     record: Dict[str, Any] = {
         "source": name,
         "at": now.isoformat(timespec="seconds"),
@@ -264,7 +266,10 @@ def pack_source(
     }
 
     def finish(result: str, **fields: Any) -> Dict[str, Any]:
-        record.update(result=result, **fields)
+        # Measured, on the monotonic clock: the open health route shows it, so a
+        # consumer can plan its pickup from what a run took, not from a guess.
+        record.update(result=result, duration_seconds=round(time.monotonic() - started, 1),
+                      **fields)
         try:
             store.write_last_run(name, record)
         except OSError as e:

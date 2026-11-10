@@ -32,11 +32,11 @@ from python.packages import preflight as preflight_module
 from python.packages.ledger import Ledger
 from python.packages.package_api import (LedgeredFileResponse,
                                          create_package_api)
-from python.packages.package_service import next_run
 from python.packages.package_store import LOCK_NAME, PackageStore
 from python.packages.package_tokens import load_package_tokens
 from python.packages.packer import pack_source
 from python.packages.pickup import pickup
+from python.packages.schedule import next_run
 from python.utils.config_loader import PackagesConfig, PackageSourceConfig
 
 MINT = "ab6381efd498"
@@ -553,8 +553,9 @@ def test_every_identity_route_refuses_a_token_holding_nothing(served: Dict[str, 
         served["app"], served["client"], bearer(NOBODY),
         required=[("/v1/packages/{package_id}", "get"),
                   ("/v1/packages/{package_id}/zip", "get"),
-                  ("/v1/packages/{package_id}/receipt", "post")])
-    assert len(walked) == 3
+                  ("/v1/packages/{package_id}/receipt", "post"),
+                  ("/v1/packages/schedule/{special_id}", "delete")])
+    assert len(walked) == 4
 
 
 def test_the_manifest_and_the_zip_are_served(served: Dict[str, Any]) -> None:
@@ -630,16 +631,18 @@ def test_health_is_open_and_names_no_content(served: Dict[str, Any]) -> None:
     body = served["client"].get("/v1/packages/health").json()
 
     assert body["status"] == "ok" and body["reasons"] == []
-    assert body["last_runs"]["kraken"] == {"result": "packed",
-                                           "at": body["last_runs"]["kraken"]["at"]}
+    run = body["last_runs"]["kraken"]
+    assert set(run) == {"result", "at", "duration_seconds"}
+    assert run["result"] == "packed" and run["duration_seconds"] >= 0
     assert "packages" not in body and "storage" not in body
 
 
 def test_no_route_can_pack_and_every_route_is_on_this_list(served: Dict[str, Any]) -> None:
     """
-    Packing happens on the weekly schedule and by a command on the machine - never
-    because a request asked for it. A route added later fails here until it is
-    looked at and written into this list.
+    Packing happens on the schedule and by a command on the machine - never because
+    a request asked for it. The schedule routes plan a run, under the operator's
+    grant and the limits; none starts one. A route added later fails here until it
+    is looked at and written into this list.
     """
     routes = sorted((route.path, method) for route in served["app"].routes
                     for method in getattr(route, "methods", None) or []
@@ -654,6 +657,10 @@ def test_no_route_can_pack_and_every_route_is_on_this_list(served: Dict[str, Any
         ("/v1/packages/{package_id}", "GET"),
         ("/v1/packages/{package_id}/zip", "GET"),
         ("/v1/packages/{package_id}/receipt", "POST"),
+        ("/v1/packages/schedule", "GET"),
+        ("/v1/packages/schedule", "POST"),
+        ("/v1/packages/schedule/weekly", "POST"),
+        ("/v1/packages/schedule/{special_id}", "DELETE"),
     ])
 
 
@@ -1446,35 +1453,3 @@ def test_the_service_reports_every_run_and_says_so_when_there_was_none(tmp_path:
 
     assert "mt5: nothing new" in sent[0].message
     assert "no result at all" in sent[1].message
-
-
-def test_the_weekly_schedule_reports_after_it_packs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import asyncio
-
-    from python.packages import package_service as service_module
-    from python.packages.package_service import PackageService
-
-    service = PackageService(PackagesConfig(output_dir=str(tmp_path / "p"),
-                                            originals_dir=str(tmp_path / "o")), {})
-    order: List[str] = []
-    monkeypatch.setattr(service_module, "next_run",
-                        lambda *args: datetime.now(timezone.utc) - timedelta(seconds=1))
-
-    async def packed() -> List[Dict[str, Any]]:
-        order.append("pack")
-        return [{"source": "mt5", "result": "nothing_new"}]
-
-    async def reported(results: List[Dict[str, Any]]) -> bool:
-        order.append(f"report {results[0]['result']}")
-        return True
-
-    async def stop() -> None:
-        order.append("housekeeping")
-        raise asyncio.CancelledError()
-
-    service.run_once, service.report, service.housekeeping = packed, reported, stop
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(service._schedule())
-
-    assert order == ["pack", "report nothing_new", "housekeeping"]
