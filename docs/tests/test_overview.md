@@ -241,6 +241,22 @@ Also the example files a new machine is set up from. Found 2026-09-23 while addi
 
 Defends: every tracked example parses; no file in `user_configs/` is named with stray whitespace; and the example demonstrates a consumer holding `status:detail` **alone**, because an example whose only consumer holds every grant teaches the opposite of one token per consumer.
 
+### `tests/utils/test_user_config.py`
+
+A second collector on the same machine needs symbols and folders of its own, and must never fall
+back on the first one's overlay: that overlay enables the Telegram bot, and a second poller takes
+the first one's commands. [running_as_a_service.md](../operations/running_as_a_service.md#a-second-instance-beside-the-first)
+is the reference.
+
+Defends: a named overlay replaces the default one, and the default one's bot does not leak in;
+without a name the default overlay applies, and its absence is no error; a named overlay that is
+missing refuses with its path; and a configuration that cannot be loaded - a mistyped overlay,
+malformed JSON, a value the schema refuses, a missing base file - exits 2, which the service
+manager keeps stopped. Before 2026-11-10 it exited 1 and was retried. The entry point is driven
+up to the refusal with collecting replaced by a failure, so a broken guard fails the test instead
+of starting a collector. Also: the first-tick log line shows a price as written, five decimals
+for forex, where it said `bid=1.12` for 1.12109.
+
 ### `tests/utils/test_console_and_counting.py`
 
 Two defences against a display saying something untrue, and one of them can stop the collection.

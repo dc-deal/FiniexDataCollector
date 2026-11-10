@@ -298,6 +298,10 @@ its own folders default to `./data/packages` and `./data/originals` under its ch
 }
 ```
 
+- **A second collector is a source of its own**, with its own name, e.g. `krakendev` with `root`
+  `<checkout>\data\devline\raw`, `subdir` `kraken` and `log_dir` `<checkout>\data\devline\logs`.
+  Its packages are named after it and chained apart; its mint keeps its files out of the others'.
+  How it runs: [running_as_a_service.md](running_as_a_service.md#a-second-instance-beside-the-first).
 - **Telegram is sending only.** The service warns through the collector's bot but never polls
   it: the collector reads the bot's commands, and a second reader would take its updates. At
   most one message per reason per day; a reason that clears and comes back is news again.

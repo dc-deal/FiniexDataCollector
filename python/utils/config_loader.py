@@ -4,7 +4,8 @@ Loads and validates application configuration with Pydantic.
 
 Supports hierarchical config merging:
 - configs/app_config.json (defaults, tracked)
-- user_configs/app_config.json (overrides, gitignored)
+- user_configs/app_config.json (overrides, gitignored), or the overlay a second
+  instance names with `--user-config`
 
 Location: python/utils/config_loader.py
 """
@@ -12,7 +13,7 @@ Location: python/utils/config_loader.py
 import json
 import re
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import (BaseModel, Field, ValidationError, field_validator,
                       model_validator)
@@ -407,21 +408,34 @@ class ConfigLoader:
 
     Supports hierarchical config merging:
     1. configs/app_config.json (defaults, tracked)
-    2. user_configs/app_config.json (overrides, gitignored)
+    2. user_configs/app_config.json (overrides, gitignored) - or a named overlay
     """
 
     DEFAULT_CONFIG_PATH = Path("./configs/app_config.json")
     USER_CONFIG_PATH = Path("./user_configs/app_config.json")
 
-    def __init__(self, config_path: Optional[Path] = None):
+    def __init__(self, config_path: Optional[Path] = None,
+                 user_config_path: Optional[Path] = None):
         """
         Initialize config loader.
 
         Args:
             config_path: Path to base config file (optional)
+            user_config_path: The overlay instead of user_configs/app_config.json.
+                Named, it must exist: a second instance started with a mistyped
+                overlay would otherwise run on the bare defaults - the production
+                symbols, into the default folders.
         """
         self._config_path = config_path or self.DEFAULT_CONFIG_PATH
+        self._user_config_path = Path(user_config_path) if user_config_path \
+            else self.USER_CONFIG_PATH
+        self._user_config_required = user_config_path is not None
         self._config: Optional[AppConfig] = None
+
+    @property
+    def user_config_path(self) -> Path:
+        """The overlay this loader merges, whether or not it exists."""
+        return self._user_config_path
 
     def load(self) -> AppConfig:
         """
@@ -451,15 +465,20 @@ class ConfigLoader:
 
         # Load user overrides (optional)
         user_data = {}
-        if self.USER_CONFIG_PATH.exists():
+        if self._user_config_path.exists():
             try:
-                with open(self.USER_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                with open(self._user_config_path, 'r', encoding='utf-8') as f:
                     user_data = json.load(f)
             except json.JSONDecodeError as e:
                 raise ConfigurationError(
                     f"Invalid JSON in user config: {describe_exception(e)}",
-                    config_file=str(self.USER_CONFIG_PATH)
+                    config_file=str(self._user_config_path)
                 )
+        elif self._user_config_required:
+            raise ConfigurationError(
+                "User configuration not found",
+                config_file=str(self._user_config_path)
+            )
 
         # Deep merge: base <- user
         merged = self._deep_merge(base_data, user_data)

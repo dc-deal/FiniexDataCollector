@@ -99,7 +99,8 @@ FiniexDataCollector is a real-time tick data collection system that captures mar
 
 ### Configuration System
 - **Pydantic Validation** - Type-safe configuration with clear error messages
-- **User Override Pattern** - `user_configs/app_config.json` overrides base config
+- **User Override Pattern** - `user_configs/app_config.json` overrides base config; a second
+  instance names its own with `--user-config`
 - **Environment Separation** - Gitignored user config for secrets (bot tokens)
 - **Flexible Scheduling** - Configurable report day/hour/minute in UTC
 

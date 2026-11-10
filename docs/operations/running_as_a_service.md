@@ -219,7 +219,9 @@ rather than exiting, so a reboot produces no restart cycle here. If you ever see
 restart at boot, that is a real failure and not the normal shape.
 
 **Exit 2 means the same thing in all three projects**: do not retry. A stale configuration, a
-missing identity, an output directory another live instance owns. Agreed with FiniexRAGEngine on
+missing identity, an output directory another live instance owns. A configuration that cannot be
+loaded at all - malformed JSON, a value the schema refuses, a missing file - exits 2 since
+2026-11-10; until then it exited 1, and the service manager retried it at its throttle interval. Agreed with FiniexRAGEngine on
 2026-09-22 so that a service definition reads the same way without reading anyone's source.
 
 ## Stopping, and what a stop is worth
@@ -259,6 +261,53 @@ to treat as final.
 
 The reverse case is handled too: a lock left behind by a crash is detected as stale and taken
 over, so a service can always start after an unclean stop.
+
+## A second instance beside the first
+
+A line of symbols that must not mix with production's - collected apart, under an identity of its
+own, so a consumer can register it as something else - runs as a second collector on the same
+machine. It needs nothing the first one has: no folder, no log, and above all not its overlay.
+
+**`--user-config` names the overlay** that is merged over `--config`, instead of
+`user_configs/app_config.json`. Named, it must exist: a mistyped path refuses with exit 2 rather
+than starting on the bare defaults, which are the production symbols in the default folders.
+The log's first lines name the overlay the process runs on, `[CONFIG] <base> + <overlay>`.
+
+```json
+{
+  "paths":      { "raw_data_dir": "./data/devline/raw", "logs_dir": "./data/devline/logs" },
+  "kraken":     { "symbols": ["PAXG/USD", "XAUT/USD", "EUR/USD", "GBP/USD", "USD/CAD", "AUD/USD", "USD/CHF"] },
+  "telegram":   { "enabled": false },
+  "monitoring": { "heartbeat_url": "" },
+  "api":        { "enabled": false }
+}
+```
+
+- **Telegram stays off.** The first collector polls the bot for commands, and a second poller takes
+  its updates. Without `--user-config` a second process reads the default overlay - the one that
+  enables the bot.
+- **Its own data root, so its own identity.** The first start mints `instance.json` there; every
+  file carries that id in its `origin` block. Its `broker_type` is the configuration's, as for the
+  first one.
+- **No port unless it is needed.** With its API on, it takes one well clear of the first one's.
+- **It can run from another program's checkout** - the package service's, on the production box,
+  so that a second line needs no second clone. Then that checkout's `git checkout` replaces this
+  collector's code too: the collector finishes its files in subprocesses that import from disk.
+  Stop it before updating the checkout, and start it after.
+
+As a service, the block above with its own name and the overlay:
+
+```powershell
+$root = 'C:\Users\Administrator\Documents\code\FiniexDataColl_packages'
+& $nssm install FiniexCollectorDev "$root\.venv\Scripts\python.exe" '-m' 'python.main' 'collect' '--no-display' '--user-config' 'user_configs\devline.json'
+& $nssm set FiniexCollectorDev AppDirectory $root
+& $nssm set FiniexCollectorDev AppStdout "$root\data\devline\logs\service.out.log"
+& $nssm set FiniexCollectorDev AppStderr "$root\data\devline\logs\service.err.log"
+```
+
+plus the same `Start`, `AppEnvironmentExtra`, `AppStopMethodConsole`, `AppExit` and `AppRotateFiles`
+settings, and the account set through the dialog. The package service packs its files as a source
+of its own ([tick_packages.md](tick_packages.md#running-it)).
 
 ## The acceptance test
 

@@ -12,52 +12,46 @@ Location: python/main.py
 import argparse
 import asyncio
 import json
+import os
 import signal
 import sys
-import os
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import psutil
 
+from python.alerts.heartbeat import Heartbeat
+from python.alerts.telegram_bot import TelegramAlertProvider
 from python.api.api_app import create_api
 from python.api.build_info import sample_build_info
-from python.alerts.heartbeat import Heartbeat
-from python.utils.memory_trail import MemoryTrail
 from python.api.stats_serializer import health_payload, plain, serialize_stats
 from python.api.token_loader import load_token_registry
 from python.collectors.kraken.quote_cache import QuoteCache
-from python.utils.collection_clock import CollectionClock
-from python.utils.instance_identity import (
-    PRODUCER,
-    collected_on,
-    mint_or_read
-)
-from python.utils.instance_lock import InstanceLock
-from python.utils.config_loader import ConfigLoader, AppConfig
-from python.utils.logging_setup import (add_log_listener, describe_exception,
-                                        get_logger, setup_logging)
-from python.utils.console_mode import (disable_quick_edit, enable_ansi_colours,
-                                       enable_ctrl_c_handling)
-from python.viewer.endpoints import EndpointError, default_interval, load_endpoint
-from python.viewer.watch import run_viewer
-from python.utils.gc_watcher import GcWatcher
-from python.utils.stall_sampler import StallSampler
-from python.utils.live_display import LiveDisplay
+from python.collectors.kraken.websocket_client import KrakenWebSocketClient
+from python.exceptions.collector_exceptions import ConfigurationError
+from python.scheduler.weekly_jobs import WeeklyJobScheduler
+from python.types.broker_config_types import BrokerConfig, normalize_symbol
 from python.types.collector_stats import CollectorStats, ReconnectEvent
 from python.types.tick_types import OriginBlock
-from python.types.broker_config_types import BrokerConfig, normalize_symbol
-from python.exceptions.collector_exceptions import ConfigurationError
-from python.collectors.kraken.websocket_client import KrakenWebSocketClient
-from python.writers.json_tick_writer import (
-    JsonTickWriter,
-    recover_orphaned_buffers
-)
-from python.alerts.telegram_bot import TelegramAlertProvider
-from python.scheduler.weekly_jobs import WeeklyJobScheduler
-
+from python.utils.collection_clock import CollectionClock
+from python.utils.config_loader import AppConfig, ConfigLoader
+from python.utils.console_mode import (disable_quick_edit, enable_ansi_colours,
+                                       enable_ctrl_c_handling)
+from python.utils.gc_watcher import GcWatcher
+from python.utils.instance_identity import PRODUCER, collected_on, mint_or_read
+from python.utils.instance_lock import InstanceLock
+from python.utils.live_display import LiveDisplay
+from python.utils.logging_setup import (add_log_listener, describe_exception,
+                                        get_logger, setup_logging)
+from python.utils.memory_trail import MemoryTrail
+from python.utils.stall_sampler import StallSampler
+from python.viewer.endpoints import (EndpointError, default_interval,
+                                     load_endpoint)
+from python.viewer.watch import run_viewer
+from python.writers.json_tick_writer import (JsonTickWriter,
+                                             recover_orphaned_buffers)
 
 # Statuses a connection can come back FROM. "failed" belongs here: a connect
 # attempt that failed and later succeeded is a reconnect, and the production log
@@ -408,7 +402,8 @@ class FiniexDataCollector:
         # port 8110, and only then discovered it was not allowed to run. Under a
         # service manager that restarts on exit, that is one phone alert per
         # restart cycle for as long as the conflict lasts.
-        self._instance_lock = InstanceLock(Path(self._config.paths.raw_data_dir))
+        self._instance_lock = InstanceLock(
+            Path(self._config.paths.raw_data_dir))
         self._instance_lock.acquire()
 
         # Initialize Telegram alerts
@@ -477,7 +472,8 @@ class FiniexDataCollector:
             self._live_display = LiveDisplay(self._stats)
             await self._live_display.start()
         else:
-            self._logger.info("Live display off - the file log keeps the record")
+            self._logger.info(
+                "Live display off - the file log keeps the record")
 
         # Wait for shutdown
         await self._shutdown_event.wait()
@@ -1099,7 +1095,6 @@ class FiniexDataCollector:
 
         return duration_ms
 
-
     async def _start_kraken_collector(self) -> None:
         """Initialize and start Kraken WebSocket collector."""
         self._logger.info(
@@ -1358,7 +1353,7 @@ class FiniexDataCollector:
             self._first_tick_logged.add(symbol)
             self._logger.info(
                 f"First tick: {symbol} | "
-                f"bid={tick.bid:.2f} ask={tick.ask:.2f} "
+                f"bid={tick.bid} ask={tick.ask} "
                 f"spread={tick.spread_pct:.4f}%"
             )
 
@@ -1701,7 +1696,6 @@ class FiniexDataCollector:
         self._logger.info("Shutdown complete")
 
 
-
 async def cmd_collect(config: AppConfig, show_display: bool = True) -> None:
     """
     Run collection daemon.
@@ -1740,7 +1734,6 @@ async def cmd_collect(config: AppConfig, show_display: bool = True) -> None:
     # === START COLLECTION ===
     app = FiniexDataCollector(config, show_display=show_display)
     await app.start_collection()
-
 
 
 def cmd_watch(endpoint_name: str, interval: Optional[float]) -> int:
@@ -1851,6 +1844,15 @@ def main():
     )
 
     parser.add_argument(
+        "--user-config",
+        type=str,
+        default=None,
+        help="collect, status: the overlay merged over --config instead of "
+             "user_configs/app_config.json - how a second instance gets folders and "
+             "symbols of its own. Named, it must exist"
+    )
+
+    parser.add_argument(
         "--no-display",
         action="store_true",
         help="collect without the live display - the file log keeps the record"
@@ -1880,15 +1882,21 @@ def main():
     if args.command == "watch":
         sys.exit(cmd_watch(args.endpoint, args.interval))
 
-    # Load config
+    # Load config. A configuration that cannot be loaded exits 2 like every other
+    # configuration refusal: the service manager maps 2 to "stay stopped", and a
+    # restart cannot repair a file. This exited 1 until 2026-11-10, so NSSM retried
+    # a broken configuration at its throttle interval.
+    config_path = Path(args.config)
+    loader = ConfigLoader(config_path, Path(
+        args.user_config) if args.user_config else None)
     try:
-        config_path = Path(args.config)
-        if config_path.exists():
-            loader = ConfigLoader(config_path)
-            config = loader.load()
-        else:
+        if not config_path.exists():
             print(f"Config not found: {config_path}")
-            sys.exit(1)
+            sys.exit(EXIT_CONFIGURATION)
+        config = loader.load()
+    except ConfigurationError as e:
+        print(f"Failed to load config: {describe_exception(e)}")
+        sys.exit(EXIT_CONFIGURATION)
     except Exception as e:
         print(f"Failed to load config: {describe_exception(e)}")
         sys.exit(1)
@@ -1899,6 +1907,12 @@ def main():
         file_level=config.logging.file_level,
         log_dir=Path(config.paths.logs_dir)
     )
+    # Which overlay this process runs on: with two instances on one machine, the
+    # log is where the answer has to be.
+    overlay = loader.user_config_path
+    get_logger("FiniexDataCollector").info(
+        f"[CONFIG] {config_path} + {overlay}"
+        + ("" if overlay.exists() else " (absent, defaults only)"))
 
     # Execute command
     try:
