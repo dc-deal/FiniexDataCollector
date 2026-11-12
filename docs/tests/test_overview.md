@@ -485,7 +485,9 @@ out and a schedule in the quiet minutes. On the API: a token and the grant are n
 identity route refuses a token holding nothing, the zip is served whole and resumed with `Range`,
 a crafted id is not found, the first receipt stands and a repeated one moves nothing, fetching is
 not acknowledging, health is open and names no content, and the grant vocabulary is the service's
-own. On the ledger: a committed package is booked with its members; packages older than the ledger
+own; `source` and `process_starts` stand beside `collector` and `collector_starts` in the manifest,
+the list (for packages built before them too), the `?source=` filter and every ledger event that
+names a collector. On the ledger: a committed package is booked with its members; packages older than the ledger
 are entered late, and once; a whole and a resumed download are booked complete with their range,
 and one the client abandons incomplete, with the disconnect; bytes are counted even where a server
 offers to send the path instead; a receipt with the right hash is verified, one with another hash is

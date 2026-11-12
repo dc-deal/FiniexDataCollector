@@ -142,6 +142,7 @@ change to the configuration or the machine.
 | field | |
 |---|---|
 | `package_id`, `sequence`, `collector` | |
+| `source` | the same value as `collector`, under the name every Finiex package service uses - the RAG engine's too - so one client reads both. Since 2026-11-12; earlier manifests have only `collector`, and the list says `source` for them as well |
 | `instance_id` | the folder's mint, which every member matched |
 | `producer` | from the members' `origin` blocks |
 | `cutoff`, `previous_package_id`, `created_at` | |
@@ -151,7 +152,7 @@ change to the configuration or the machine.
 | `members[]` | per file: `name`, `size_bytes`, `sha256`, `symbol`, `data_format_version`, `producer`, `tick_count` (counted), `declared_tick_count` (the summary's), `first_time_msc`/`last_time_msc` (event time, as the file writes it), `first_collected_msc`/`last_collected_msc` (UTC) |
 | `excluded[]`, `held_for_next[]`, `open_files[]` | see above |
 | `outages` | the outage records that began within the span, read from the collector's log, the same records [`/v1/outages`](../architecture/status_api.md) serves; `days_missing` names log days that do not exist. **`null` for a collector that writes no such records**, never an empty list |
-| `collector_starts` | every start of the collector's process within the span. A restart is the one gap no outage record covers, because the process that was gone could not write one. `null` like `outages` |
+| `collector_starts` | every start of the collector's process within the span. A restart is the one gap no outage record covers, because the process that was gone could not write one. `null` like `outages`. `process_starts` carries the same, under the shared name, since 2026-11-12 |
 | `packer` | program, version and commit that built it |
 
 Outage records exist from 2026-10-10, the build that began writing them. A span before that
@@ -164,7 +165,7 @@ loopback.
 
 | route | grant | |
 |---|---|---|
-| `GET /v1/packages` | `packages` | every package, oldest first, with `state` (`ready`, `delivered`) and `received_at`; `?collector=`, `?unacknowledged=true`; the `health` verdict, `storage` (originals per stage, disk) and each collector's last run |
+| `GET /v1/packages` | `packages` | every package, oldest first, with `state` (`ready`, `delivered`) and `received_at`; `?collector=` or `?source=`, `?unacknowledged=true`; each entry with `collector` and `source`; the `health` verdict, `storage` (originals per stage, disk) and each collector's last run |
 | `GET /v1/packages/ledger` | `packages` | the ledger, below; `?package_id=`, `?event=` |
 | `GET /v1/packages/{package_id}` | `packages:<id>` | the manifest, and the receipt |
 | `GET /v1/packages/{package_id}/zip` | `packages:<id>` | the zip; repeatable, and resumable with `Range` |
@@ -222,6 +223,7 @@ database.
 
 | event | written when | carries |
 |---|---|---|
+| (every event that names a collector) | | `source` beside `collector`, the same value, since 2026-11-12 |
 | `packed` | a package is committed, after its manifest | the zip's size and SHA-256, and every member's name, SHA-256 and tick count: a second record of the contents beside the manifests |
 | `served` | a download ends, finished or not | consumer, `range`, `status`, `content_length`, `bytes_sent`, `complete`, `disconnected` |
 | `received` | the first acknowledgement | consumer, note, `zip_sha256`, `verified` |

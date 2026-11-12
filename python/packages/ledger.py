@@ -175,6 +175,10 @@ class Ledger:
         Returns:
             The record as written
         """
+        # `source` beside `collector` in every event that names one: the name all
+        # Finiex package services share (2026-11-12). Older lines carry `collector` only.
+        if "collector" in fields and "source" not in fields:
+            fields["source"] = fields["collector"]
         record = {"event": event,
                   "at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                   **fields}

@@ -138,7 +138,8 @@ class Schedule:
                              "cutoff": _midnight(weekly_at.date()).isoformat(),
                              "set_aside": self.weekly_skipped(weekly_at, state)})
             weekly_at += timedelta(days=7)
-        specials = [{k: s[k] for k in ("id", "collector", "cutoff", "run_at", "state")}
+        specials = [{**{k: s[k] for k in ("id", "collector", "cutoff", "run_at", "state")},
+                     "source": s["collector"]}
                     for s in state["specials"]
                     if s["state"] == "planned" or _parse(s["run_at"]) > now - timedelta(days=14)]
         return {

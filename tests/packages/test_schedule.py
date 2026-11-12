@@ -325,6 +325,9 @@ def test_the_schedule_is_open_and_names_no_token(api: Dict[str, Any]) -> None:
     client = api["client"]
     client.post("/v1/packages/schedule", headers=bearer(OPERATOR),
                 json={"collector": "kraken", "cutoff": "2026-11-18"})
+    # `source`, the name every Finiex package service uses, is taken as well.
+    client.post("/v1/packages/schedule", headers=bearer(OPERATOR),
+                json={"source": "mt5", "cutoff": "2026-11-18"})
 
     answer = client.get("/v1/packages/schedule")
 
@@ -332,6 +335,8 @@ def test_the_schedule_is_open_and_names_no_token(api: Dict[str, Any]) -> None:
     view = answer.json()
     assert view["weekly"]["next_runs"][0]["run_at"] == "2026-11-15T20:00:00+00:00"
     assert view["special"][0]["run_at"] == "2026-11-18T01:00:00+00:00"
+    assert sorted((s["collector"], s["source"]) for s in view["special"]) == [
+        ("kraken", "kraken"), ("mt5", "mt5")]
     assert "operator" not in answer.text
 
 

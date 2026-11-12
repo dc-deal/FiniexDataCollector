@@ -477,6 +477,8 @@ def test_outages_and_starts_ride_along_from_the_collectors_log(
     assert manifest["outages"]["records"][0]["timestamp"] == start.isoformat()
     assert manifest["collector_starts"]["starts"] == [day(4, 8).isoformat()]
     assert "2026-11-03" in manifest["collector_starts"]["days_missing"]
+    # The name every Finiex package service uses, beside ours (2026-11-12).
+    assert manifest["process_starts"] == manifest["collector_starts"]
 
 
 # --------------------------------------------------------------------- configuration
@@ -539,6 +541,35 @@ def served(kraken: Dict[str, Any]) -> Dict[str, Any]:
         on_receipt=settle_after_receipt)
     return {"client": TestClient(app), "app": app, "id": package_id, "store": kraken["store"],
             "ledger": ledger, "kraken": kraken, "config": config}
+
+
+def test_the_shared_names_stand_beside_ours(served: Dict[str, Any]) -> None:
+    """
+    `source` is the name every Finiex package service uses, so FiniexTestingIDE's one
+    client reads the collector's packages and the RAG engine's alike (2026-11-12).
+    Beside `collector`, never instead - and for packages built before it too.
+    """
+    client, store = served["client"], served["store"]
+    manifest = store.manifest(served["id"])
+    assert manifest["source"] == manifest["collector"] == "kraken"
+
+    def listed(**params: str) -> List[Dict[str, Any]]:
+        return client.get("/v1/packages", headers=bearer(FETCHER), params=params).json()["packages"]
+
+    assert [(p["source"], p["collector"])
+            for p in listed()] == [("kraken", "kraken")]
+    assert [p["package_id"] for p in listed(source="kraken")] == [served["id"]]
+    assert listed(source="mt5") == []
+
+    path = store.find(served["id"])["manifest"]
+    older = json.loads(path.read_text(encoding="utf-8"))
+    del older["source"]
+    path.write_text(json.dumps(older), encoding="utf-8")
+    assert listed()[0]["source"] == "kraken"
+
+    named = [e for e in served["ledger"].read()["events"] if "collector" in e]
+    assert {e["event"] for e in named} >= {"packed", "staged"}
+    assert all(e["source"] == e["collector"] for e in named)
 
 
 def test_the_list_needs_a_token_and_the_grant(served: Dict[str, Any]) -> None:

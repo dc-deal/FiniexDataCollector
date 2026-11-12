@@ -419,6 +419,10 @@ def _pack_locked(
         "package_id": package_id,
         "sequence": sequence,
         "collector": name,
+        # The same value under the name every Finiex package service uses, so one
+        # client reads the collector's and the RAG engine's packages alike
+        # (FiniexTestingIDE, 2026-11-12). `collector` stays for the readers it has.
+        "source": name,
         "instance_id": check.instance_id,
         "producer": producers[0] if len(producers) == 1 else producers,
         "cutoff": cutoff.isoformat(),
@@ -435,6 +439,7 @@ def _pack_locked(
         "open_files": check.open_files,
         "outages": outages,
         "collector_starts": starts,
+        "process_starts": starts,
         "packer": packer,
     }
     write_json_atomically(folder / f"{package_id}{MANIFEST_SUFFIX}", manifest)

@@ -120,6 +120,9 @@ def _summary(manifest: Dict[str, Any], receipt: Optional[Dict[str, Any]]) -> Dic
     return {
         "package_id": manifest["package_id"],
         "collector": manifest["collector"],
+        # Manifests from before 2026-11-12 carry no `source`; the list is a view
+        # and says it for them too. The manifest route serves a file as written.
+        "source": manifest.get("source", manifest["collector"]),
         "instance_id": manifest["instance_id"],
         "cutoff": manifest["cutoff"],
         "previous_package_id": manifest["previous_package_id"],
@@ -203,6 +206,8 @@ def create_package_api(
     def list_packages(
         request: Request,
         collector: Optional[str] = Query(None),
+        source: Optional[str] = Query(
+            None, description="The same as collector"),
         unacknowledged: bool = Query(
             False, description="Only packages without a receipt")
     ) -> Dict[str, Any]:
@@ -213,7 +218,7 @@ def create_package_api(
         """
         consumer = getattr(request.state, "consumer", None)
         packages = []
-        for manifest in store.manifests(collector):
+        for manifest in store.manifests(collector or source):
             if consumer is not None and not registry.may(
                     consumer, f"packages:{manifest['package_id']}"):
                 continue
@@ -293,17 +298,17 @@ def create_package_api(
         body: Optional[Dict[str, Any]] = Body(None)
     ) -> JSONResponse:
         """
-        Plan a special run: `collector` (a configured one, or `all`), `cutoff` (a
-        day; its 00:00 UTC is the cutoff), optionally `run_at` (ISO, UTC). Refused
-        with 409 and the rule when it would break one.
+        Plan a special run: `collector` or `source` (a configured one, or `all`),
+        `cutoff` (a day; its 00:00 UTC is the cutoff), optionally `run_at` (ISO,
+        UTC). Refused with 409 and the rule when it would break one.
         """
         body = body or {}
         consumer = getattr(request.state, "consumer",
                            None) or "unauthenticated"
-        collector = body.get("collector")
+        collector = body.get("collector", body.get("source"))
         if not isinstance(collector, str):
             raise HTTPException(
-                status_code=400, detail="collector is required")
+                status_code=400, detail="collector (or source) is required")
         cutoff = _day(body.get("cutoff"), "cutoff")
         run_at = None
         if body.get("run_at") is not None:
