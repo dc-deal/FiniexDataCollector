@@ -41,6 +41,10 @@ from python.packages.package_store import (MANIFEST_SUFFIX, PART_SUFFIX,
                                            ZIP_SUFFIX, PackageStore, PackLock,
                                            PackLockHeld, write_json_atomically)
 from python.packages.preflight import check_source
+# One definition of the quiet minutes for the packer, the schedule and the service:
+# two of them disagreed about 00:15 until 2026-11-12, so a hand `pack` could run
+# in a minute the schedule kept free.
+from python.packages.schedule import in_quiet_minutes
 from python.utils.config_loader import PackageSourceConfig
 from python.utils.logging_setup import describe_exception
 
@@ -54,15 +58,6 @@ COMPRESS_LEVEL = 6
 START_MESSAGE = "FiniexDataCollector Starting"
 
 HASH_BLOCK = 1024 * 1024
-
-
-def in_quiet_minutes(moment: datetime) -> bool:
-    """
-    23:55 to 00:15 UTC: the day cut writes files, and FiniexTestingIDE's bot
-    places its daily order. Nothing is packed then.
-    """
-    minute_of_day = moment.hour * 60 + moment.minute
-    return minute_of_day >= 23 * 60 + 55 or minute_of_day < 15
 
 
 def default_cutoff(now: datetime) -> datetime:

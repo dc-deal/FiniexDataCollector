@@ -387,8 +387,13 @@ def test_the_quiet_minutes_and_a_future_cutoff_are_refused(kraken: Dict[str, Any
                 )["result"] == "refused"
     assert pack(kraken, now=CUTOFF - timedelta(minutes=2)
                 )["result"] == "refused"
+    # 00:15 is the last quiet minute, for a run by hand as for the schedule.
+    assert pack(kraken, now=CUTOFF + timedelta(minutes=15)
+                )["result"] == "refused"
     assert pack(kraken, cutoff=CUTOFF + WEEK, now=NOW)["result"] == "refused"
     assert kraken["store"].manifests("kraken") == []
+    assert pack(kraken, now=CUTOFF + timedelta(minutes=16)
+                )["result"] == "packed"
 
 
 def test_a_second_packer_is_refused_while_one_holds_the_lock(kraken: Dict[str, Any]) -> None:
