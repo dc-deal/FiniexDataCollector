@@ -424,6 +424,48 @@ def test_a_stale_lock_is_taken_over(kraken: Dict[str, Any]) -> None:
     assert not (folder / LOCK_NAME).exists()
 
 
+LOCK_RACER = """
+import sys, time
+from pathlib import Path
+from python.packages.package_store import PackLock, PackLockHeld
+folder, start = Path(sys.argv[1]), float(sys.argv[2])
+while time.time() < start:
+    pass
+try:
+    with PackLock(folder):
+        print("took", flush=True)
+        time.sleep(1.5)
+except PackLockHeld:
+    print("refused", flush=True)
+"""
+
+
+def test_of_packers_starting_in_the_same_instant_one_takes_the_lock(tmp_path: Path) -> None:
+    """
+    Real processes, released at the same moment. A check followed by a write let
+    several through (found by FiniexRAGEngine porting this, 2026-11-13); the lock
+    has to be taken in one step.
+    """
+    import subprocess
+    import sys
+    import time
+
+    root = Path(__file__).resolve().parents[2]
+    start = time.time() + 4.0
+    racers = [subprocess.Popen([sys.executable, "-c", LOCK_RACER, str(tmp_path), str(start)],
+                               cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env={**os.environ, "PYTHONPATH": str(root)})
+              for _ in range(6)]
+    outcomes = []
+    for racer in racers:
+        out, err = racer.communicate(timeout=60)
+        outcomes.append(out.strip() or f"error: {err.strip()[-200:]}")
+
+    assert sorted(outcomes) == ["refused"] * 5 + ["took"], outcomes
+    assert not (tmp_path / LOCK_NAME).exists()
+    assert not list(tmp_path.glob("*.tmp")), "a temporary was left behind"
+
+
 def test_mt5_is_cut_on_collected_time_not_on_broker_time(tmp_path: Path) -> None:
     """MT5 names and `time_msc` carry the broker's server time, two or three hours ahead."""
     root = tmp_path / "MQL5" / "Files"
@@ -640,9 +682,10 @@ def test_a_receipt_marks_once_and_deletes_nothing(served: Dict[str, Any]) -> Non
     url = f"/v1/packages/{package_id}/receipt"
     fetch(served)
 
+    sha = served["store"].manifest(package_id)["zip"]["sha256"]
     first = client.post(url, headers=bearer(READER),
-                        json={"note": "imported 1 file"})
-    again = client.post(url, headers=bearer(READER))
+                        json={"note": "imported 1 file", "zip_sha256": sha})
+    again = client.post(url, headers=bearer(READER), json={"zip_sha256": sha})
 
     assert first.status_code == 201 and first.json()["consumer"] == "ide"
     assert again.status_code == 200
@@ -823,16 +866,30 @@ def test_a_receipt_with_another_hash_is_refused_and_booked(served: Dict[str, Any
     assert events(served["ledger"], "received") == []
 
 
-def test_a_receipt_without_a_hash_is_kept_unverified(served: Dict[str, Any]) -> None:
+def test_a_receipt_without_a_hash_is_refused_and_leaves_the_slot_free(served: Dict[str, Any]) -> None:
+    """
+    A hashless receipt used to take the one receipt slot: the receipt with the hash
+    that followed got the hashless one back, and the package stayed `ready` and
+    left `?unacknowledged=true` for good (found by FiniexRAGEngine, 2026-11-13).
+    """
+    client, url = served["client"], f"/v1/packages/{served['id']}/receipt"
     fetch(served)
-    served["client"].post(
-        f"/v1/packages/{served['id']}/receipt", headers=bearer(READER))
-    served["client"].post(
-        f"/v1/packages/{served['id']}/receipt", headers=bearer(READER))
 
-    received = events(served["ledger"], "received")
-    assert len(received) == 1, "a repeated acknowledgement is not a second receipt"
-    assert received[0]["verified"] is False and received[0]["zip_sha256"] is None
+    without = client.post(url, headers=bearer(READER),
+                          json={"note": "no hash"})
+
+    assert without.status_code == 400 and "zip_sha256 is required" in without.json()[
+        "detail"]
+    assert served["store"].receipt(served["id"]) is None
+    assert [e["reason"] for e in events(served["ledger"], "receipt_refused")] == [
+        "no zip_sha256"]
+    waiting = client.get("/v1/packages", headers=bearer(READER),
+                         params={"unacknowledged": True}).json()["packages"]
+    assert [p["package_id"] for p in waiting] == [served["id"]]
+
+    assert receive(served, download=False).status_code == 201
+    assert served["store"].find(served["id"])["state"] == "delivered"
+    assert events(served["ledger"], "received")[0]["verified"] is True
 
 
 def test_the_ledger_route_needs_the_grant_and_filters(kraken: Dict[str, Any]) -> None:
@@ -1076,8 +1133,12 @@ def test_a_verified_receipt_delivers_the_package_and_makes_its_originals_disposa
 
 
 def test_a_receipt_without_the_hash_moves_nothing_on(served: Dict[str, Any]) -> None:
-    """Received is not proven: the originals wait - also when the housekeeping comes by."""
-    receive(served, sha=None)
+    """
+    Received is not proven: the originals wait - also when the housekeeping comes by.
+    The API refuses such a receipt since 2026-11-13; one written before, or by hand,
+    must still not deliver a package.
+    """
+    served["store"].write_receipt(served["id"], "ide", "", zip_sha256=None)
     lifecycle.settle(served["config"], served["store"], served["ledger"])
 
     assert served["store"].find(served["id"])["state"] == "ready"
@@ -1092,7 +1153,7 @@ def test_a_receipt_without_the_hash_moves_nothing_on(served: Dict[str, Any]) -> 
 def test_a_move_cut_short_is_finished_by_the_next_settle(served: Dict[str, Any]) -> None:
     """Zip moved, manifest not: the package is still found, and settle finishes the move."""
     store, package_id = served["store"], served["id"]
-    receive(served, sha=None)
+    store.write_receipt(package_id, "ide", "", zip_sha256=None)
     paths = store.find(package_id)
     store.delivered("kraken").mkdir(parents=True, exist_ok=True)
     os.replace(paths["zip"], store.delivered("kraken") / paths["zip"].name)

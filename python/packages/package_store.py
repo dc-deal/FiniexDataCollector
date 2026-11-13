@@ -100,14 +100,41 @@ class PackLock:
 
     def __enter__(self) -> "PackLock":
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        holder = self._live_holder()
-        if holder is not None:
-            raise PackLockHeld(
-                f"another packer (pid {holder}) holds {self._path}")
         record = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
-        self._path.write_text(json.dumps(record), encoding="utf-8")
-        self._held = True
-        return self
+        # One temporary per call, not per process: the service's housekeeping and
+        # its run take locks from two threads of one process.
+        temporary = self._path.with_name(
+            f"{LOCK_NAME}.{uuid.uuid4().hex[:12]}.tmp")
+        temporary.write_text(json.dumps(record), encoding="utf-8")
+        try:
+            # Taken by one atomic step: the complete record is linked under the
+            # lock's name, which fails when the name exists. A check followed by a
+            # write let two packers starting in the same instant both through
+            # (found by FiniexRAGEngine porting this, 2026-11-13); an O_EXCL create
+            # followed by a write would leave a moment in which the file is empty
+            # and reads as stale. A lock already there is asked who holds it, and a
+            # stale one is removed and the link tried once more. What remains: two
+            # packers meeting the same STALE lock in the same instant - one may
+            # remove the lock the other has just taken. That needs a crash first.
+            for _ in range(2):
+                try:
+                    os.link(temporary, self._path)
+                except FileExistsError:
+                    holder = self._live_holder()
+                    if holder is not None:
+                        raise PackLockHeld(
+                            f"another packer (pid {holder}) holds {self._path}")
+                    try:
+                        self._path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                self._held = True
+                return self
+            raise PackLockHeld(
+                f"{self._path} was taken by another packer while a stale lock was removed")
+        finally:
+            temporary.unlink()
 
     def __exit__(self, *exc: Any) -> None:
         if self._held:

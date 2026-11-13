@@ -48,8 +48,8 @@ instant, and never a copy.
      the hash alone proves knowledge, not possession: the list publishes it.
    - **(b) the reported hash is the zip's.** It proves that what left also arrived intact.
 
-   Both holding makes the package **confirmed**. A receipt without a hash is kept but proves
-   nothing, and nothing moves on.
+   Both holding makes the package **confirmed**. A receipt without a hash is refused with `400`
+   (since 2026-11-13) and leaves the slot free for the one that names the bytes.
 5. **Stage B.** A confirmed package moves to `delivered/`, and its originals from `awaiting/` to
    `disposable/`. The bytes now exist on two machines.
 6. **Purge.** The only step that deletes, only from `disposable/`, and only what it proves again
@@ -185,8 +185,10 @@ hashes. `purge --apply` - if the disk is below the target - deletes the two file
   originals in `awaiting\`, and the ledger has `receipt_refused`.
 - The consumer acknowledges without having downloaded the whole zip with its own token:
   `409`, `receipt_refused` with the reason, nothing moves.
-- The consumer acknowledges without a hash: kept, proves nothing; nothing moves, and after
-  14 days the package is `receipt_overdue`.
+- The consumer acknowledges without a hash: `400`, `receipt_refused`, nothing is marked; the
+  package stays unacknowledged and a receipt with the hash can follow. A hashless receipt file from
+  before 2026-11-13, or one written by hand, still moves nothing, and after 14 days the package is
+  `receipt_overdue`.
 - No receipt for 14 days: a Telegram message, health `degraded`, the outside check alarms.
 - A file in `disposable\` was changed, removed or joined by another: `purge` keeps that package
   and names the file.

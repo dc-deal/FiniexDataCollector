@@ -169,7 +169,7 @@ loopback.
 | `GET /v1/packages/ledger` | `packages` | the ledger, below; `?package_id=`, `?event=` |
 | `GET /v1/packages/{package_id}` | `packages:<id>` | the manifest, and the receipt |
 | `GET /v1/packages/{package_id}/zip` | `packages:<id>` | the zip; repeatable, and resumable with `Range` |
-| `POST /v1/packages/{package_id}/receipt` | `receipts:<id>` | "received and imported"; body `{"note": "...", "zip_sha256": "..."}`, both optional |
+| `POST /v1/packages/{package_id}/receipt` | `receipts:<id>` | "received and imported"; body `{"zip_sha256": "...", "note": "..."}`; `zip_sha256` required (since 2026-11-13), `note` optional |
 | `GET /v1/packages/purge` | `purge` | what a purge would delete now; `?target_free_percent=` |
 | `POST /v1/packages/purge` | `purge` | delete confirmed originals until the target; body `{"target_free_percent": 50}` optional |
 | `GET /v1/packages/health` | open | `status` `ok` or `degraded`, `reasons` as codes, the next weekly run and whether it is set aside, the next special run, each collector's last result and how long that run took |
@@ -195,10 +195,14 @@ loopback.
   original date, so a consumer retrying after a lost answer cannot move it. An acknowledged
   package stays listed, and the acknowledgement deletes nothing.
 - **`zip_sha256` makes a receipt name the bytes.** It is the hash the consumer computed over
-  what it holds. Given, it must be the package's, or the acknowledgement is refused with `409`
+  what it holds, and it must be the package's, or the acknowledgement is refused with `409`
   and nothing is marked received: the consumer holds something other than this package. The
-  receipt keeps it, so "received" then means "these exact bytes", not only "a package of this
-  name".
+  receipt keeps it, so "received" means "these exact bytes", not only "a package of this name".
+- **A receipt without `zip_sha256` is refused with `400`** and booked as `receipt_refused`; the
+  receipt slot stays free. Until 2026-11-13 it was optional, and a hashless first receipt took the
+  one slot for good: the receipt with the hash that followed got the hashless one back, and the
+  package stayed `ready` and left `?unacknowledged=true`. FiniexRAGEngine found it porting this
+  service.
 - **A receipt needs a complete download by the same token.** The list publishes the hash, so
   knowing it proves nothing; the ledger has to show that every byte of the zip left for the
   token that acknowledges - a resumed download adding up across its attempts. Otherwise `409`.
@@ -227,7 +231,7 @@ database.
 | `packed` | a package is committed, after its manifest | the zip's size and SHA-256, and every member's name, SHA-256 and tick count: a second record of the contents beside the manifests |
 | `served` | a download ends, finished or not | consumer, `range`, `status`, `content_length`, `bytes_sent`, `complete`, `disconnected` |
 | `received` | the first acknowledgement | consumer, note, `zip_sha256`, `verified` |
-| `receipt_refused` | an acknowledgement with another hash, or without a complete download | consumer, the reported and the expected hash, or the reason |
+| `receipt_refused` | an acknowledgement without a hash, with another hash, or without a complete download | consumer, the reported and the expected hash, or the reason |
 | `schedule_added`, `schedule_refused`, `schedule_cancelled` | a special run is planned, refused or cancelled | consumer, `special_id`, collector, cutoff, `run_at`; the rule for a refusal |
 | `schedule_weekly_set_aside`, `schedule_weekly_resumed` | the weekly run is set aside or resumed | consumer, `skip_run_at`, `suspended_until` |
 | `special_ran` | a special run finished | `special_id`, collector, cutoff, each collector's result |

@@ -478,7 +478,8 @@ no file is in two packages; no mint, no package; a member with another identity,
 file and every open `.part` (including a complete MT5 orphan) stay out and are named; nothing new
 makes no package; a run that died is removed and built again; the package folder must take a
 probe file; a package may not push the disk below its free share; the quiet minutes and a future
-cutoff are refused; a live lock refuses a second packer and a stale one is taken over; MT5 is cut
+cutoff are refused; a live lock refuses a second packer and a stale one is taken over, and of six real processes
+released in the same instant exactly one takes the lock and no temporary is left; MT5 is cut
 on collected time, not broker time; outages and process starts ride along from the collector's
 log, and are `null` for a producer without one; the configuration refuses a `subdir` that climbs
 out and a schedule in the quiet minutes. On the API: a token and the grant are needed, every
@@ -491,7 +492,8 @@ names a collector. On the ledger: a committed package is booked with its members
 are entered late, and once; a whole and a resumed download are booked complete with their range,
 and one the client abandons incomplete, with the disconnect; bytes are counted even where a server
 offers to send the path instead; a receipt with the right hash is verified, one with another hash is
-refused and booked, one without stays unverified, and a repeated one is not a second receipt; the
+refused and booked, one without a hash is refused with 400 and leaves the slot free for the receipt
+with the hash, which then delivers the package, and a repeated one is not a second receipt; the
 ledger route needs the grant and shows a token only its own packages' lines; and a torn line is
 counted while the next event starts a line of its own. On the lifecycle
 ([package_lifecycle.md](../operations/package_lifecycle.md)): stage A moves the packed originals

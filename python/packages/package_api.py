@@ -462,10 +462,17 @@ def create_package_api(
         Mark a package received and imported. The first acknowledgement stands; a
         repeated one answers 200 with the original, a new one 201. Deletes nothing.
 
-        `zip_sha256`, optional: the hash the consumer computed over what it
-        received. Given, it must be the package's, or the acknowledgement is
-        refused with 409 - and then the receipt says "these exact bytes", not only
-        "a package of this name".
+        `zip_sha256`, required: the hash the consumer computed over what it
+        received. It must be the package's, or the acknowledgement is refused with
+        409 - so a receipt always says "these exact bytes", never only "a package of
+        this name".
+
+        Required since 2026-11-13. Optional, a receipt without it took the one
+        receipt slot and proved nothing: a later receipt with the right hash got the
+        hashless one back, the package stayed `ready` for good and dropped out of
+        `?unacknowledged=true`, so no client would try again. FiniexRAGEngine found
+        it porting this service. Now it is refused with 400 and booked, and the
+        slot stays free for the receipt that names the bytes.
         """
         body = body or {}
         note = body.get("note", "")
@@ -485,8 +492,15 @@ def create_package_api(
         if manifest is None:
             raise HTTPException(
                 status_code=404, detail=f"no such package: {package_id}")
+        if reported is None:
+            book("receipt_refused", package_id=package_id, consumer=consumer,
+                 reason="no zip_sha256")
+            raise HTTPException(
+                status_code=400,
+                detail="zip_sha256 is required: a receipt names the bytes it acknowledges. "
+                "Send the SHA-256 you computed over the zip.")
         expected = manifest["zip"]["sha256"]
-        if reported is not None and reported != expected:
+        if reported != expected:
             book("receipt_refused", package_id=package_id, consumer=consumer,
                  reported_sha256=reported, expected_sha256=expected)
             raise HTTPException(
@@ -514,7 +528,7 @@ def create_package_api(
             # rehearses the consumer's whole path without marking the package or
             # moving a single file, and the consumer's real receipt stays open.
             book("dev_received", package_id=package_id, consumer=consumer, note=note,
-                 zip_sha256=reported, verified=reported is not None)
+                 zip_sha256=reported, verified=True)
             return JSONResponse({"package_id": package_id, "consumer": consumer, "note": note,
                                  "zip_sha256": reported, "dev": True, "created": False,
                                  "detail": "dev receipt: every check passed, nothing was marked"},
@@ -527,8 +541,8 @@ def create_package_api(
                 status_code=404, detail=f"no such package: {package_id}")
         if created:
             book("received", package_id=package_id, consumer=consumer, note=note,
-                 zip_sha256=reported, verified=reported is not None)
-            if on_receipt is not None and reported is not None:
+                 zip_sha256=reported, verified=True)
+            if on_receipt is not None:
                 on_receipt(manifest["collector"])
         return JSONResponse({**receipt, "created": created}, status_code=201 if created else 200)
 
